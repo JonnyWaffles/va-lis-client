@@ -1,0 +1,54 @@
+[project]
+name = "va-lis-client"
+version = "0.1.0"
+description = "Python client for the Virginia Legislative Information System (LIS) API"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Jonny Fuller", email = "mr.waffles@gmail.com" }]
+keywords = ["virginia", "legislature", "LIS", "legislation", "API", "client"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "pydantic>=2.0",
+    "requests",
+    "urllib3",
+]
+
+[project.optional-dependencies]
+rate-limiting = [
+    "redis>=4.0",
+]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.urls]
+Homepage = "https://github.com/JonnyWaffles/va-lis-client"
+Repository = "https://github.com/JonnyWaffles/va-lis-client"
+"Bug Tracker" = "https://github.com/JonnyWaffles/va-lis-client/issues"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+lint.select = ["E", "F", "B", "I"]
+lint.extend-select = ["I"]
+fix = true
