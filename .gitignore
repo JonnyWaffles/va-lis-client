@@ -16,3 +16,4 @@ venv/
 # Secrets / local config
 .env
 .env.*
+.claude/
