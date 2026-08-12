@@ -32,7 +32,9 @@ from va_lis_client import LISClient
 client = LISClient(api_key="your-api-key-here")
 # or: os.environ["LIS_API_KEY"] = "your-key"; client = LISClient()
 
-# Current session
+# The GA's current working session. During the interim this is the
+# *upcoming* session, not the one that just ended — see
+# "Bill identity & carry-over" below.
 session = client.get_default_session()
 
 # All bills in that session
@@ -67,10 +69,12 @@ client = LISClient(api_key="your-guid-here")
 `client.check_api_key()` to actually validate a key via the
 PartnerAuthentication service.
 
-## Data restrictions
+## Data availability
 
-- Only **2025 and 2026 session data** is authorized via the API.
-- Pre-2025 data must come from `legacylis.virginia.gov` CSV downloads.
+- The session reference list reaches back to **1994**.
+- Bill data has been observed working for the **2024–2027 sessions** (as of
+  Aug 2026). Earlier guidance said only 2025–2026 was authorized via the API.
+- Older session data is available as `legacylis.virginia.gov` CSV downloads.
 - No rate limits are documented anywhere.
 
 ## Identifier cheat-sheet
@@ -83,7 +87,7 @@ several overlapping identifiers:
 | `SessionCode` | `20261` | Year + sequence. `20261` = 2026 Regular, `20262` = Special I |
 | `SessionID` | `59` | Surrogate PK. Either code or ID works as query param |
 | `LegislationNumber` | `"HB1"` | **Must be unpadded** — `HB0001` returns 204 |
-| `LegislationID` | `98525` | Surrogate PK, globally unique across sessions |
+| `LegislationID` | `98525` | Surrogate PK for the *logical* bill — reused across carry-over (see below) |
 | `DocumentCode` | `"HB1ER"` | Bill number + version suffix |
 | `LegislationTextID` | `257719` | PK for a specific text version |
 | `CommitteeID` | `14` | Surrogate PK for a committee |
@@ -92,6 +96,40 @@ several overlapping identifiers:
 | `DocketID` | `21114` | PK for a Senate committee docket |
 | `ScheduleID` | `3626` | PK for a scheduled meeting |
 | `LegislationEventID` | `1561089` | PK for a bill history event |
+
+## Bill identity & carry-over
+
+Virginia's even-year sessions may carry unfinished bills over into the
+following odd-year session — never the reverse, never twice, and never across
+a two-year General Assembly term. The API models this by **reusing the
+`LegislationID`** (confirmed against the live API, 2026-08-12):
+
+- A carried-over bill appears in **both** sessions' `get_session_bills` lists
+  with the same `LegislationID` (e.g. HB9, ID `98631`, in `20261` and `20271`).
+- `get_bill(legislation_id)` returns top-level `SessionCode`/`SessionID` as
+  `None`. The `Sessions` list carries one cross-ref per session the bill
+  appears in — both the even and odd session for a carried-over bill — and is
+  the explicit lineage record.
+- So `LegislationID` identifies the *logical bill within a GA term*: at most
+  two session appearances (even, then odd if continued). Session-scoped
+  identity is `(SessionCode, LegislationNumber)` or
+  `(SessionCode, LegislationID)`.
+- An odd-year bill list starts as pure carry-over — as of Aug 2026, `20271`
+  returned 443 bills, every one sharing its ID with `20261`. Continued bills
+  must be acted on by mid-November of the even year or they die, so expect
+  that set to shrink before the odd session convenes.
+
+**Sync warning:** if you mirror bills into a database, don't put a global
+unique constraint on `LegislationID` — the first odd-year sync will violate it
+on the first carried-over bill. Scope uniqueness to
+`(session, LegislationID)`.
+
+**Default session:** `get_default_session()` tracks the GA's *working*
+session, not the last one convened. Once a session wraps up (sine die, veto
+session, enactments effective July 1), the default advances to the upcoming
+session during the interim — by Aug 2026 it was already `20271`, which is
+where continued bills and (from mid-November) new prefiles accumulate. For
+retrospective work on a just-ended session, pass its explicit session code.
 
 ## Response envelope gotchas
 

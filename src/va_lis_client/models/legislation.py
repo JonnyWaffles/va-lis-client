@@ -43,9 +43,15 @@ class Patron(BaseModel):
 class LegislationSession(BaseModel):
     """Session cross-reference on a bill (which sessions it appeared in).
 
-    Example::
+    This list is the explicit carry-over lineage record: a bill continued
+    from an even-year session into the odd-year session has one entry per
+    session.  ``IsPrefile`` is ``True`` on the session the bill was
+    prefiled for, not on the carry-over appearance.
 
-        {"SessionID": 59, "SessionCode": "20261", "IsPrefile": true}
+    Example (HB9, LegislationID 98631, carried over)::
+
+        [{"SessionID": 59, "SessionCode": "20261", "IsPrefile": true},
+         {"SessionID": 61, "SessionCode": "20271", "IsPrefile": false}]
     """
 
     SessionID: int
@@ -59,8 +65,11 @@ class LegislationSummaryItem(BaseModel):
     Returned by ``/Legislation/api/getlegislationsessionlistasync``.
     Use ``session_code`` (e.g. ``20261``) to query.
 
-    Key: ``LegislationID`` is globally unique; ``LegislationNumber`` is
-    unique within a session (e.g. "HB1" in 20261).
+    Key: ``LegislationNumber`` is unique within a session (e.g. "HB1" in
+    20261).  ``LegislationID`` names the *logical* bill and is reused
+    across even→odd carry-over (HB9 keeps ID 98631 in both 20261 and
+    20271), so it is only unique within ``(session, LegislationID)``.
+    An ID never spans a two-year GA term and never carries twice.
 
     ``LegislationTypeCode``: ``"B"`` = Bill, ``"J"`` = Joint Resolution,
     ``"R"`` = Resolution.
@@ -74,7 +83,7 @@ class LegislationSummaryItem(BaseModel):
          "Patrons": [{"MemberDisplayName": "Jeion A. Ward", ...}]}
     """
 
-    LegislationID: int  # globally unique surrogate PK
+    LegislationID: int  # surrogate PK — reused across even→odd carry-over (see docstring)
     LegislationNumber: str  # e.g. "HB1", "SB234" (unpadded)
     Description: str  # short description
     LegislationTitle: str | None = None  # full formal title (often null here)
@@ -93,6 +102,11 @@ class Legislation(BaseModel):
     ``FullNumber`` is the zero-padded form (``"HB0001"``), while
     ``LegislationNumber`` is unpadded (``"HB1"``).
 
+    Top-level ``SessionID``/``SessionCode`` are ``None`` in observed
+    responses; ``Sessions`` holds the per-session cross-refs — two entries
+    for a bill carried over from an even-year to the odd-year session,
+    since carry-over reuses the ``LegislationID``.
+
     Example::
 
         {"LegislationID": 98525, "LegislationNumber": "HB1",
@@ -107,7 +121,7 @@ class Legislation(BaseModel):
          "Sessions": [{"SessionCode": "20261", ...}]}
     """
 
-    LegislationID: int  # globally unique surrogate PK
+    LegislationID: int  # surrogate PK — reused across even→odd carry-over (see docstring)
     LegislationNumber: str  # e.g. "HB1" (unpadded)
     Description: str  # short description
     LegislationTitle: str | None = None  # full "An Act to ..." title
@@ -124,8 +138,8 @@ class Legislation(BaseModel):
     EffectiveType: str | None = None  # "Standard" etc.
     EffectiveTypeID: int | None = None
     PendingChange: bool = False
-    SessionID: int | None = None
-    SessionCode: str | None = None
+    SessionID: int | None = None  # ALWAYS NULL in observed responses — use Sessions[]
+    SessionCode: str | None = None  # ALWAYS NULL in observed responses — use Sessions[]
     # NOTE: CommitteeName, CommitteeID, ParentCommitteeName, and
     # CommitteeNumber are ALWAYS NULL from the LIS API.  Committee data
     # must be derived from LegislationEvent records instead, where each

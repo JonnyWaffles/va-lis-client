@@ -34,7 +34,7 @@ class Partner(BaseModel):
 
     Example::
 
-        {"PartnerID": 259, "IdentityID": 7383,
+        {"PartnerID": 123, "IdentityID": 4567,
          "OrganizationName": "Example Agency",
          "ContactName": "Jane Smith", "APIKey": "XXXXXXXX-...",
          "IsActive": true, "IsPublic": false, ...}

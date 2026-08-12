@@ -92,6 +92,38 @@ class LiveLegislationTest(unittest.TestCase):
 
 
 @_skip_live
+class LiveCarryOverIdentityTest(unittest.TestCase):
+    """Carry-over reuses LegislationID across an even→odd session pair.
+
+    Anchored on the settled 2024→2025 term: HB1013 (LegislationID 91089)
+    was carried over from 20241 into 20251, so these facts are fixed
+    history and stable to assert.
+    """
+
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_carried_bill_keeps_id_in_both_session_lists(self):
+        ids_2024 = {b.LegislationID for b in self.client.get_session_bills(session_code=20241)}
+        ids_2025 = {b.LegislationID for b in self.client.get_session_bills(session_code=20251)}
+
+        shared = ids_2024 & ids_2025
+        self.assertIn(91089, shared)
+        self.assertGreater(len(shared), 100, "Expected hundreds of carried-over IDs")
+
+    def test_sessions_list_is_the_lineage_record(self):
+        bill = self.client.get_bill(91089)
+        self.assertEqual(bill.LegislationNumber, "HB1013")
+
+        self.assertIsNone(
+            bill.SessionCode,
+            "Top-level SessionCode expected to be None — session membership lives in Sessions[]",
+        )
+        codes = {s.SessionCode for s in bill.Sessions}
+        self.assertEqual(codes, {"20241", "20251"})
+
+
+@_skip_live
 class LiveTextAndSummaryTest(unittest.TestCase):
     def setUp(self):
         self.client = LISClient()

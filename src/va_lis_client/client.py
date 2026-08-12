@@ -3,7 +3,9 @@ LIS API client.
 
 Docs:  https://lis.virginia.gov/developers
 Auth:  ``WebAPIKey`` header on every request.
-Data:  Only 2025–2026 session data via API; pre-2025 use legacy CSV.
+Data:  Session reference list reaches back to 1994.  Bill data observed
+       working for the 2024–2027 sessions (as of Aug 2026); earlier
+       guidance said 2025–2026 only.  Older sessions via legacy CSV.
 
 The client wraps a requests session with a system-cert SSL adapter (required
 on Windows for government CA roots) and returns parsed Pydantic models.
@@ -19,7 +21,9 @@ Parameter               Example               Notes
 ``sessionCode``         ``20261``             Year + sequence.  Str or int.
 ``sessionID``           ``59``                Surrogate PK.
 ``legislationNumber``   ``"HB1"``            **Unpadded** — not ``HB0001``.
-``legislationID``       ``98525``             Surrogate PK, globally unique.
+``legislationID``       ``98525``             Surrogate PK for the *logical*
+                                              bill — reused across carry-over
+                                              (see gotchas below).
 ``legislationTextID``   ``257719``            PK for a specific text version.
 ======================  ====================  ========================
 
@@ -33,6 +37,17 @@ Gotchas discovered by hitting the live API:
   ``Legislations``, ``LegislationTextList``, ``TextsList``,
   ``LegislationSummaries``, ``References``, ``LegislationVersionList``,
   ``PartnerList``.
+- **Carry-over reuses** ``LegislationID`` (confirmed live 2026-08-12): a
+  bill continued from an even-year session keeps its ID in the following
+  odd-year session, so the same ID appears in *both* sessions' bill lists
+  (e.g. HB9, ID ``98631``, in ``20261`` and ``20271``).  Carry-over is
+  even→odd only, never twice, and never across a two-year GA term — so an
+  ID is unique within a term but is NOT one-session-one-record.
+  Session-scoped identity is ``(SessionCode, LegislationNumber)`` or
+  ``(SessionCode, LegislationID)``.
+- ``get_bill`` returns top-level ``SessionID``/``SessionCode`` as ``None``.
+  Session membership — including carry-over lineage — lives in the
+  ``Sessions`` cross-reference list (two entries for a carried-over bill).
 """
 
 from __future__ import annotations
@@ -278,7 +293,16 @@ class LISClient:
         """Return the current/default legislative session.
 
         LIS marks exactly one session as ``IsDefault=True`` at any time.
-        Currently returns the 2026 Regular Session (``SessionCode="20261"``).
+
+        The default tracks the General Assembly's *working* session, not
+        the most recently convened one.  Once a session wraps up (sine
+        die, then the April reconvened session), the default advances to
+        the upcoming session during the interim — observed pointing at
+        ``20271`` by August 2026, months before that session convenes.
+        That is where continued bills, interim committee action, and
+        (from mid-November) new prefiles accumulate.  For retrospective
+        work on a just-ended session (enactments, final statuses), pass
+        its explicit ``session_code`` instead of using the default.
 
         Envelope key: ``Sessions`` (single-element list).
         """
@@ -308,6 +332,13 @@ class LISClient:
         chief patron.  For full detail (all patrons, dates, status ID),
         call :meth:`get_bill` with the ``LegislationID``.
 
+        **Carry-over:** an odd-year session's list starts as pure
+        carry-over — every bill continued from the preceding even-year
+        session appears with its ``LegislationID`` unchanged (as of Aug
+        2026, ``20271`` returned 443 bills, all sharing IDs with
+        ``20261``'s 3,645).  See the module docstring for the identity
+        rules.
+
         Envelope key: ``Legislations``.
         """
         params = {}
@@ -333,6 +364,12 @@ class LISClient:
         Returns:
             :class:`Legislation` with all patrons (65 for HB1!), session
             cross-refs, and status info.  ``None`` if not found.
+
+        Top-level ``SessionID``/``SessionCode`` are ``None`` in observed
+        responses.  Session membership comes from the ``Sessions`` list,
+        which holds one entry per session the bill appears in — two for a
+        bill carried over from an even-year session (e.g. ``98631`` lists
+        ``20261`` and ``20271``).
 
         Envelope key: ``Legislations``.
         """
