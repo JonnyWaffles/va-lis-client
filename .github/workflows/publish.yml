@@ -12,7 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      # setup-uv publishes no floating major tag — pin the full version
+      - uses: astral-sh/setup-uv@v10.0.0
         with:
           cache-dependency-glob: pyproject.toml
       - run: uv build
