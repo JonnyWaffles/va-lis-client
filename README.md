@@ -177,8 +177,19 @@ The docs say `ListItems` everywhere. Reality:
 
 #### LegislationEvent (`/LegislationEvent/api/`)
 - `get_bill_events(legislation_id)` → chronological action history for a bill
-- `get_event_types()` → ~3,900 event type references
+- `get_event_types()` → 3,912 event type references
 - `get_actor_types()` → 5 actor types (House, Senate, Committee, etc.)
+
+**Event join keys** (verified 2026-08-13): an event's `Status` carries the
+internal *name* from the 52-status vocabulary (a closed vocabulary, not
+free text), and `LegislationStatusID` comes back null — join statuses on
+the name. The event-type reference rows come back with
+`LegislationEventTypeID` null — join event types on `EventCode`. 120 of
+the 3,912 types are the committee continuance family (codes ending
+40/41/42, e.g. `H1940` = Continued to next session in Transportation);
+floor and conference continuances are covered by statuses 46–48 instead.
+`EventDate` is the true action date — a committee continuance is dated on
+the committee vote, not at crossover.
 
 ### Modeled but not yet wired to client methods
 

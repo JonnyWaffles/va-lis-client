@@ -44,8 +44,13 @@ class LegislationEvent(BaseModel):
     - ``"Committee"`` → a committee action (ReferenceID = CommitteeID)
     - ``"LegislationFile"`` → a file (fiscal impact, etc.)
 
-    ``Status`` is the bill's status *after* this event (e.g. "Introduced",
-    "In Committee", "Passed House").
+    ``Status`` is the bill's status *after* this event, carried as the
+    internal *name* from the 52-value LegislationStatus vocabulary (e.g.
+    "Introduced", "In Committee", "Continued To") — a closed vocabulary
+    that joins onto the status reference table, not free text.  The
+    payload also defines ``LegislationStatusID``, but the API returns it
+    null in practice (verified 2026-08-13), so the ``Status`` name is the
+    per-event join key into the status vocabulary.
 
     Key passage-related event codes::
 
@@ -73,6 +78,8 @@ class LegislationEvent(BaseModel):
     """
 
     LegislationEventID: int  # surrogate PK — globally unique, durable
+    # Populated on events, but the event-type *reference* endpoint returns
+    # its rows without this ID — cross-reference via ``EventCode`` instead.
     LegislationEventTypeID: int | None = None
     EventCode: str | None = None  # e.g. "H4020", "H1401", "S0205"
     EventDate: datetime | None = None
@@ -98,12 +105,16 @@ class LegislationEvent(BaseModel):
     # to determine which committee a bill was referred to or reported from.
     CommitteeName: str | None = None
     ParentCommitteeName: str | None = None
-    LegislationStatusID: int | None = None  # status after this event
+    # Null in practice (verified 2026-08-13) — join on ``Status`` (the
+    # status *name*) instead.
+    LegislationStatusID: int | None = None
     ReferenceID: str | None = None  # context-dependent (text ID, committee ID, etc.)
     ReferenceNumber: str | None = None
     ReferenceTypeID: int | None = None
     ReferenceType: str | None = None  # "LegislationText", "Vote", etc.
-    Status: str | None = None  # status name after event, e.g. "Introduced"
+    # Status *name* after the event, from the 52-value LegislationStatus
+    # vocabulary (e.g. "Introduced", "Continued To") — closed, not free text.
+    Status: str | None = None
     ActorID: int | None = None  # CommitteeID when actor is a committee
     # ActorType values: "House", "Senate", "Governor", "Conference", "Committee"
     ActorType: str | None = None
@@ -113,13 +124,24 @@ class LegislationEvent(BaseModel):
 class LegislationEventType(BaseModel):
     """Event type reference from ``/LegislationEvent/api/getlegislationeventtypereferencesasync``.
 
-    There are ~3,900 types — most are duplicates with different chamber
+    There are 3,912 types — most are duplicates with different chamber
     codes.  The key fields for filtering:
 
     - ``IsPassage``: True for events where a bill passes a chamber
       (H5000/S5000 family) or is defeated (H9520/S9520).
     - ``EventCode``: Prefix indicates actor (H=House, S=Senate,
       G=Governor).  Codes in the 5000 range are passage/defeat events.
+    - Continuance (carry-forward) family: 120 types — one per committee
+      per chamber, in three flavors ("Continued to next session in X",
+      "with amendment(s)", "with substitute") — with committee-numbered
+      codes ending 40, 41, and 42 (e.g. H1940 = Continued to next
+      session in Transportation).  Floor and conference continuances are
+      covered by the event ``Status`` vocabulary instead (statuses
+      46–48, "Continued to House/Senate/Conference").
+
+    Rows from this endpoint come back with ``LegislationEventTypeID``
+    null (verified 2026-08-13), so ``EventCode`` is the join key between
+    events and this table.
 
     Envelope key: ``EventTypes``.
 

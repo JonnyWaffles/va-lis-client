@@ -1,6 +1,6 @@
 [project]
 name = "va-lis-client"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python client for the Virginia Legislative Information System (LIS) API"
 readme = "README.md"
 license = { text = "MIT" }

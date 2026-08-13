@@ -551,6 +551,15 @@ class LISClient:
         ``"Passed Senate"`` and read ``EventDate`` for the passage date.
         ``VoteTally`` contains the vote count (e.g. ``"(64-Y 34-N 0-A)"``).
 
+        ``Status`` is the internal status *name* from the 52-value
+        LegislationStatus vocabulary — a closed vocabulary, not free
+        text.  Match on it rather than ``LegislationStatusID``, which
+        this endpoint returns null (verified 2026-08-13).  ``EventDate``
+        is the true action date (a committee continuance is dated on the
+        committee vote, not on crossover); whether LIS publishes events
+        promptly mid-session or batches them at crossover is not
+        verifiable from post-session data.
+
         Args:
             legislation_id: Surrogate PK, e.g. ``98525`` for HB1.
 
@@ -568,13 +577,19 @@ class LISClient:
         return [LegislationEvent.model_validate(e) for e in data.get("LegislationEvents", [])]
 
     def get_event_types(self) -> list[LegislationEventType]:
-        """Reference list of ~3,900 legislation event types.
+        """Reference list of 3,912 legislation event types.
 
         Key fields for filtering:
 
         - ``IsPassage``: True for passage/defeat events (H5000/S5000 family)
         - ``EventCode``: Prefix = actor (H=House, S=Senate, G=Governor)
         - ``LegislationDescription``: Human-readable action name
+
+        The continuance (carry-forward) family is 120 types with
+        committee-numbered codes ending 40, 41, and 42; see
+        :class:`LegislationEventType` for the breakdown.  Rows come back
+        with ``LegislationEventTypeID`` null, so join to events on
+        ``EventCode``.
 
         Envelope key: ``EventTypes``.
         """
