@@ -19,6 +19,7 @@ Modules:
                    DocketDetail
     event        — EventReference, LegislationEvent, LegislationEventType,
                    ActorType
+    pagination   — Pagination, PagedList, page_request_header
 """
 
 from va_lis_client.models.calendar import (
@@ -59,6 +60,11 @@ from va_lis_client.models.legislation import (
     LegislationSummaryItem,
     LegislationVersion,
     Patron,
+)
+from va_lis_client.models.pagination import (
+    PagedList,
+    Pagination,
+    page_request_header,
 )
 from va_lis_client.models.schedule import MeetingRoom, Schedule, ScheduleType
 from va_lis_client.models.session import Session, SessionEvent
@@ -113,6 +119,10 @@ __all__ = [
     "DocketDetail",
     "DocketItem",
     "DocketListItem",
+    # pagination
+    "PagedList",
+    "Pagination",
+    "page_request_header",
     # event
     "ActorType",
     "EventReference",
