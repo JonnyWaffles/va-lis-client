@@ -1,4 +1,29 @@
 from va_lis_client.client import LISClient
-from va_lis_client.exceptions import LISClientError
+from va_lis_client.exceptions import (
+    BillNotFoundError,
+    InvalidBillNumberError,
+    LISClientError,
+    LISError,
+    TextVersionNotFoundError,
+)
+from va_lis_client.service import (
+    DEFAULT_BILL_LIST_TTL,
+    LISService,
+    normalize_bill_number,
+    pick_text_version,
+    strip_html,
+)
 
-__all__ = ["LISClient", "LISClientError"]
+__all__ = [
+    "BillNotFoundError",
+    "DEFAULT_BILL_LIST_TTL",
+    "InvalidBillNumberError",
+    "LISClient",
+    "LISClientError",
+    "LISError",
+    "LISService",
+    "TextVersionNotFoundError",
+    "normalize_bill_number",
+    "pick_text_version",
+    "strip_html",
+]

@@ -153,6 +153,73 @@ class LiveTextAndSummaryTest(unittest.TestCase):
         self.assertIsNotNone(passed, "Expected a 'SUMMARY AS PASSED' entry")
 
 
+@_skip_live
+class LivePaginationTest(unittest.TestCase):
+    """Paging rides an X-Pagination request header, not the query string."""
+
+    SESSION = 20271
+
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_unpaged_list_reports_its_own_total(self):
+        page = self.client.get_session_bills(session_code=self.SESSION)
+        self.assertIsNotNone(page.pagination, "No X-Pagination header on the response")
+        self.assertEqual(len(page), page.pagination.TotalCount)
+
+    def test_page_size_caps_the_rows(self):
+        page = self.client.get_session_bills(session_code=self.SESSION, page_size=3)
+        self.assertEqual(len(page), 3)
+        self.assertGreater(page.pagination.TotalCount, 3)
+        self.assertTrue(page.pagination.HasNext)
+        self.assertFalse(page.pagination.HasPrevious)
+
+    def test_skip_offsets_the_window(self):
+        first = self.client.get_session_bills(session_code=self.SESSION, page_size=3, skip=0)
+        second = self.client.get_session_bills(session_code=self.SESSION, page_size=3, skip=3)
+
+        numbers = {b.LegislationNumber for b in first}
+        self.assertEqual(numbers & {b.LegislationNumber for b in second}, set())
+        self.assertTrue(second.pagination.HasPrevious)
+        self.assertEqual(second.pagination.SkippedRecords, 3)
+
+    def test_bill_count_avoids_the_full_download(self):
+        count = self.client.get_session_bill_count(session_code=self.SESSION)
+        self.assertIsInstance(count, int)
+        self.assertGreater(count, 0)
+
+    def test_page_number_is_ignored_by_the_server(self):
+        """The server always echoes PageNumber as 1; CurrentPage is the real one."""
+        page = self.client.get_session_bills(session_code=self.SESSION, page_size=3, skip=6)
+        self.assertEqual(page.pagination.PageNumber, 1)
+        self.assertEqual(page.pagination.CurrentPage, 3)
+
+
+@_skip_live
+class LiveTextSessionScopeTest(unittest.TestCase):
+    """LISService.resolve_bill_id leans on the text endpoint being session scoped.
+
+    HB1 completed in the 2026 Regular Session, so it never carried into 20271.
+    If this endpoint ever stops scoping by session, the cheap id lookup would
+    silently resolve a bill into a session it does not belong to.
+    """
+
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_text_list_answers_for_the_owning_session(self):
+        texts = self.client.get_bill_texts(legislation_number="HB1", session_code=20261)
+        self.assertGreater(len(texts), 0)
+        self.assertEqual({t.LegislationID for t in texts}, {98525})
+
+    def test_text_list_is_empty_for_a_session_the_bill_is_not_in(self):
+        bills = self.client.get_session_bills(session_code=20271)
+        self.assertNotIn("HB1", {b.LegislationNumber for b in bills})
+
+        texts = self.client.get_bill_texts(legislation_number="HB1", session_code=20271)
+        self.assertEqual(texts, [])
+
+
 class ClientConfigTest(unittest.TestCase):
     """Unit tests for client configuration (no network calls)."""
 

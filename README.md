@@ -6,6 +6,9 @@ Built from live API responses — the official OpenAPI specs are unreliable
 (response envelope keys, field casing, and parameter behavior all differ from
 the docs).
 
+This package doubles as the API documentation, recording behavior found
+nowhere else, such as [pagination](#pagination-undocumented).
+
 - Developer portal: https://lis.virginia.gov/developers
 - API key registration: https://lis.virginia.gov/apiregistration
 - Help desk: lis@dlas.virginia.gov
@@ -47,6 +50,58 @@ bill = client.get_bill(legislation_id=98525)
 texts = client.get_bill_text_detail(legislation_id=98525, session_code=20261)
 summaries = client.get_bill_summaries(legislation_number="HB1", session_code=20261)
 ```
+
+## Service layer
+
+`LISClient` is transport: one method per endpoint, and no interpretation.
+`LISService` sits above it. It does the work every caller would otherwise
+repeat: resolving human bill numbers to IDs, joining the reference
+vocabularies, caching the large lists, and flattening bill text HTML.
+
+```python
+from va_lis_client import LISClient, LISService, strip_html
+
+service = LISService(LISClient())   # or LISService() to build the client for you
+
+# Bill numbers, not surrogate keys. Case and padding are normalized.
+bill = service.get_bill("hb0001", 20261)
+bill_id = service.resolve_bill_id("HB1", 20261)  # ~1.3 KB, via the text list
+item = service.resolve_bill("HB1", 20261)        # the session row; needs the 3 MB list
+
+# Text: the newest version by default, or name one by DocumentCode.
+item, detail = service.bill_text("HB1", 20261)
+item, detail = service.bill_text("HB1", 20261, "HB1ER")
+print(strip_html(detail.DraftText))
+
+# Reference joins. Events carry a null type ID and a null status ID, so these
+# index the vocabularies on the keys that events actually carry.
+types = service.event_types_by_code()          # EventCode -> LegislationEventType
+statuses = service.statuses_by_name()          # Name      -> LegislationStatus
+label = service.bill_status_label(bill, item)  # best available status label
+```
+
+**Resolving an id cheaply.** The text list endpoint takes a bill number and
+returns rows carrying the `LegislationID`, so `resolve_bill_id` costs about
+1.3 KB instead of the 3 MB session list. It is session scoped, so it will not
+resolve a bill into a session it does not belong to. Bills with no published
+text fall back to the list. Use `resolve_bill` when you want the session row
+itself, for its status, description, or chief patron.
+
+**Caching.** The session bill list backs substring search and is the fallback
+for id resolution. It runs to roughly 3 MB, so `LISService` caches it for 15
+minutes (tune with `bill_list_ttl=`). The static reference vocabularies are
+kept for the life of the instance. Caches live on the instance, so build one
+service and keep it. Instances are safe to share between threads.
+
+**Errors.** Everything derives from `LISError`, so one `except` clause covers
+the package. The resolution errors also derive from the builtin that fits them.
+
+| Exception | Also a | Raised when |
+| --- | --- | --- |
+| `LISClientError` | | The API returns a non-success response |
+| `InvalidBillNumberError` | `ValueError` | A string does not parse as a bill number |
+| `BillNotFoundError` | `LookupError` | A bill number is not in the session |
+| `TextVersionNotFoundError` | `LookupError` | No text version matches, or the version has no body |
 
 ## Authentication
 
@@ -153,6 +208,59 @@ The docs say `ListItems` everywhere. Reality:
 | Legislation events | `ListItems` | `LegislationEvents` |
 | Schedule types | `ListItems` | `ScheduleTypes` |
 | Meeting rooms | `ListItems` | `MeetingRooms` |
+
+## Pagination (undocumented)
+
+Paging works but is documented nowhere, and it is **not** a query string
+parameter. Every parameter name is silently ignored. It runs on an
+`X-Pagination` request header carrying JSON:
+
+```bash
+curl -H "WebAPIKey: $LIS_API_KEY" \
+     -H 'X-Pagination: {"PageSize":3,"SkippedRecords":6}' \
+     "https://lis.virginia.gov/Legislation/api/getlegislationsessionlistasync?sessionCode=20271"
+```
+
+| Request field | Effect |
+| --- | --- |
+| `PageSize` | Caps the number of rows returned |
+| `SkippedRecords` | Raw record offset. This is what moves the window |
+| `PageNumber` | Accepted and ignored. Always echoed back as `1` |
+
+Every response carries an `X-Pagination` header back. `CurrentPage` is derived
+from `SkippedRecords` divided by `PageSize`:
+
+```json
+{"PageSize":3,"PageNumber":1,"TotalPages":148,"TotalCount":443,
+ "CurrentPage":3,"SkippedRecords":6,"HasPrevious":true,"HasNext":true}
+```
+
+### Using it
+
+```python
+page = client.get_session_bills(session_code=20271, page_size=5, skip=10)
+
+len(page)                      # 5. PagedList subclasses list.
+page[0].LegislationNumber      # "HB71"
+page.pagination.TotalCount     # 443
+page.pagination.HasNext        # True
+
+# TotalCount without downloading the list: one row, about a kilobyte.
+client.get_session_bill_count(session_code=20271)   # 443
+```
+
+`PagedList` is a real `list`, so code that iterates or indexes it needs no
+change. `.pagination` is `None` when the server sends no usable header.
+
+Worth using: an unpaged row is about 820 bytes, so a full regular session runs
+to roughly 3 MB.
+
+### Which endpoints support it
+
+Verified on `getlegislationsessionlistasync` only. It is **not** global
+middleware. The event type reference endpoint ignores the header and returns
+all 3,912 rows (2.19 MB) on every call, which is why the client caches that one
+instead.
 
 ## API services
 
@@ -495,9 +603,10 @@ is needed.
 
 ```
 src/va_lis_client/
-├── __init__.py         # re-exports LISClient, LISClientError
+├── __init__.py         # re-exports the client, the service, and the errors
 ├── client.py           # HTTP client — returns Pydantic models
-├── exceptions.py       # LISClientError
+├── service.py          # LISService — resolution, reference joins, text helpers
+├── exceptions.py       # LISError and its subclasses
 ├── http.py             # SystemCertSSLAdapter + shared requests session
 ├── rate_limiter.py     # optional Redis-based rate limiter
 └── models/
@@ -507,6 +616,7 @@ src/va_lis_client/
     ├── legislation.py  # Patron, Legislation, LegislationStatus, ...
     ├── text.py         # LegislationTextItem, LegislationTextDetail, ...
     ├── event.py        # LegislationEvent, LegislationEventType, ActorType
+    ├── pagination.py   # Pagination, PagedList — the X-Pagination protocol
     ├── committee.py    # Committee, CommitteeMember, CommitteeAction
     ├── schedule.py     # Schedule, ScheduleType, MeetingRoom
     ├── calendar.py     # CalendarDetail, Agenda, VoteMember, ...

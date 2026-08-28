@@ -72,8 +72,11 @@ from va_lis_client.models import (
     LegislationTextDetail,
     LegislationTextItem,
     LegislationVersion,
+    PagedList,
+    Pagination,
     Partner,
     Session,
+    page_request_header,
 )
 
 logger = logging.getLogger(__name__)
@@ -141,15 +144,32 @@ class LISClient:
     def _headers(self) -> dict[str, str]:
         return {"WebAPIKey": self.api_key}
 
-    def _request(self, method: str, path: str, **kwargs):
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        page_header: dict[str, str] | None = None,
+        capture: dict | None = None,
+        **kwargs,
+    ):
         """Send an HTTP request with exponential backoff on transient failures.
 
         Retries on connection errors, timeouts, and HTTP 429/5xx responses.
         Respects ``Retry-After`` header when present.  Logs all response
         headers on 429 to help discover LIS rate-limit SLAs.
+
+        Args:
+            page_header: An ``X-Pagination`` request header from
+                :func:`page_request_header`, merged over the auth header.
+            capture: A dict to fill with the response headers, so a caller can
+                read ``X-Pagination`` back off a successful response.
         """
         url = f"{BASE_URL}{path}"
-        kwargs.setdefault("headers", self._headers())
+        headers = self._headers()
+        if page_header:
+            headers.update(page_header)
+        kwargs.setdefault("headers", headers)
         delay = _INITIAL_DELAY
 
         for attempt in range(self._max_retries + 1):
@@ -176,6 +196,8 @@ class LISClient:
 
             if resp.status_code not in _RETRYABLE_STATUS_CODES:
                 resp.raise_for_status()
+                if capture is not None:
+                    capture.update(resp.headers)
                 return resp.json()
 
             # Retryable HTTP error
@@ -219,8 +241,15 @@ class LISClient:
             f"LIS request {method} {path} failed after {self._max_retries} retries"
         )
 
-    def _get(self, path: str, params: dict | None = None):
-        return self._request("GET", path, params=params)
+    def _get(
+        self,
+        path: str,
+        params: dict | None = None,
+        *,
+        page_header: dict[str, str] | None = None,
+        capture: dict | None = None,
+    ):
+        return self._request("GET", path, params=params, page_header=page_header, capture=capture)
 
     def _post(self, path: str, json: dict | None = None):
         return self._request("POST", path, json=json)
@@ -320,7 +349,10 @@ class LISClient:
         self,
         session_code: int | None = None,
         session_id: int | None = None,
-    ) -> list[LegislationSummaryItem]:
+        *,
+        page_size: int | None = None,
+        skip: int | None = None,
+    ) -> PagedList[LegislationSummaryItem]:
         """Lightweight bill list for a session.
 
         Provide **one of**:
@@ -331,6 +363,23 @@ class LISClient:
         Returns every bill in the session with basic metadata and the
         chief patron.  For full detail (all patrons, dates, status ID),
         call :meth:`get_bill` with the ``LegislationID``.
+
+        **Size:** the unpaged response is large.  Session ``20271`` measured
+        363,344 bytes for 443 rows (about 820 bytes per row), which scales to
+        roughly 3 MB for a full regular session.  Pass ``page_size`` to trim
+        it.
+
+        **Paging** rides an ``X-Pagination`` request header, not the query
+        string; see :mod:`va_lis_client.models.pagination`.  The returned
+        :class:`PagedList` is a plain list that also carries ``.pagination``
+        with ``TotalCount`` and ``HasNext``.
+
+        Args:
+            session_code: e.g. ``20261``.
+            session_id: e.g. ``59``.
+            page_size: Maximum rows to return.  Omit for every row.
+            skip: Records to skip before the window starts.  This is a raw
+                record offset, not a page index.
 
         **Carry-over:** an odd-year session's list starts as pure
         carry-over — every bill continued from the preceding even-year
@@ -346,12 +395,43 @@ class LISClient:
             params["sessionCode"] = session_code
         if session_id is not None:
             params["sessionID"] = session_id
-        data = self._get("/Legislation/api/getlegislationsessionlistasync", params=params)
+
+        headers: dict = {}
+        data = self._get(
+            "/Legislation/api/getlegislationsessionlistasync",
+            params=params,
+            page_header=page_request_header(page_size, skip),
+            capture=headers,
+        )
         if data is None:
-            return []
-        return [
+            return PagedList()
+
+        rows = [
             LegislationSummaryItem.model_validate(item) for item in data.get("Legislations", [])
         ]
+        return PagedList(rows, Pagination.from_header(headers.get("X-Pagination")))
+
+    def get_session_bill_count(
+        self,
+        session_code: int | None = None,
+        session_id: int | None = None,
+    ) -> int | None:
+        """Number of bills in a session, without downloading the list.
+
+        Asks for a single row and reads ``TotalCount`` off the response's
+        ``X-Pagination`` header, so this costs about a kilobyte rather than
+        the megabytes a full list costs.
+
+        Returns:
+            The row count, or ``None`` when the server sent no usable header.
+        """
+        page = self.get_session_bills(
+            session_code=session_code,
+            session_id=session_id,
+            page_size=1,
+        )
+
+        return page.pagination.TotalCount if page.pagination else None
 
     def get_bill(self, legislation_id: int) -> Legislation | None:
         """Full bill detail by numeric LIS ID.
