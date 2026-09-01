@@ -144,13 +144,13 @@ several overlapping identifiers:
 | `LegislationNumber` | `"HB1"` | **Must be unpadded** — `HB0001` returns 204 |
 | `LegislationID` | `98525` | Surrogate PK for the *logical* bill — reused across carry-over (see below) |
 | `DocumentCode` | `"HB1ER"` | Bill number + version suffix |
-| `LegislationTextID` | `257719` | PK for a specific text version |
+| `LegislationTextID` | `257719` | PK for one immutable text snapshot — follows the bill across carry-over (see below) |
 | `CommitteeID` | `14` | Surrogate PK for a committee |
 | `CommitteeNumber` | `"H14"` | Chamber prefix + number, e.g. `H14`, `S02` |
 | `CalendarID` | `21146` | PK for a House floor calendar |
 | `DocketID` | `21114` | PK for a Senate committee docket |
 | `ScheduleID` | `3626` | PK for a scheduled meeting |
-| `LegislationEventID` | `1561089` | PK for a bill history event |
+| `LegislationEventID` | `1561089` | PK for a bill history event — follows the bill across carry-over (see below) |
 
 ## Bill identity & carry-over
 
@@ -174,10 +174,25 @@ a two-year General Assembly term. The API models this by **reusing the
   must be acted on by mid-November of the even year or they die, so expect
   that set to shrink before the odd session convenes.
 
+**Texts and events are entity-level too.** A bill's text versions and history
+events belong to the logical bill, not to a session appearance, so they follow
+it across the carry-over with their ids unchanged: `get_bill_texts("HB9", 20261)`
+and `get_bill_texts("HB9", 20271)` return the identical record
+(`LegislationTextID=257905`, the introduced text — verified live 2026-08-12).
+A text id never mutates. When the text changes, LIS appends a **new** version
+record with a new id (`HB9` → `HB9E` → `HB9H1` → `HB9ER`); a carried bill
+brings its whole existing stack into the new session and appends any odd-year
+amendments to it. Event histories behave the same way — the odd-year view
+includes every even-year event under its original `LegislationEventID`.
+
 **Sync warning:** if you mirror bills into a database, don't put a global
-unique constraint on `LegislationID` — the first odd-year sync will violate it
-on the first carried-over bill. Scope uniqueness to
-`(session, LegislationID)`.
+unique constraint on any of these ids. The first odd-year sync will violate a
+global `LegislationID` constraint on the first carried-over bill, violate a
+global `LegislationTextID` constraint on its first text version, and — worst —
+an upsert keyed on a globally-unique `LegislationEventID` won't error at all:
+it silently re-parents the even-year rows to the odd-year bill. Scope every
+LIS surrogate to its owning parent: `(session, LegislationID)`,
+`(bill, LegislationTextID)`, `(bill, LegislationEventID)`.
 
 **Default session:** `get_default_session()` tracks the GA's *working*
 session, not the last one convened. Once a session wraps up (sine die, veto
