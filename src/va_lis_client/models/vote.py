@@ -16,10 +16,12 @@ Two traps dominate this service:
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import Field
+
+from va_lis_client.models.common import LISModel
 
 
-class VoteMember(BaseModel):
+class VoteMember(LISModel):
     """One member's response on a vote.
 
     ``ResponseCode`` values::
@@ -36,8 +38,9 @@ class VoteMember(BaseModel):
     2 X) against a tally of ``"(64-Y 34-N 0-A)"``.
 
     ``VotingSequence`` appears on committee votes and is absent on floor
-    votes.  ``MemberDisplayName`` carries leading-space dirt from LIS (2 of
-    100 rows on vote 294006), so prefer :attr:`name`.
+    votes.  LIS pads ``MemberDisplayName`` on some rows (2 of 100 on vote
+    294006); :class:`~va_lis_client.models.common.LISModel` strips it, so
+    :attr:`name` is shorthand rather than a repair.
 
     Example::
 
@@ -54,7 +57,7 @@ class VoteMember(BaseModel):
     VoteMemberID: int | None = None  # the ballot — e.g. 10988439
     MemberID: int | None = None  # the person — e.g. 217, stable
     MemberNumber: str | None = None  # e.g. "S0115", "H0353"
-    MemberDisplayName: str | None = None  # may carry a leading space
+    MemberDisplayName: str | None = None  # LIS pads this; LISModel strips it
     PatronDisplayName: str | None = None  # surname only
     ResponseCode: str | None = None  # "Y", "N", "A", "X"
     ProxyMemberID: int | None = None
@@ -62,11 +65,11 @@ class VoteMember(BaseModel):
 
     @property
     def name(self) -> str:
-        """``MemberDisplayName`` with the LIS leading-space dirt removed."""
-        return (self.MemberDisplayName or "").strip()
+        """``MemberDisplayName``, never ``None``."""
+        return self.MemberDisplayName or ""
 
 
-class VoteLegislation(BaseModel):
+class VoteLegislation(LISModel):
     """A bill covered by a vote, and the event that vote produced.
 
     ``LegislationEventID`` is the back-link to the event whose ``VoteID``
@@ -92,7 +95,7 @@ class VoteLegislation(BaseModel):
     VoteItems: list[dict] = []
 
 
-class VoteStatement(BaseModel):
+class VoteStatement(LISModel):
     """A correction to the recorded roll call.
 
     A member who was recorded wrongly files one of these.  The roll call
@@ -135,7 +138,7 @@ class VoteStatement(BaseModel):
     ModificationDate: datetime | None = None
 
 
-class VoteFile(BaseModel):
+class VoteFile(LISModel):
     """A published file for a vote (PDF or JSON).
 
     Note ``TextFormatID`` arrives as a **string** here (``"5"``), unlike
@@ -158,7 +161,7 @@ class VoteFile(BaseModel):
     IsActive: bool = True
 
 
-class VoteType(BaseModel):
+class VoteType(LISModel):
     """Vote type reference from ``/Vote/api/getvotetypereferencesasync``.
 
     Three types::
@@ -174,7 +177,7 @@ class VoteType(BaseModel):
     Name: str | None = None
 
 
-class Vote(BaseModel):
+class Vote(LISModel):
     """A vote record from ``/Vote/api/getvotebyidasync``.
 
     Key: ``VoteID``.  Reach one from ``LegislationEvent.VoteID``; no

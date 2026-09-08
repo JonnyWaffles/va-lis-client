@@ -62,6 +62,7 @@ from va_lis_client.exceptions import LISClientError
 from va_lis_client.http import requests_session
 from va_lis_client.models import (
     ActorType,
+    District,
     Heartbeat,
     Legislation,
     LegislationEvent,
@@ -72,9 +73,11 @@ from va_lis_client.models import (
     LegislationTextDetail,
     LegislationTextItem,
     LegislationVersion,
+    Member,
     PagedList,
     Pagination,
     Partner,
+    Party,
     Session,
     Vote,
     VoteType,
@@ -756,3 +759,100 @@ class LISClient:
         if data is None:
             return []
         return [VoteType.model_validate(t) for t in data.get("VoteTypes", [])]
+
+    # ------------------------------------------------------------------
+    # Members (the roster behind a roll call)
+    # ------------------------------------------------------------------
+
+    def get_members(
+        self,
+        session_code: int,
+        chamber_code: str | None = None,
+    ) -> list[Member]:
+        """The roster for a session, with party and district.
+
+        This is the authoritative member source and the join target for
+        ``VoteMember.MemberID``.  Prefer it over :meth:`get_member`, which
+        answers 204 for some sitting members.
+
+        **The roster holds more than the sitting membership, on purpose.**
+        Session 20261 returns 148 rows for 140 seats, because members who
+        left or arrived mid-session are still there, and one member who moved
+        from the House to the Senate appears under two member numbers.  A
+        member who resigned in February still cast the January votes, so keep
+        the extra rows rather than filtering on ``MemberStatus``.
+
+        The undocumented ``chamberCode`` parameter works: it returns 106 House
+        or 42 Senate rows against 148 unfiltered (measured 2026-09-08).
+
+        ``/Member/api/getmemberlistasync`` returns the same rows under
+        ``ShallowMembers`` with a strict subset of the fields — it drops
+        ``DistrictID`` and ``DistrictName`` — so this client does not wire it.
+
+        Args:
+            session_code: Required.  Omitting it returns HTTP 400.
+            chamber_code: ``"H"`` or ``"S"``.  Omit for both.
+
+        Envelope key: ``Members``.
+        """
+        params: dict[str, str | int] = {"sessionCode": session_code}
+        if chamber_code:
+            params["chamberCode"] = chamber_code
+
+        data = self._get("/Member/api/getmembersasync", params=params)
+        if data is None:
+            return []
+        return [Member.model_validate(m) for m in data.get("Members", [])]
+
+    def get_member(self, member_id: int, session_code: int) -> Member | None:
+        """One member, with the fields the roster list leaves null.
+
+        **This endpoint is not reliable enough to build on.**  It answered 204
+        for 9 of the 148 members on the 2026 roster, including sitting ones
+        (measured 2026-09-08).  Use :meth:`get_members` as the source of truth
+        and treat this as an enrichment.
+
+        What it adds over a list row: ``MemberDetailID``, plus values for
+        ``ChamberName``, ``SeatNumber``, ``VotingSequence``, and ``SessionID``,
+        which the list returns null for every member.
+
+        Returns:
+            The :class:`Member`, or ``None`` when LIS answers 204.
+
+        Envelope key: ``Members`` — a list holding one member.
+        """
+        data = self._get(
+            "/Member/api/getmemberbyidasync",
+            params={"memberID": member_id, "sessionCode": session_code},
+        )
+        if data is None:
+            return None
+
+        members = data.get("Members", [])
+        if not members:
+            return None
+
+        return Member.model_validate(members[0])
+
+    def get_parties(self) -> list[Party]:
+        """Reference list of 3 parties (D Democrat, I Independent, R Republican).
+
+        Join to ``Member.PartyCode``.  Envelope key: ``Parties``.
+        """
+        data = self._get("/Member/api/getpartyreferencesasync")
+        if data is None:
+            return []
+        return [Party.model_validate(p) for p in data.get("Parties", [])]
+
+    def get_districts(self) -> list[District]:
+        """Reference list of 140 districts — 100 House and 40 Senate.
+
+        A district row labels itself ``Title``; the same value appears on a
+        member as ``DistrictName``.
+
+        Envelope key: ``Districts``.
+        """
+        data = self._get("/Member/api/getdistrictreferencesasync")
+        if data is None:
+            return []
+        return [District.model_validate(d) for d in data.get("Districts", [])]

@@ -11,6 +11,9 @@ Run with:
 
 import os
 import unittest
+from collections import Counter
+
+import requests
 
 from va_lis_client import LISClient, LISClientError
 from va_lis_client.models import (
@@ -321,12 +324,16 @@ class LiveVoteTest(unittest.TestCase):
             next(s.VoteStatement for s in vote.VoteStatements if s.VoteMemberID == 217),
         )
 
-    def test_member_names_need_stripping(self):
+    def test_no_padded_strings_survive_on_a_ballot(self):
         vote = self.client.get_vote(self.HOUSE_FLOOR)
 
-        dirty = [m for m in vote.vote_members if m.MemberDisplayName != m.name]
-        self.assertGreater(len(dirty), 0)
-        self.assertTrue(all(m.name == m.MemberDisplayName.strip() for m in dirty))
+        padded = [
+            (b.MemberNumber, field)
+            for b in vote.vote_members
+            for field, value in b.model_dump().items()
+            if isinstance(value, str) and value != value.strip()
+        ]
+        self.assertEqual(padded, [])
 
     def test_vote_types_reference(self):
         types = self.client.get_vote_types()
@@ -364,6 +371,161 @@ class LiveEventTypeJoinTest(unittest.TestCase):
         descriptions = {t.LegislationDescription for t in rows}
         self.assertIn("Reported from Labor and Commerce", descriptions)
         self.assertIn("Failed to report (defeated) in Labor and Commerce", descriptions)
+
+
+@_skip_live
+class LiveMemberTest(unittest.TestCase):
+    """The roster that gives a roll call party and district.
+
+    Anchored on the completed 2026 Regular Session, so the counts are final.
+    """
+
+    SESSION = 20261
+
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_roster_carries_party_and_district(self):
+        members = self.client.get_members(self.SESSION)
+
+        anderson = next(m for m in members if m.MemberNumber == "H0386")
+        self.assertEqual(anderson.PartyCode, "D")
+        self.assertEqual(anderson.DistrictName, "71st")
+        self.assertEqual(anderson.name, "Jessica L. Anderson")
+
+    def test_roster_holds_more_rows_than_seats(self):
+        """Members who left or arrived mid-session stay in the list."""
+        members = self.client.get_members(self.SESSION)
+
+        by_chamber = Counter(m.ChamberCode for m in members)
+        self.assertGreater(by_chamber["H"], 100)
+        self.assertGreater(by_chamber["S"], 40)
+        self.assertGreater(len([m for m in members if m.ServiceEndDate]), 0)
+
+    def test_chamber_code_filters(self):
+        house = self.client.get_members(self.SESSION, chamber_code="H")
+        senate = self.client.get_members(self.SESSION, chamber_code="S")
+        both = self.client.get_members(self.SESSION)
+
+        self.assertEqual({m.ChamberCode for m in house}, {"H"})
+        self.assertEqual({m.ChamberCode for m in senate}, {"S"})
+        self.assertEqual(len(house) + len(senate), len(both))
+
+    def test_the_roster_status_id_holds_the_previous_status(self):
+        """Every row whose ID contradicts its name is a departed member."""
+        vocab = {1: "Active", 2: "Inactive", 3: "Outgoing"}
+        members = self.client.get_members(self.SESSION)
+
+        contradicting = [
+            m
+            for m in members
+            if m.MemberStatusID is not None and vocab[m.MemberStatusID] != m.MemberStatus
+        ]
+        self.assertTrue(contradicting, "Expected the stale-ID rows to still exist")
+        for m in contradicting:
+            self.assertEqual(m.MemberStatusID, 1, f"{m.name} should hold the Active code")
+            self.assertIsNotNone(m.ServiceEndDate, f"{m.name} should have left")
+            self.assertIn(m.MemberStatus, ("Inactive", "Outgoing"))
+
+    def test_the_by_id_status_id_agrees_with_its_own_name(self):
+        vocab = {1: "Active", 2: "Inactive", 3: "Outgoing"}
+
+        for member_id in (217, 527):
+            one = self.client.get_member(member_id, self.SESSION)
+            self.assertEqual(vocab[one.MemberStatusID], one.MemberStatus)
+
+    def test_the_roster_omits_the_status_id_on_many_rows(self):
+        members = self.client.get_members(self.SESSION)
+
+        self.assertGreater(len([m for m in members if m.MemberStatusID is None]), 0)
+
+    def test_the_list_nulls_fields_the_by_id_call_fills(self):
+        members = self.client.get_members(self.SESSION)
+
+        for field in ("SessionID", "ChamberName", "SeatNumber", "VotingSequence"):
+            self.assertTrue(
+                all(getattr(m, field) is None for m in members),
+                f"Expected {field} null on every list row",
+            )
+
+    def test_get_member_is_not_reliable_enough_to_build_on(self):
+        """It answers 204 for some sitting members, so the roster is the source."""
+        members = self.client.get_members(self.SESSION)
+
+        missing = [
+            m for m in members[:40] if self.client.get_member(m.MemberID, self.SESSION) is None
+        ]
+        self.assertGreater(len(missing), 0)
+
+    def test_get_member_adds_what_the_list_omits(self):
+        one = self.client.get_member(217, self.SESSION)
+
+        self.assertEqual(one.MemberNumber, "H0206")
+        self.assertEqual(one.ChamberName, "House")
+        self.assertIsNotNone(one.SeatNumber)
+        self.assertIsNotNone(one.MemberDetailID)
+
+    def test_session_code_is_required(self):
+        with self.assertRaises(requests.HTTPError):
+            self.client.get_members(None)
+
+    def test_the_roster_changes_between_sessions(self):
+        now = {m.MemberID for m in self.client.get_members(20261)}
+        then = {m.MemberID for m in self.client.get_members(20241)}
+
+        self.assertGreater(len(now - then), 0)
+        self.assertGreater(len(then - now), 0)
+
+    def test_no_padded_strings_survive_validation(self):
+        """LIS pads ~50 email addresses per roster; LISModel strips them all."""
+        for code in (20241, 20251, 20261, 20271):
+            padded = [
+                (m.MemberNumber, field)
+                for m in self.client.get_members(code)
+                for field, value in m.model_dump().items()
+                if isinstance(value, str) and value != value.strip()
+            ]
+            self.assertEqual(padded, [], f"padded strings survived in {code}")
+
+    def test_party_reference(self):
+        parties = self.client.get_parties()
+
+        self.assertEqual(
+            {p.PartyCode: p.Name for p in parties},
+            {"D": "Democrat", "I": "Independent", "R": "Republican"},
+        )
+
+    def test_district_reference_covers_every_seat(self):
+        districts = self.client.get_districts()
+
+        by_chamber = Counter(d.ChamberCode for d in districts)
+        self.assertEqual(by_chamber["H"], 100)
+        self.assertEqual(by_chamber["S"], 40)
+
+
+@_skip_live
+class LiveRollCallJoinTest(unittest.TestCase):
+    """Every ballot on a roll call must resolve against the session roster."""
+
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_every_ballot_resolves_to_a_member(self):
+        vote = self.client.get_vote(294006)
+        roster = {m.MemberID: m for m in self.client.get_members(20261)}
+
+        unresolved = [b for b in vote.vote_members if b.MemberID not in roster]
+        self.assertEqual(unresolved, [])
+        self.assertEqual(len(vote.vote_members), 100)
+
+    def test_a_departed_member_still_resolves(self):
+        """Barry Knight voted on 2026-02-03 and left service on 2026-02-17."""
+        roster = {m.MemberID: m for m in self.client.get_members(20261)}
+
+        knight = roster[217]
+        self.assertIsNotNone(knight.ServiceEndDate)
+        self.assertFalse(knight.is_serving)
+        self.assertEqual(knight.PartyCode, "R")
 
 
 class ClientConfigTest(unittest.TestCase):

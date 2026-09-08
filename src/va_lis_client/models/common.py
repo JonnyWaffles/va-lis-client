@@ -1,8 +1,44 @@
-"""Common/shared models — heartbeat and partner authentication."""
+"""Common/shared models — heartbeat, partner authentication, and the base model."""
 
 from datetime import datetime
+from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+
+class LISModel(BaseModel):
+    """A model that strips the stray whitespace LIS puts on string values.
+
+    LIS ships padded strings across unrelated fields, and which fields carry
+    the padding moves between sessions.  On the member roster alone:
+
+    ==================  =====  =====  =====  =====
+    Field               20241  20251  20261  20271
+    ==================  =====  =====  =====  =====
+    GABEmailAddress        57     57     50     45
+    ListDisplayName         1      1      4      4
+    MemberDisplayName       0      0      3      3
+    RoomNumber              1      0      0      0
+    ==================  =====  =====  =====  =====
+
+    The padding carries no meaning, and chasing it with a per-field accessor
+    loses to the next field LIS pads.  Every string on a subclass is stripped
+    at validation instead, so ``MemberNumber == "H0386"`` and
+    ``ResponseCode == "Y"`` hold whatever LIS sends.
+
+    A string of only whitespace becomes ``""``, not ``None``.
+    """
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _strip_strings(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.strip()
+
+        if isinstance(value, list):
+            return [v.strip() if isinstance(v, str) else v for v in value]
+
+        return value
 
 
 class Heartbeat(BaseModel):

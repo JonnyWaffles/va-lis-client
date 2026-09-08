@@ -18,6 +18,8 @@ questions the raw endpoints leave to every caller:
   and the body arrives as HTML.
 - Votes have no bill-first endpoint.  Reaching a bill's roll calls means
   walking its events for ``VoteID`` and fetching each one.
+- A ballot names a member by ``MemberID`` and nothing else, so party and
+  district take a second join against the session roster.
 
 Usage::
 
@@ -55,12 +57,14 @@ from va_lis_client.models import (
     LegislationSummaryItem,
     LegislationTextDetail,
     LegislationTextItem,
+    Member,
     Vote,
     VoteMember,
     VoteStatement,
 )
 
 DEFAULT_BILL_LIST_TTL = 15 * 60
+DEFAULT_ROSTER_TTL = 60 * 60
 
 _BILL_NUMBER_RE = re.compile(r"([A-Z]+)(\d+)")
 
@@ -149,6 +153,43 @@ class BillVote:
         return keyed
 
 
+@dataclass(frozen=True)
+class RollCallEntry:
+    """One member's vote, with the roster record that names and places them.
+
+    :meth:`LISService.roll_call` returns these.  A ballot from LIS carries a
+    ``MemberID`` and a display name and nothing else, so this pairs it with
+    the member's roster row for party and district.
+
+    ``vote`` is carried on every entry, because one bill has many votes.
+    Group on ``entry.vote.VoteID`` when you want them separated.
+    """
+
+    vote: Vote
+    member: Member
+    ballot: VoteMember
+
+    @property
+    def response(self) -> str | None:
+        """``"Y"`` yea, ``"N"`` nay, ``"A"`` abstain, or ``"X"`` not voting."""
+        return self.ballot.ResponseCode
+
+    @property
+    def name(self) -> str:
+        """The member's display name."""
+        return self.member.name
+
+    @property
+    def party(self) -> str | None:
+        """``"D"``, ``"I"``, or ``"R"``."""
+        return self.member.PartyCode
+
+    @property
+    def district(self) -> str | None:
+        """The district label, e.g. ``"71st"``."""
+        return self.member.DistrictName
+
+
 class LISService:
     """Resolution and reference joins over a :class:`LISClient`.
 
@@ -159,6 +200,9 @@ class LISService:
             through a session, so this list expires.  The event type and
             status vocabularies are static, so the service keeps them for its
             whole life.
+        roster_ttl: Seconds to keep a session's member roster.  A roster
+            changes a handful of times a session, when a member resigns or
+            arrives, so it expires far more slowly than the bill list.
 
     Caches live on the instance, not on the module, so two services built with
     different API keys never share data.
@@ -169,11 +213,14 @@ class LISService:
         client: LISClient | None = None,
         *,
         bill_list_ttl: float = DEFAULT_BILL_LIST_TTL,
+        roster_ttl: float = DEFAULT_ROSTER_TTL,
     ):
         self.client = client if client is not None else LISClient()
         self.bill_list_ttl = bill_list_ttl
+        self.roster_ttl = roster_ttl
 
         self._bill_lists: dict[int, tuple[float, list[LegislationSummaryItem]]] = {}
+        self._rosters: dict[int, tuple[float, dict[int, Member]]] = {}
         self._event_types: dict[str, list[LegislationEventType]] | None = None
         self._statuses_by_name: dict[str, LegislationStatus] | None = None
         self._statuses_by_id: dict[int, LegislationStatus] | None = None
@@ -182,6 +229,7 @@ class LISService:
         # block a fetch for another.  ``_guard`` protects the lock table
         # itself; ``_reference_lock`` covers both static vocabularies.
         self._bill_list_locks: dict[int, threading.Lock] = {}
+        self._roster_locks: dict[int, threading.Lock] = {}
         self._guard = threading.Lock()
         self._reference_lock = threading.Lock()
 
@@ -434,6 +482,94 @@ class LISService:
 
         return results
 
+    def roll_call(
+        self,
+        bill_number: str,
+        session_code: int,
+        *,
+        vote_id: int | None = None,
+    ) -> list[RollCallEntry]:
+        """Who voted which way on a bill, with party and district attached.
+
+        This is :meth:`bill_votes` with the roster joined on.  It returns one
+        entry per member per vote, in the order LIS lists them, and each entry
+        carries its own ``vote`` because a bill has many.
+
+        **Only attributable roll calls are included.**  Voice votes record no
+        members, and a block vote records a chamber disposing of many bills at
+        once, so naming a member on either misstates the record.  Use
+        :meth:`bill_votes` when you want every vote including those.
+
+        The roster costs one extra request per session, cached for
+        ``roster_ttl``.  Members who left mid-session stay in it, so a vote
+        cast in January still resolves after a February resignation.
+
+        Args:
+            bill_number: Any case, padded or not.  ``hb0001`` resolves ``HB1``.
+            session_code: e.g. ``20261``.
+            vote_id: Narrow to a single vote.  Omit for every roll call.
+
+        Returns:
+            :class:`RollCallEntry` records.  Empty when a ballot names a
+            member absent from the roster, which does not happen in practice:
+            all 100 ballots on House vote 294006 resolve.
+        """
+        roster = self.members_by_id(session_code)
+
+        entries = []
+        for record in self.bill_votes(bill_number, session_code, roll_calls_only=True):
+            if vote_id is not None and record.vote.VoteID != vote_id:
+                continue
+
+            for ballot in record.vote.vote_members:
+                member = roster.get(ballot.MemberID)
+                if member is None:
+                    continue
+
+                entries.append(RollCallEntry(vote=record.vote, member=member, ballot=ballot))
+
+        return entries
+
+    def members_by_id(
+        self,
+        session_code: int,
+        *,
+        refresh: bool = False,
+    ) -> dict[int, Member]:
+        """The session's roster, keyed by ``MemberID``, cached for ``roster_ttl``.
+
+        ``MemberID`` is the join key from a ballot: every
+        :attr:`VoteMember.MemberID` on a roll call resolves here.
+
+        **Do not filter this on ``MemberStatus``.**  The roster deliberately
+        holds members who left or arrived mid-session, and they cast the votes
+        you are attributing.  Session 20261 carries 148 rows for 140 seats.
+
+        This reads the roster list rather than calling
+        :meth:`LISClient.get_member` per member, which answers 204 for 9 of
+        those 148.
+
+        Args:
+            session_code: e.g. ``20261``.
+            refresh: Fetch again even when a fresh copy is cached.
+        """
+        if not refresh:
+            cached = self._read_roster(session_code)
+            if cached is not None:
+                return cached
+
+        with self._roster_lock(session_code):
+            # Another thread may have filled the slot while this one waited.
+            if not refresh:
+                cached = self._read_roster(session_code)
+                if cached is not None:
+                    return cached
+
+            members = self.client.get_members(session_code=session_code)
+            roster = {m.MemberID: m for m in members}
+            self._rosters[session_code] = (time.monotonic(), roster)
+            return roster
+
     def event_types_by_code(self) -> dict[str, list[LegislationEventType]]:
         """The event type reference, grouped by ``EventCode``.
 
@@ -553,9 +689,10 @@ class LISService:
         return item.LegislationStatus if item is not None else None
 
     def clear_cache(self) -> None:
-        """Drop every cached bill list and reference vocabulary."""
+        """Drop every cached bill list, roster, and reference vocabulary."""
         with self._guard:
             self._bill_lists.clear()
+            self._rosters.clear()
 
         with self._reference_lock:
             self._event_types = None
@@ -574,6 +711,19 @@ class LISService:
     def _bill_list_lock(self, session_code: int) -> threading.Lock:
         with self._guard:
             return self._bill_list_locks.setdefault(session_code, threading.Lock())
+
+    def _read_roster(self, session_code: int) -> dict[int, Member] | None:
+        """The cached roster for a session, or None when absent or stale."""
+        cached = self._rosters.get(session_code)
+
+        if cached is None or time.monotonic() - cached[0] >= self.roster_ttl:
+            return None
+
+        return cached[1]
+
+    def _roster_lock(self, session_code: int) -> threading.Lock:
+        with self._guard:
+            return self._roster_locks.setdefault(session_code, threading.Lock())
 
     def _load_statuses(self) -> None:
         if self._statuses_by_name is not None:

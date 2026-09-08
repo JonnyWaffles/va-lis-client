@@ -24,11 +24,13 @@ from va_lis_client.models import (
     LegislationSummaryItem,
     LegislationTextDetail,
     LegislationTextItem,
+    Member,
     Vote,
 )
 from va_lis_client.service import (
     BillVote,
     LISService,
+    RollCallEntry,
     normalize_bill_number,
     pick_text_version,
     strip_html,
@@ -130,6 +132,29 @@ def vote(
     )
 
 
+def member(
+    member_id=1,
+    number="H0001",
+    name="Ada Lovelace",
+    party="D",
+    district="1st",
+    chamber="H",
+    status="Active",
+    ended=None,
+):
+    return Member(
+        MemberID=member_id,
+        MemberNumber=number,
+        MemberDisplayName=name,
+        PatronDisplayName=name.split()[-1],
+        ChamberCode=chamber,
+        DistrictName=district,
+        PartyCode=party,
+        MemberStatus=status,
+        ServiceEndDate=ended,
+    )
+
+
 def service_with_types():
     return LISService(FakeClient())
 
@@ -137,9 +162,19 @@ def service_with_types():
 class FakeClient:
     """A stand-in for LISClient that serves fixtures and counts calls."""
 
-    def __init__(self, bills=None, detail=None, texts=None, details=None, events=None, votes=None):
+    def __init__(
+        self,
+        bills=None,
+        detail=None,
+        texts=None,
+        details=None,
+        events=None,
+        votes=None,
+        members=None,
+    ):
         self.events = events if events is not None else []
         self.votes = votes if votes is not None else {}
+        self.members = members if members is not None else [member(1), member(2), member(3)]
         self.bills = bills if bills is not None else [bill_row()]
         self.detail = detail if detail is not None else bill_detail()
         self.texts = (
@@ -223,6 +258,10 @@ class FakeClient:
     def get_vote(self, vote_id):
         self._count("get_vote")
         return self.votes.get(vote_id)
+
+    def get_members(self, session_code, chamber_code=None):
+        self._count("get_members")
+        return list(self.members)
 
     def get_legislation_statuses(self):
         self._count("get_legislation_statuses")
@@ -669,14 +708,6 @@ class BillVoteTest(unittest.TestCase):
 
         self.assertEqual({k: len(v) for k, v in grouped.items()}, {"Y": 2, "N": 1, "X": 1})
 
-    def test_member_name_strips_the_lis_leading_space(self):
-        record = BillVote(event=event(1, "H5000", vote_id=1), vote=vote())
-
-        member = record.vote.vote_members[0]
-        member.MemberDisplayName = " Jessica L. Anderson"
-
-        self.assertEqual(member.name, "Jessica L. Anderson")
-
     def test_statements_key_on_member_id_not_vote_member_id(self):
         """VoteStatement.VoteMemberID is misnamed and holds a MemberID.
 
@@ -724,6 +755,188 @@ class BillVoteTest(unittest.TestCase):
         )
 
         self.assertTrue(record.is_committee)
+
+
+class RosterTest(unittest.TestCase):
+    def test_roster_keys_on_member_id(self):
+        client = FakeClient(members=[member(217, "H0206", "Barry D. Knight", party="R")])
+
+        roster = LISService(client).members_by_id(20261)
+
+        self.assertEqual(list(roster), [217])
+        self.assertEqual(roster[217].PartyCode, "R")
+
+    def test_roster_is_fetched_once_per_session(self):
+        client = FakeClient()
+        service = LISService(client)
+
+        service.members_by_id(20261)
+        service.members_by_id(20261)
+
+        self.assertEqual(client.calls["get_members"], 1)
+
+    def test_refresh_refetches(self):
+        client = FakeClient()
+        service = LISService(client)
+
+        service.members_by_id(20261)
+        service.members_by_id(20261, refresh=True)
+
+        self.assertEqual(client.calls["get_members"], 2)
+
+    def test_an_expired_roster_refetches(self):
+        client = FakeClient()
+        service = LISService(client, roster_ttl=0)
+
+        service.members_by_id(20261)
+        service.members_by_id(20261)
+
+        self.assertEqual(client.calls["get_members"], 2)
+
+    def test_clear_cache_drops_the_roster(self):
+        client = FakeClient()
+        service = LISService(client)
+
+        service.members_by_id(20261)
+        service.clear_cache()
+        service.members_by_id(20261)
+
+        self.assertEqual(client.calls["get_members"], 2)
+
+    def test_departed_members_stay_in_the_roster(self):
+        """A member who resigned in February still cast the January votes."""
+        gone = member(
+            9,
+            "H0334",
+            "Elizabeth B. Bennett-Parker",
+            status="Outgoing",
+            ended="2026-02-18T00:00:00",
+        )
+
+        roster = LISService(FakeClient(members=[gone])).members_by_id(20261)
+
+        self.assertIn(9, roster)
+        self.assertFalse(roster[9].is_serving)
+
+    def test_the_model_strips_every_string_not_just_the_named_ones(self):
+        """LIS pads different fields each session, so stripping is global."""
+        row = Member(
+            MemberID=1,
+            MemberDisplayName=" Jessica L. Anderson",
+            ListDisplayName=" Anderson, Jessica L.",
+            GABEmailAddress="deljanderson@house.virginia.gov      ",
+            RoomNumber=" 804 ",
+            MemberNumber=" H0386 ",
+            MemberStatus="Active ",
+        )
+
+        self.assertEqual(row.MemberDisplayName, "Jessica L. Anderson")
+        self.assertEqual(row.GABEmailAddress, "deljanderson@house.virginia.gov")
+        # These two have no accessor, and are the reason the strip is global.
+        self.assertEqual(row.RoomNumber, "804")
+        self.assertEqual(row.MemberNumber, "H0386")
+        self.assertEqual(row.MemberStatus, "Active")
+
+    def test_accessors_never_return_none(self):
+        row = Member(MemberID=1)
+
+        self.assertEqual((row.name, row.list_name, row.email), ("", "", ""))
+
+    def test_a_whitespace_only_string_becomes_empty_not_none(self):
+        row = Member(MemberID=1, RoomNumber="   ")
+
+        self.assertEqual(row.RoomNumber, "")
+
+    def test_ballots_are_stripped_too(self):
+        ballot = Vote(
+            VoteID=1,
+            VoteMember=[{"MemberID": 1, "MemberDisplayName": " Ada ", "ResponseCode": "Y "}],
+        ).vote_members[0]
+
+        self.assertEqual(ballot.MemberDisplayName, "Ada")
+        self.assertEqual(ballot.ResponseCode, "Y")
+
+
+class RollCallTest(unittest.TestCase):
+    def roster_client(self, **kwargs):
+        return FakeClient(
+            events=[event(1, "H5000", vote_id=294006)],
+            votes={294006: vote(294006, responses=("Y", "N", "X"))},
+            members=[
+                member(1, "H0001", "Ada Lovelace", party="D", district="1st"),
+                member(2, "H0002", "Grace Hopper", party="R", district="2nd"),
+                member(3, "H0003", "Katherine Johnson", party="I", district="3rd"),
+            ],
+            **kwargs,
+        )
+
+    def test_pairs_each_ballot_with_its_member(self):
+        entries = LISService(self.roster_client()).roll_call("HB1", 20261)
+
+        self.assertEqual(
+            [(e.name, e.party, e.district, e.response) for e in entries],
+            [
+                ("Ada Lovelace", "D", "1st", "Y"),
+                ("Grace Hopper", "R", "2nd", "N"),
+                ("Katherine Johnson", "I", "3rd", "X"),
+            ],
+        )
+
+    def test_every_entry_carries_its_vote(self):
+        entries = LISService(self.roster_client()).roll_call("HB1", 20261)
+
+        self.assertEqual({e.vote.VoteID for e in entries}, {294006})
+
+    def test_the_roster_costs_one_request_for_the_whole_bill(self):
+        client = self.roster_client()
+
+        LISService(client).roll_call("HB1", 20261)
+
+        self.assertEqual(client.calls["get_members"], 1)
+
+    def test_block_and_voice_votes_are_excluded(self):
+        client = FakeClient(
+            events=[event(1, "H5000", vote_id=1), event(2, "S4160", vote_id=2)],
+            votes={
+                1: vote(1, responses=("Y",)),
+                2: vote(2, responses=(), is_voice=True, is_block=True, bills=50),
+            },
+            members=[member(1)],
+        )
+
+        entries = LISService(client).roll_call("HB1", 20261)
+
+        self.assertEqual([e.vote.VoteID for e in entries], [1])
+
+    def test_vote_id_narrows_to_one_vote(self):
+        client = FakeClient(
+            events=[event(1, "H5000", vote_id=1), event(2, "S5100", vote_id=2)],
+            votes={1: vote(1, responses=("Y",)), 2: vote(2, responses=("N",))},
+            members=[member(1)],
+        )
+
+        entries = LISService(client).roll_call("HB1", 20261, vote_id=2)
+
+        self.assertEqual([(e.vote.VoteID, e.response) for e in entries], [(2, "N")])
+
+    def test_a_ballot_with_no_roster_row_is_skipped(self):
+        client = self.roster_client()
+        client.members = [member(1)]  # ballots name members 1, 2 and 3
+
+        entries = LISService(client).roll_call("HB1", 20261)
+
+        self.assertEqual([e.member.MemberID for e in entries], [1])
+
+    def test_entry_delegates_to_the_member_row(self):
+        entry = RollCallEntry(
+            vote=vote(),
+            member=member(1, name=" Ada Lovelace ", party="D", district="1st"),
+            ballot=vote().vote_members[0],
+        )
+
+        self.assertEqual(entry.name, "Ada Lovelace")
+        self.assertEqual(entry.party, "D")
+        self.assertEqual(entry.district, "1st")
 
 
 if __name__ == "__main__":

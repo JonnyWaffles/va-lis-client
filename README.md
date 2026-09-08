@@ -73,8 +73,14 @@ item, detail = service.bill_text("HB1", 20261)
 item, detail = service.bill_text("HB1", 20261, "HB1ER")
 print(strip_html(detail.DraftText))
 
-# Votes: per-member roll calls, both chambers, committee and floor.
-for record in service.bill_votes("HB1", 20261, roll_calls_only=True):
+# Who voted which way, with party and district already attached.
+for row in service.roll_call("HB1", 20261):
+    print(row.name, row.party, row.district, row.response)
+# Lashrecse D. Aird   D  13th  Y
+# Luther Cifers, III  R  10th  N
+
+# Every vote including the ones no member can be credited with.
+for record in service.bill_votes("HB1", 20261):
     notes = record.statements_by_member()
     for code, members in record.responses().items():   # "Y" "N" "A" "X"
         for m in members:
@@ -95,6 +101,13 @@ votes: two House committee, one House floor, two Senate committee, three
 Senate floor. Six of the eight are attributable to HB1 alone. See
 [Votes](#votes-per-member-roll-calls) for why the other two are not.
 
+**`roll_call` is `bill_votes` with the roster joined on.** A ballot from LIS
+names a member by `MemberID` and nothing else, so party and district take a
+second lookup against the session roster, cached for an hour. `roll_call`
+returns only the attributable votes, since naming a member on a block or voice
+vote misstates the record. HB1 gives 214 named ballots across its six roll
+calls. Each entry carries its own `vote`, because one bill has many.
+
 **`EventCode` is not unique.** The event-type vocabulary holds 3,912 rows under
 only 1,502 codes, and `H1405` alone returns four. Two of those four read
 "Reported from Labor and Commerce" and two read "Failed to report (defeated)
@@ -111,9 +124,11 @@ itself, for its status, description, or chief patron.
 
 **Caching.** The session bill list backs substring search and is the fallback
 for id resolution. It runs to roughly 3 MB, so `LISService` caches it for 15
-minutes (tune with `bill_list_ttl=`). The static reference vocabularies are
-kept for the life of the instance. Caches live on the instance, so build one
-service and keep it. Instances are safe to share between threads.
+minutes (tune with `bill_list_ttl=`). The member roster changes only when a
+member resigns or arrives, so it is cached for an hour (`roster_ttl=`). The
+static reference vocabularies are kept for the life of the instance. Caches
+live on the instance, so build one service and keep it. Instances are safe to
+share between threads.
 
 **Errors.** Everything derives from `LISError`, so one `except` clause covers
 the package. The resolution errors also derive from the builtin that fits them.
@@ -180,6 +195,7 @@ several overlapping identifiers:
 | `MemberID` | `217` | PK for a **person**. Stable across every vote and session |
 | `VoteMemberID` | `10988439` | PK for one **ballot** — that person's response on that one vote. New every vote |
 | `MemberNumber` | `"H0206"` | Chamber prefix + number, the human-facing member id |
+| `DistrictID` | `98` | Surrogate PK for a seat. The label is `DistrictName` on a member, `Title` on a district |
 
 **`MemberID` and `VoteMemberID` are not interchangeable, and one LIS field
 mixes them up.** See [The `VoteStatement.VoteMemberID`
@@ -394,6 +410,15 @@ across the chamber pair far more often, in 148 codes.
 **This service is absent from the LIS developer portal service list.** It is
 the only route to per-member votes. See [Votes](#votes-per-member-roll-calls).
 
+#### Member (`/Member/api/`)
+- `get_members(session_code, chamber_code=None)` → the session roster, with party and district
+- `get_member(member_id, session_code)` → one member, **204s for some sitting members**
+- `get_parties()` → 3 parties (D, I, R)
+- `get_districts()` → 140 districts (100 House, 40 Senate)
+
+`MemberID` is the join key from a ballot. See
+[Members](#members-the-roster-behind-a-roll-call).
+
 ### Modeled but not yet wired to client methods
 
 #### Schedule (`/Schedule/api/`)
@@ -481,12 +506,121 @@ Endpoint names confirmed 2026-09-08 but no client method exists yet:
 | Endpoint | Parameters | Notes |
 |---|---|---|
 | `MemberVoteSearch/getmembervotelistasync` | `memberID`, `sessionCode` | The member-first axis: every vote one member cast. Envelope `MemberVoteList`. Roughly **1.9 MB per member**, and it includes attendance roll calls, not only legislation |
-| `Member/getmemberlistasync` | `sessionCode`, `chamberCode` | Envelope `ShallowMembers` |
-| `Member/getmembersasync` | `sessionCode` | Envelope `Members` |
-| `Member/getmemberbyidasync` | `memberID`, `sessionCode` | Envelope `Members` |
 
-Wiring `Member` is the natural next step: a roll call gives `MemberID` and a
-display name, but party and district live here.
+## Members (the roster behind a roll call)
+
+A ballot names a member by `MemberID` and a display name. Party and district
+live in the `Member` service, and `MemberID` joins the two directly: all 100
+ballots on House vote 294006 resolve against the 2026 roster.
+
+`LISService.roll_call` does that join. `members_by_id(session_code)` exposes
+the cached roster if you want to do it yourself.
+
+### The roster is session scoped, and larger than the chamber
+
+`getmembersasync` **requires** `sessionCode` and returns HTTP 400 without it.
+The rosters genuinely differ: 148 rows for 20261, 140 for 20251, 142 for
+20241, with only 123 members shared between 2026 and 2024.
+
+Session 20261 returns 148 rows for 140 seats, 106 House against 100 and 42
+Senate against 40. That is correct, not a bug. The extras are members who left
+or arrived mid-session, plus one member who moved from the House to the Senate
+and so appears under two member numbers.
+
+**Do not filter on `MemberStatus`.** Delegate Barry Knight (`MemberID` 217)
+voted on HB1 on 3 February 2026 and his service ended on 17 February with
+reason `"Deceased"`. Drop the non-active rows and that vote loses its voter.
+
+### Other traps
+
+**`MemberStatusID` on the roster is the member's *previous* status.** The
+code itself is sound, and every `getmemberbyidasync` response agrees on it:
+`1` Active, `2` Inactive, `3` Outgoing. The roster list breaks it two ways.
+It omits the ID on 62 of 148 rows. And on a member who has left it keeps the
+status they held before leaving while refreshing the name:
+
+| Member | `MemberStatus` | list `MemberStatusID` | by-id | `ServiceEndDate` |
+|---|---|---|---|---|
+| Barry D. Knight | Inactive | 1 (Active) | 2 | 2026-02-17 |
+| Ghazala F. Hashmi | Inactive | 1 (Active) | 2 | 2026-01-17 |
+| Mark D. Sickles | Outgoing | 1 (Active) | 3 | 2026-01-17 |
+| Adam P. Ebbin | Outgoing | 1 (Active) | 3 | 2026-02-18 |
+
+All six rows whose list ID contradicts their own name look like this. Read
+the name, exactly as
+[events join their status on the name](#legislationevent-legislationeventapi).
+
+### Which member endpoint to use
+
+There are three, and they are incomplete in **different dimensions**. Neither
+of the two useful ones is simply the better one.
+
+| | `getmembersasync` | `getmemberbyidasync` | `getmemberlistasync` |
+|---|---|---|---|
+| Rows | **all 148** | 1, and **9 of 148 return nothing** | all 148 |
+| Fields | 28, nine always null | 29, five null | 16 |
+| Wired as | `get_members` | `get_member` | not wired |
+
+**The list is complete in rows and incomplete in fields.** It returns every
+member every time, but nine fields come back null on all 148 rows:
+`ChamberName`, `SeatNumber`, `VotingSequence`, `SessionID`, `SessionCode`,
+`Salutation`, `Seniority`, `StatusReason`, and `LastElectionDate`. Note
+`SessionCode` is null even though the query is session scoped, the same shape
+as the carry-over trap.
+
+**By-id is complete in fields and incomplete in rows.** It fills four of those
+nine — `ChamberName`, `SeatNumber`, `VotingSequence`, `SessionID` — and adds
+`MemberDetailID`. The other five are null there too. But it answered 204 for 9
+of the 148 members on the 2026 roster, including sitting ones.
+
+**Build on the list, because the two failures are not equally bad.** A missing
+row is unrecoverable: no name, no party, no district, and no error telling you
+so, which leaves that member's votes unattributable. A null field costs almost
+nothing, because the list still carries `MemberID`, name, `PartyCode`,
+`DistrictName`, `ChamberCode`, and the service dates — everything a voting
+record needs. What by-id adds is thin: `ChamberName` restates `ChamberCode`,
+`SessionID` is what you passed in, and `SeatNumber` and `VotingSequence` are
+seating-chart trivia. `LISService.roll_call` therefore reads the roster once
+and never calls by-id.
+
+**The one field where the list is wrong and by-id is right** is
+`MemberStatusID`, above. So: the list is authoritative for which members exist
+and for every field it populates except that one; by-id is authoritative for
+`MemberStatusID` and the four extra fields, when it answers.
+
+**The 204s are not a key problem.** Passing `identityID` 204s as well, and
+passing an `IdentityID` as `memberID` returns a *different* member, so the
+parameter is right. Every person holding two member records fails, which
+accounts for the four who moved from the House to the Senate mid-term and so
+appear under two member numbers. The remaining five have a single record and
+share no trait found so far. All nine 204 in every session tried, so it is a
+property of the member rather than the query.
+
+**Whitespace dirt, worse than anywhere else in the API — the client strips
+it for you.** Padded strings appear across unrelated fields, and which
+fields carry the padding moves between sessions:
+
+| Field | 20241 | 20251 | 20261 | 20271 |
+|---|---|---|---|---|
+| `GABEmailAddress` | 57 | 57 | 50 | 45 |
+| `ListDisplayName` | 1 | 1 | 4 | 4 |
+| `MemberDisplayName` | 0 | 0 | 3 | 3 |
+| `RoomNumber` | 1 | 0 | 0 | 0 |
+
+Chasing that with a per-field accessor loses to the next field LIS pads, so
+`LISModel` strips every string at validation. `MemberNumber == "H0386"` and
+`ResponseCode == "Y"` hold whatever LIS sends. `Member.name`, `.list_name`,
+and `.email` remain as shorthand that never returns `None`.
+
+**`getmemberlistasync` is strictly worse than both.** It returns the same 148
+rows under `ShallowMembers` with only 16 fields, dropping `DistrictID`,
+`DistrictName`, `RoomNumber`, and `ServiceEndDate`, so it can neither back a
+voting record nor tell you who left. It has no advantage over
+`getmembersasync`, which accepts the same undocumented `chamberCode` filter,
+so this client does not wire it.
+
+**A district labels itself `Title`; a member calls the same value
+`DistrictName`.** Both read `"71st"`.
 
 ## Votes (per-member roll calls)
 
@@ -876,6 +1010,7 @@ src/va_lis_client/
     ├── schedule.py     # Schedule, ScheduleType, MeetingRoom
     ├── calendar.py     # CalendarDetail, Agenda, ...
     ├── vote.py         # Vote, VoteMember, VoteLegislation, VoteStatement
+    ├── member.py       # Member, Party, District
     └── docket.py       # DocketDetail, DocketItem, DocketCategory, ...
 ```
 

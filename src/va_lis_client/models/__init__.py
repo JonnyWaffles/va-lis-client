@@ -21,6 +21,7 @@ Modules:
                    DocketDetail
     event        — EventReference, LegislationEvent, LegislationEventType,
                    ActorType
+    member       — Member, Party, District
     pagination   — Pagination, PagedList, page_request_header
 """
 
@@ -62,6 +63,7 @@ from va_lis_client.models.legislation import (
     LegislationVersion,
     Patron,
 )
+from va_lis_client.models.member import District, Member, Party
 from va_lis_client.models.pagination import (
     PagedList,
     Pagination,
@@ -138,6 +140,10 @@ __all__ = [
     "PagedList",
     "Pagination",
     "page_request_header",
+    # member
+    "District",
+    "Member",
+    "Party",
     # event
     "ActorType",
     "EventReference",
