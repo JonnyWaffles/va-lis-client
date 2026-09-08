@@ -7,7 +7,20 @@ everything".  The two axes agree — member 503's HB1 rows carry the same
 
 **A row is one (vote, bill) pair, not one vote.**  Member 503's 2026 history
 holds 2,910 rows over only 2,293 distinct ``VoteID`` values, because a block
-vote repeats once per bill it disposed of.  See :class:`MemberVoteResult`.
+vote repeats once per bill it disposed of.
+
+A :class:`~va_lis_client.models.vote.Vote` hangs two independent lists off one
+record — who voted, and which bills the vote disposed of::
+
+    Vote 297750
+      |-- 99  VoteMember       who voted, once each
+      +-- 105 VoteLegislation  which bills it passed
+
+This service flattens that pair-wise, so it can answer "how did she vote on
+HB150" separately from "how did she vote on HB253".  One member against one
+105-bill block is 105 rows for a single ballot cast.  See
+:mod:`va_lis_client.models.vote` for what a block vote is, and
+:class:`MemberVoteResult` for the field-level detail.
 """
 
 from datetime import datetime

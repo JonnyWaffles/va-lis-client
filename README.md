@@ -720,6 +720,56 @@ both flags, not one.
 `bill_votes(..., roll_calls_only=True)` filters on it. HB1 in 20261 has eight
 votes; six survive the filter.
 
+#### What a block vote actually is
+
+A chamber does not vote on every bill separately. It bundles the
+uncontroversial ones and disposes of them in a single motion. Members vote
+once, and that one vote passes the whole bundle.
+
+Vote 297750 is the extreme case in the 2026 session:
+
+```
+Date         2026-02-17
+Chamber      H, Floor
+Description  Read third time and passed House (97-Y 0-N 0-A)
+IsBlock      True
+members       99 recorded  (97 Y, 2 X)
+bills        105 disposed
+```
+
+97 delegates said yes and nobody said no. **That lopsidedness is the
+signature.** Anything contested gets pulled out and voted on by itself, so
+blocks and single-bill votes sit side by side on the same day:
+
+```
+voteID   block  bills  tally
+294005    True     27  (98-Y  0-N 0-A)    the bundle
+294007   False      1  (93-Y  5-N 0-A)    pulled out
+294021   False      1  (63-Y 35-N 0-A)    pulled out, genuinely fought
+294054    True     19  (39-Y  0-N 0-A)    a Senate bundle
+```
+
+**Every bill still gets its own event off the shared vote.** LIS writes a
+separate `LegislationEventID` per bill, all pointing at the one `VoteID`. So a
+bill's history looks like an ordinary passage, and the `VoteID` on it is
+shared with 104 other bills.
+
+**Do not try to spot this in the description text.** Only 9 of vote 297750's
+105 bill events say "Block Vote"; the other 96 read like an ordinary
+individual passage:
+
+```
+  96x  'Read third time and passed House (97-Y 0-N 0-A)'
+   9x  'Read third time and passed House  Block Vote (97-Y 0-N 0-A)'
+```
+
+Vote 294005 labels 1 of 27, and vote 294054 labels 2 of 19. Test `IsBlock`.
+
+**Why this matters for reporting.** "Delegate Anthony voted Yes on HB150" is
+true and misleading. She voted yes to a bundle of 105 bills that nobody in the
+chamber opposed, which is not a considered position on HB150. That is why
+`roll_call` excludes block votes and `MemberVote.is_block` exists.
+
 ### Who voted which way
 
 `BillVote.responses()` groups the members by `ResponseCode`:

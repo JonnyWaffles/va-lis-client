@@ -271,6 +271,37 @@ class LiveVoteTest(unittest.TestCase):
         self.assertEqual(len(vote.vote_members), 40)
         self.assertGreater(len(vote.vote_legislation), 1)
 
+    def test_a_block_vote_bundles_uncontested_bills(self):
+        """One motion, one ballot each, many bills — and near-unanimous."""
+        vote = self.client.get_vote(297750)
+
+        self.assertTrue(vote.IsBlock)
+        self.assertEqual(len(vote.vote_legislation), 105)
+        self.assertEqual(len(vote.vote_members), 99)
+        self.assertEqual(
+            Counter(m.ResponseCode for m in vote.vote_members)["N"],
+            0,
+            "A block that drew a nay would have been pulled apart",
+        )
+
+    def test_a_block_vote_gives_each_bill_its_own_event(self):
+        vote = self.client.get_vote(297750)
+
+        event_ids = {leg.LegislationEventID for leg in vote.vote_legislation}
+        self.assertEqual(len(event_ids), len(vote.vote_legislation))
+
+    def test_the_block_vote_label_is_not_in_most_descriptions(self):
+        """Test IsBlock; the action text hides it on most of the bundle."""
+        vote = self.client.get_vote(297750)
+
+        labelled = [
+            leg
+            for leg in vote.vote_legislation
+            if "block vote" in (leg.LegislationActionDescription or "").lower()
+        ]
+        self.assertLess(len(labelled), len(vote.vote_legislation) // 2)
+        self.assertGreater(len(vote.vote_legislation) - len(labelled), 50)
+
     def test_a_voice_vote_records_no_members(self):
         vote = self.client.get_vote(self.SENATE_VOICE)
 

@@ -12,6 +12,27 @@ Two traps dominate this service:
 - **``VoteStatement.VoteMemberID`` holds a ``MemberID``, not a
   ``VoteMemberID``.**  The join implied by the field name silently matches
   nothing.  See :class:`VoteStatement`.
+
+What a block vote is
+--------------------
+A chamber does not vote on every bill separately.  It bundles the
+uncontroversial ones and disposes of them in one motion, so members vote once
+and that vote passes the whole bundle.  Vote 297750 recorded 99 members and
+passed **105 bills** at 97-Y 0-N.
+
+That lopsidedness is the signature: anything contested gets pulled out and
+voted on alone, so a single session day carries both a 27-bill block at
+98-Y 0-N and separate bills at 63-Y 35-N.
+
+Every bill still gets its own ``LegislationEventID`` off the shared vote, so a
+bill's history reads like an ordinary passage while its ``VoteID`` is shared
+with a hundred others.  **The description text will not tell you.**  Only 9 of
+vote 297750's 105 bill events say "Block Vote"; the other 96 read exactly like
+an individual passage.  Test ``IsBlock``.
+
+The practical point: crediting a member with a position on one bill out of a
+105-bill unanimous bundle misstates the record.  That is why
+:attr:`~va_lis_client.service.BillVote.is_roll_call` rejects them.
 """
 
 from datetime import datetime
