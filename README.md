@@ -79,6 +79,11 @@ for row in service.roll_call("HB1", 20261):
 # Lashrecse D. Aird   D  13th  Y
 # Luther Cifers, III  R  10th  N
 
+# The other axis: everything one member voted on.
+for v in service.member_votes(503, 20261):
+    print(v.bill_number, v.response, "BLOCK" if v.is_block else "")
+votes = service.member_votes_on(503, "hb0001", 20261)
+
 # Every vote including the ones no member can be credited with.
 for record in service.bill_votes("HB1", 20261):
     notes = record.statements_by_member()
@@ -125,7 +130,8 @@ itself, for its status, description, or chief patron.
 **Caching.** The session bill list backs substring search and is the fallback
 for id resolution. It runs to roughly 3 MB, so `LISService` caches it for 15
 minutes (tune with `bill_list_ttl=`). The member roster changes only when a
-member resigns or arrives, so it is cached for an hour (`roster_ttl=`). The
+member resigns or arrives, so it is cached for an hour (`roster_ttl=`), and a
+member's 1.9 MB vote history rides the same TTL, keyed per member. The
 static reference vocabularies are kept for the life of the instance. Caches
 live on the instance, so build one service and keep it. Instances are safe to
 share between threads.
@@ -419,6 +425,12 @@ the only route to per-member votes. See [Votes](#votes-per-member-roll-calls).
 `MemberID` is the join key from a ballot. See
 [Members](#members-the-roster-behind-a-roll-call).
 
+#### MemberVoteSearch (`/MemberVoteSearch/api/`)
+- `get_member_votes(member_id, session_code)` → every vote one member cast
+
+The member-first axis, where `/Vote` is bill-first. See
+[The member-first axis](#the-member-first-axis).
+
 ### Modeled but not yet wired to client methods
 
 #### Schedule (`/Schedule/api/`)
@@ -493,19 +505,12 @@ These services exist in the portal but haven't been investigated:
 - LegislationFileGeneration
 - LegislationPatron
 - LegislationSubject
+- MemberVoteSearch (only `getmembervotelistasync` is wired)
 - MembersByCommittee
 - MinutesBook
 - Organization
 - Person
 - Personnel
-
-#### Probed, live, not yet wired
-
-Endpoint names confirmed 2026-09-08 but no client method exists yet:
-
-| Endpoint | Parameters | Notes |
-|---|---|---|
-| `MemberVoteSearch/getmembervotelistasync` | `memberID`, `sessionCode` | The member-first axis: every vote one member cast. Envelope `MemberVoteList`. Roughly **1.9 MB per member**, and it includes attendance roll calls, not only legislation |
 
 ## Members (the roster behind a roll call)
 
@@ -621,6 +626,64 @@ so this client does not wire it.
 
 **A district labels itself `Title`; a member calls the same value
 `DistrictName`.** Both read `"71st"`.
+
+## The member-first axis
+
+`/Vote` answers "who voted on this bill". `/MemberVoteSearch` answers the
+other direction: "how did this member vote on everything". The two agree —
+`member_votes_on(503, "HB1", 20261)` and `roll_call("HB1", 20261)` return the
+same `VoteID` values with the same responses, and a live test asserts it.
+
+```python
+for v in service.member_votes(503, 20261):
+    print(v.bill_number, v.response, "BLOCK" if v.is_block else "")
+```
+
+Delegate Anthony's 2026 record: **2,867 bill positions over 2,250 distinct
+votes**, 2,179 floor, 437 committee, 251 subcommittee.
+
+### A row is a (vote, bill) pair, not a vote
+
+A block vote repeats, once per bill it disposed of. One House vote in that
+record — `VoteID` 297750, "Read third time and passed House (97-Y 0-N 0-A)" —
+appears **105 times**, once for each bill it passed. So `len(rows)` counts
+bill positions and overstates how often a member voted. Count distinct
+`VoteID` for votes cast.
+
+**This endpoint carries no `IsBlock` flag**, unlike a `Vote` record. The
+service recovers it by counting the rows that share a `VoteID`, and the count
+is exact: for vote 297750 it derives 105, and `Vote.vote_legislation` also
+holds 105. Read `MemberVote.is_block` before treating a row as the member's
+verdict on that one bill.
+
+### `ClassificationName` is not the legislation filter
+
+It takes three values, and only one of them means "not a bill":
+
+| `ClassificationName` | Rows | Has a bill? | What it is |
+|---|---|---|---|
+| `Legislation` | 2,179 | yes | floor votes on bills |
+| `null` | 688 | **yes** | committee and subcommittee votes on bills |
+| `Attendance` | 43 | no | quorum roll calls |
+
+**Filter on `LegislationNumber`.** Filtering on
+`ClassificationName == "Legislation"` silently drops every committee and
+subcommittee vote the member cast — 688 of them here, nearly a quarter of the
+record. `member_votes` filters correctly and takes `legislation_only=False`
+if you want the attendance rows too.
+
+### Other notes
+
+**It is the heaviest response in the API**, roughly 1.9 MB per member, and you
+cannot ask for several members at once. Both `memberID` and `sessionCode` are
+required, and omitting either returns HTTP 400. `chamberCode` is accepted and
+silently ignored — it returns a byte-identical response. `LISService` caches
+the payload per member and session for `roster_ttl`.
+
+**`VoteStatement` the field collides with `VoteStatement` the model**, so the
+scalar is aliased to `vote_statement` on the Python side. It is always null in
+practice; the real corrections are in `VoteStatements`, whose `VoteMemberID`
+holds a `MemberID` like everywhere else.
 
 ## Votes (per-member roll calls)
 
@@ -1011,6 +1074,7 @@ src/va_lis_client/
     ├── calendar.py     # CalendarDetail, Agenda, ...
     ├── vote.py         # Vote, VoteMember, VoteLegislation, VoteStatement
     ├── member.py       # Member, Party, District
+    ├── member_vote.py  # MemberVoteResult — the member-first axis
     └── docket.py       # DocketDetail, DocketItem, DocketCategory, ...
 ```
 

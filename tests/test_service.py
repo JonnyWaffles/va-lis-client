@@ -25,6 +25,7 @@ from va_lis_client.models import (
     LegislationTextDetail,
     LegislationTextItem,
     Member,
+    MemberVoteResult,
     Vote,
 )
 from va_lis_client.service import (
@@ -155,6 +156,29 @@ def member(
     )
 
 
+def vote_result(
+    vote_id=294006,
+    bill="HB1",
+    response="Y",
+    committee_id=None,
+    classification="Legislation",
+    statements=(),
+):
+    return MemberVoteResult(
+        VoteID=vote_id,
+        LegislationNumber=bill,
+        LegislationID=98525 if bill else None,
+        ResponseCode=response,
+        CommitteeID=committee_id,
+        VoteType="Committee" if committee_id else "Floor",
+        ClassificationName=classification,
+        VoteStatements=[
+            {"VoteStatementID": i, "VoteMemberID": 503, "VoteStatement": t}
+            for i, t in enumerate(statements, start=1)
+        ],
+    )
+
+
 def service_with_types():
     return LISService(FakeClient())
 
@@ -171,10 +195,12 @@ class FakeClient:
         events=None,
         votes=None,
         members=None,
+        member_votes=None,
     ):
         self.events = events if events is not None else []
         self.votes = votes if votes is not None else {}
         self.members = members if members is not None else [member(1), member(2), member(3)]
+        self.member_votes = member_votes if member_votes is not None else []
         self.bills = bills if bills is not None else [bill_row()]
         self.detail = detail if detail is not None else bill_detail()
         self.texts = (
@@ -262,6 +288,10 @@ class FakeClient:
     def get_members(self, session_code, chamber_code=None):
         self._count("get_members")
         return list(self.members)
+
+    def get_member_votes(self, member_id, session_code):
+        self._count("get_member_votes")
+        return list(self.member_votes)
 
     def get_legislation_statuses(self):
         self._count("get_legislation_statuses")
@@ -937,6 +967,132 @@ class RollCallTest(unittest.TestCase):
         self.assertEqual(entry.name, "Ada Lovelace")
         self.assertEqual(entry.party, "D")
         self.assertEqual(entry.district, "1st")
+
+
+class MemberVoteTest(unittest.TestCase):
+    """The member-first axis: /MemberVoteSearch."""
+
+    def client(self, rows):
+        return FakeClient(member_votes=rows)
+
+    def test_attendance_rows_are_dropped_by_default(self):
+        rows = [
+            vote_result(1, "HB1"),
+            vote_result(2, None, classification="Attendance"),
+        ]
+
+        votes = LISService(self.client(rows)).member_votes(503, 20261)
+
+        self.assertEqual([v.bill_number for v in votes], ["HB1"])
+
+    def test_legislation_only_false_keeps_attendance(self):
+        rows = [vote_result(1, "HB1"), vote_result(2, None, classification="Attendance")]
+
+        votes = LISService(self.client(rows)).member_votes(503, 20261, legislation_only=False)
+
+        self.assertEqual(len(votes), 2)
+
+    def test_a_null_classification_row_is_still_legislation(self):
+        """688 of one member's rows are committee votes with a null class."""
+        rows = [vote_result(1, "HB1", committee_id=14, classification=None)]
+
+        votes = LISService(self.client(rows)).member_votes(503, 20261)
+
+        self.assertEqual([v.bill_number for v in votes], ["HB1"])
+        self.assertTrue(votes[0].is_committee)
+
+    def test_block_fan_out_is_derived_from_repeated_vote_ids(self):
+        """MemberVoteSearch has no IsBlock, so the service counts the rows."""
+        rows = [
+            vote_result(900, "HB1"),
+            vote_result(900, "HB2"),
+            vote_result(900, "HB3"),
+            vote_result(901, "HB4"),
+        ]
+
+        votes = LISService(self.client(rows)).member_votes(503, 20261)
+
+        self.assertEqual([v.bills_in_vote for v in votes], [3, 3, 3, 1])
+        self.assertEqual([v.is_block for v in votes], [True, True, True, False])
+
+    def test_a_row_is_a_vote_bill_pair_not_a_vote(self):
+        rows = [vote_result(900, "HB1"), vote_result(900, "HB2")]
+
+        votes = LISService(self.client(rows)).member_votes(503, 20261)
+
+        self.assertEqual(len(votes), 2)
+        self.assertEqual(len({v.result.VoteID for v in votes}), 1)
+
+    def test_the_history_is_fetched_once_per_member_and_session(self):
+        client = self.client([vote_result()])
+        service = LISService(client)
+
+        service.member_votes(503, 20261)
+        service.member_votes(503, 20261)
+
+        self.assertEqual(client.calls["get_member_votes"], 1)
+
+    def test_a_different_member_is_a_different_cache_entry(self):
+        client = self.client([vote_result()])
+        service = LISService(client)
+
+        service.member_votes(503, 20261)
+        service.member_votes(504, 20261)
+
+        self.assertEqual(client.calls["get_member_votes"], 2)
+
+    def test_refresh_refetches(self):
+        client = self.client([vote_result()])
+        service = LISService(client)
+
+        service.member_votes(503, 20261)
+        service.member_votes(503, 20261, refresh=True)
+
+        self.assertEqual(client.calls["get_member_votes"], 2)
+
+    def test_clear_cache_drops_the_history(self):
+        client = self.client([vote_result()])
+        service = LISService(client)
+
+        service.member_votes(503, 20261)
+        service.clear_cache()
+        service.member_votes(503, 20261)
+
+        self.assertEqual(client.calls["get_member_votes"], 2)
+
+    def test_votes_on_a_bill_normalizes_the_number(self):
+        rows = [vote_result(1, "HB1"), vote_result(2, "HB2"), vote_result(3, "HB1")]
+
+        votes = LISService(self.client(rows)).member_votes_on(503, "hb0001", 20261)
+
+        self.assertEqual([v.result.VoteID for v in votes], [1, 3])
+
+    def test_votes_on_a_bill_the_member_never_saw_is_empty(self):
+        rows = [vote_result(1, "HB1")]
+
+        self.assertEqual(LISService(self.client(rows)).member_votes_on(503, "SB99", 20261), [])
+
+    def test_votes_on_rejects_a_bad_bill_number(self):
+        with self.assertRaises(InvalidBillNumberError):
+            LISService(self.client([])).member_votes_on(503, "not-a-bill", 20261)
+
+    def test_statements_ride_along_on_the_row(self):
+        rows = [vote_result(1, "HB295", statements=("Recorded as yea. Intended nay.",))]
+
+        votes = LISService(self.client(rows)).member_votes(503, 20261)
+
+        self.assertEqual(
+            votes[0].result.VoteStatements[0].VoteStatement,
+            "Recorded as yea. Intended nay.",
+        )
+        # Same misnaming as everywhere else: this holds a MemberID.
+        self.assertEqual(votes[0].result.VoteStatements[0].VoteMemberID, 503)
+
+    def test_the_scalar_vote_statement_field_is_aliased(self):
+        """VoteStatement the field collides with VoteStatement the model."""
+        row = MemberVoteResult.model_validate({"VoteID": 1, "VoteStatement": None})
+
+        self.assertIsNone(row.vote_statement)
 
 
 if __name__ == "__main__":

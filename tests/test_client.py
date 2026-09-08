@@ -15,7 +15,7 @@ from collections import Counter
 
 import requests
 
-from va_lis_client import LISClient, LISClientError
+from va_lis_client import LISClient, LISClientError, LISService
 from va_lis_client.models import (
     Heartbeat,
     Legislation,
@@ -526,6 +526,111 @@ class LiveRollCallJoinTest(unittest.TestCase):
         self.assertIsNotNone(knight.ServiceEndDate)
         self.assertFalse(knight.is_serving)
         self.assertEqual(knight.PartyCode, "R")
+
+
+@_skip_live
+class LiveMemberVoteSearchTest(unittest.TestCase):
+    """The member-first axis, anchored on Delegate Anthony in 2026."""
+
+    MEMBER = 503  # Bonita G. Anthony, H0386
+    SESSION = 20261
+
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_a_row_is_a_vote_bill_pair_not_a_vote(self):
+        rows = self.client.get_member_votes(self.MEMBER, self.SESSION)
+
+        self.assertGreater(len(rows), len({r.VoteID for r in rows}))
+
+    def test_a_block_vote_repeats_once_per_bill(self):
+        rows = self.client.get_member_votes(self.MEMBER, self.SESSION)
+
+        counts = Counter(r.VoteID for r in rows)
+        vote_id, fan_out = counts.most_common(1)[0]
+        self.assertGreater(fan_out, 1)
+
+        # The derived count must match what the bill-first record reports.
+        vote = self.client.get_vote(vote_id)
+        self.assertEqual(fan_out, len(vote.vote_legislation))
+        self.assertTrue(vote.IsBlock)
+
+    def test_classification_name_is_not_the_legislation_filter(self):
+        """Null classification still means a bill; only attendance has none."""
+        rows = self.client.get_member_votes(self.MEMBER, self.SESSION)
+
+        null_class = [r for r in rows if r.ClassificationName is None]
+        attendance = [r for r in rows if r.ClassificationName == "Attendance"]
+
+        self.assertGreater(len(null_class), 0)
+        self.assertTrue(all(r.LegislationNumber for r in null_class))
+        self.assertTrue(all(r.LegislationNumber is None for r in attendance))
+
+    def test_null_classification_rows_are_committee_votes(self):
+        rows = self.client.get_member_votes(self.MEMBER, self.SESSION)
+
+        null_class = [r for r in rows if r.ClassificationName is None]
+        self.assertEqual({r.VoteType for r in null_class}, {"Committee", "Subcommittee"})
+
+    def test_both_parameters_are_required(self):
+        with self.assertRaises(requests.HTTPError):
+            self.client.get_member_votes(self.MEMBER, None)
+
+    def test_the_two_axes_agree_on_a_bill(self):
+        """Member-first and bill-first return the same VoteIDs and responses."""
+        rows = self.client.get_member_votes(self.MEMBER, self.SESSION)
+        mine = {(r.VoteID, r.ResponseCode) for r in rows if r.LegislationNumber == "HB1"}
+
+        vote_ids = (291609, 294006)  # HB1's two House votes
+        theirs = set()
+        for vote_id in vote_ids:
+            vote = self.client.get_vote(vote_id)
+            ballot = next(b for b in vote.vote_members if b.MemberID == self.MEMBER)
+            theirs.add((vote_id, ballot.ResponseCode))
+
+        self.assertEqual(mine, theirs)
+
+    def test_statements_use_the_same_misnamed_member_id(self):
+        rows = self.client.get_member_votes(self.MEMBER, self.SESSION)
+
+        with_statements = [r for r in rows if r.VoteStatements]
+        self.assertGreater(len(with_statements), 0)
+        for r in with_statements:
+            for s in r.VoteStatements:
+                self.assertEqual(s.VoteMemberID, self.MEMBER)
+
+    def test_the_scalar_statement_field_is_always_null(self):
+        rows = self.client.get_member_votes(self.MEMBER, self.SESSION)
+
+        self.assertTrue(all(r.vote_statement is None for r in rows))
+
+
+@_skip_live
+class LiveMemberVoteServiceTest(unittest.TestCase):
+    def setUp(self):
+        self.service = LISService()
+
+    def test_member_votes_drops_only_the_attendance_rows(self):
+        every = self.service.member_votes(503, 20261, legislation_only=False)
+        bills = self.service.member_votes(503, 20261)
+
+        dropped = len(every) - len(bills)
+        self.assertGreater(dropped, 0)
+        self.assertTrue(all(v.bill_number for v in bills))
+
+    def test_member_votes_on_agrees_with_roll_call(self):
+        mine = {
+            (v.result.VoteID, v.response)
+            for v in self.service.member_votes_on(503, "hb0001", 20261)
+        }
+        theirs = {
+            (e.vote.VoteID, e.response)
+            for e in self.service.roll_call("HB1", 20261)
+            if e.member.MemberID == 503
+        }
+
+        self.assertEqual(mine, theirs)
+        self.assertGreater(len(mine), 0)
 
 
 class ClientConfigTest(unittest.TestCase):

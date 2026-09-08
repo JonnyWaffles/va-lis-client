@@ -74,6 +74,7 @@ from va_lis_client.models import (
     LegislationTextItem,
     LegislationVersion,
     Member,
+    MemberVoteResult,
     PagedList,
     Pagination,
     Partner,
@@ -843,6 +844,49 @@ class LISClient:
         if data is None:
             return []
         return [Party.model_validate(p) for p in data.get("Parties", [])]
+
+    def get_member_votes(self, member_id: int, session_code: int) -> list[MemberVoteResult]:
+        """Every vote one member cast in a session — the member-first axis.
+
+        :meth:`get_vote` answers "who voted on this bill".  This answers the
+        other direction.  The two agree: a member's rows for a bill carry the
+        same ``VoteID`` values a bill-first lookup returns.
+
+        **A row is one (vote, bill) pair, not one vote.**  A block vote repeats
+        once per bill it disposed of, so member 503's 2026 history holds 2,910
+        rows over only 2,293 distinct ``VoteID`` values, with one vote
+        appearing 105 times.  Count distinct ``VoteID`` to count votes.
+
+        **Filter on ``LegislationNumber``, not ``ClassificationName``.**  The
+        classification is null on all 688 committee and subcommittee rows,
+        which are still votes on bills.  Only the 43 attendance roll calls
+        lack a ``LegislationNumber``.
+
+        This is the heaviest response in the API at roughly **1.9 MB per
+        member**, and there is no way to ask for several members at once:
+        both parameters are required, and omitting either returns HTTP 400.
+        ``chamberCode`` is accepted and ignored.  Prefer
+        :meth:`LISService.member_votes`, which caches.
+
+        Args:
+            member_id: ``MemberID`` from the roster or a ballot.
+            session_code: e.g. ``20261``.  Required.
+
+        Envelope key: ``MemberVoteList`` — one row, whose ``VoteResult`` holds
+        the votes.  This returns that inner list.
+        """
+        data = self._get(
+            "/MemberVoteSearch/api/getmembervotelistasync",
+            params={"memberID": member_id, "sessionCode": session_code},
+        )
+        if data is None:
+            return []
+
+        rows = data.get("MemberVoteList", [])
+        if not rows:
+            return []
+
+        return [MemberVoteResult.model_validate(v) for v in rows[0].get("VoteResult", [])]
 
     def get_districts(self) -> list[District]:
         """Reference list of 140 districts — 100 House and 40 Senate.

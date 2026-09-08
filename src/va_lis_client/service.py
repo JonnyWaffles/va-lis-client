@@ -20,6 +20,9 @@ questions the raw endpoints leave to every caller:
   walking its events for ``VoteID`` and fetching each one.
 - A ballot names a member by ``MemberID`` and nothing else, so party and
   district take a second join against the session roster.
+- The member-first vote endpoint returns one row per (vote, bill) pair and
+  omits the block flag, so the service derives it by counting the rows that
+  share a ``VoteID``.
 
 Usage::
 
@@ -40,6 +43,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 from html.parser import HTMLParser
 
@@ -58,6 +62,7 @@ from va_lis_client.models import (
     LegislationTextDetail,
     LegislationTextItem,
     Member,
+    MemberVoteResult,
     Vote,
     VoteMember,
     VoteStatement,
@@ -190,6 +195,46 @@ class RollCallEntry:
         return self.member.DistrictName
 
 
+@dataclass(frozen=True)
+class MemberVote:
+    """One member's vote on one bill, with the block fan-out worked out.
+
+    :meth:`LISService.member_votes` returns these.  ``result`` is the raw row;
+    ``bills_in_vote`` counts how many bills that single ``VoteID`` disposed of.
+
+    ``/MemberVoteSearch`` carries no ``IsBlock`` flag, unlike
+    :class:`~va_lis_client.models.vote.Vote`, so the service counts the rows
+    sharing a ``VoteID`` to recover it.
+    """
+
+    result: MemberVoteResult
+    bills_in_vote: int
+
+    @property
+    def is_block(self) -> bool:
+        """True when this vote disposed of more than one bill at once.
+
+        A block vote is a real vote the member cast, but it is not a verdict
+        on this bill in particular, so do not read it as one.
+        """
+        return self.bills_in_vote > 1
+
+    @property
+    def is_committee(self) -> bool:
+        """True for a committee or subcommittee vote, false on the floor."""
+        return self.result.CommitteeID is not None
+
+    @property
+    def response(self) -> str | None:
+        """``"Y"`` yea, ``"N"`` nay, ``"A"`` abstain, or ``"X"`` not voting."""
+        return self.result.ResponseCode
+
+    @property
+    def bill_number(self) -> str | None:
+        """e.g. ``"HB1"``.  Never ``None`` on a legislation row."""
+        return self.result.LegislationNumber
+
+
 class LISService:
     """Resolution and reference joins over a :class:`LISClient`.
 
@@ -221,6 +266,7 @@ class LISService:
 
         self._bill_lists: dict[int, tuple[float, list[LegislationSummaryItem]]] = {}
         self._rosters: dict[int, tuple[float, dict[int, Member]]] = {}
+        self._member_votes: dict[tuple[int, int], tuple[float, list[MemberVoteResult]]] = {}
         self._event_types: dict[str, list[LegislationEventType]] | None = None
         self._statuses_by_name: dict[str, LegislationStatus] | None = None
         self._statuses_by_id: dict[int, LegislationStatus] | None = None
@@ -230,6 +276,7 @@ class LISService:
         # itself; ``_reference_lock`` covers both static vocabularies.
         self._bill_list_locks: dict[int, threading.Lock] = {}
         self._roster_locks: dict[int, threading.Lock] = {}
+        self._member_vote_locks: dict[tuple[int, int], threading.Lock] = {}
         self._guard = threading.Lock()
         self._reference_lock = threading.Lock()
 
@@ -530,6 +577,80 @@ class LISService:
 
         return entries
 
+    def member_votes(
+        self,
+        member_id: int,
+        session_code: int,
+        *,
+        legislation_only: bool = True,
+        refresh: bool = False,
+    ) -> list[MemberVote]:
+        """Every vote one member cast in a session, in LIS order.
+
+        This is the member-first axis, where :meth:`roll_call` is the
+        bill-first one.  The two agree on the same ``VoteID`` values.
+
+        Each entry knows how many bills its vote covered, because the endpoint
+        omits the ``IsBlock`` flag that :class:`~va_lis_client.models.vote.Vote`
+        carries.  Read :attr:`MemberVote.is_block` before treating a row as the
+        member's verdict on that one bill: member 503's 2026 history includes a
+        single House vote that passed 105 bills at once.
+
+        **A row is a (vote, bill) pair.**  ``len(...)`` counts bill positions,
+        not votes.  Count distinct ``result.VoteID`` for votes cast.
+
+        The response runs to roughly 1.9 MB, so it is cached for ``roster_ttl``
+        per member and session.
+
+        Args:
+            member_id: ``MemberID`` from the roster or a ballot.
+            session_code: e.g. ``20261``.
+            legislation_only: Drop the attendance roll calls, which carry no
+                bill.  This filters on ``LegislationNumber``, because
+                ``ClassificationName`` is null on every committee vote.
+            refresh: Fetch again even when a fresh copy is cached.
+        """
+        rows = self._member_vote_rows(member_id, session_code, refresh=refresh)
+
+        fan_out = Counter(r.VoteID for r in rows)
+
+        votes = []
+        for row in rows:
+            if legislation_only and not row.LegislationNumber:
+                continue
+
+            votes.append(MemberVote(result=row, bills_in_vote=fan_out[row.VoteID]))
+
+        return votes
+
+    def member_votes_on(
+        self,
+        member_id: int,
+        bill_number: str,
+        session_code: int,
+    ) -> list[MemberVote]:
+        """How one member voted on one bill, across every vote it saw.
+
+        The intersection of the two axes.  A member sees only the votes their
+        own chamber and committees cast, so a delegate returns nothing for a
+        Senate-only vote.
+
+        Args:
+            member_id: ``MemberID`` from the roster or a ballot.
+            bill_number: Any case, padded or not.  ``hb0001`` resolves ``HB1``.
+            session_code: e.g. ``20261``.
+
+        Raises:
+            InvalidBillNumberError: The string does not parse as a bill number.
+        """
+        number = normalize_bill_number(bill_number)
+
+        return [
+            v
+            for v in self.member_votes(member_id, session_code)
+            if (v.result.LegislationNumber or "").upper() == number
+        ]
+
     def members_by_id(
         self,
         session_code: int,
@@ -689,10 +810,11 @@ class LISService:
         return item.LegislationStatus if item is not None else None
 
     def clear_cache(self) -> None:
-        """Drop every cached bill list, roster, and reference vocabulary."""
+        """Drop every cached bill list, roster, vote history, and vocabulary."""
         with self._guard:
             self._bill_lists.clear()
             self._rosters.clear()
+            self._member_votes.clear()
 
         with self._reference_lock:
             self._event_types = None
@@ -724,6 +846,44 @@ class LISService:
     def _roster_lock(self, session_code: int) -> threading.Lock:
         with self._guard:
             return self._roster_locks.setdefault(session_code, threading.Lock())
+
+    def _member_vote_rows(
+        self,
+        member_id: int,
+        session_code: int,
+        *,
+        refresh: bool = False,
+    ) -> list[MemberVoteResult]:
+        """The raw ~1.9 MB vote history for a member, cached per session."""
+        key = (member_id, session_code)
+
+        if not refresh:
+            cached = self._read_member_votes(key)
+            if cached is not None:
+                return cached
+
+        with self._member_vote_lock(key):
+            # Another thread may have filled the slot while this one waited.
+            if not refresh:
+                cached = self._read_member_votes(key)
+                if cached is not None:
+                    return cached
+
+            rows = self.client.get_member_votes(member_id=member_id, session_code=session_code)
+            self._member_votes[key] = (time.monotonic(), rows)
+            return rows
+
+    def _read_member_votes(self, key: tuple[int, int]) -> list[MemberVoteResult] | None:
+        cached = self._member_votes.get(key)
+
+        if cached is None or time.monotonic() - cached[0] >= self.roster_ttl:
+            return None
+
+        return cached[1]
+
+    def _member_vote_lock(self, key: tuple[int, int]) -> threading.Lock:
+        with self._guard:
+            return self._member_vote_locks.setdefault(key, threading.Lock())
 
     def _load_statuses(self) -> None:
         if self._statuses_by_name is not None:
