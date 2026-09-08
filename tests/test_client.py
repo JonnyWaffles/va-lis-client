@@ -220,6 +220,152 @@ class LiveTextSessionScopeTest(unittest.TestCase):
         self.assertEqual(texts, [])
 
 
+@_skip_live
+class LiveVoteTest(unittest.TestCase):
+    """The ``/Vote`` service, reached through a bill event's ``VoteID``.
+
+    These IDs come from HB1 in the 2026 Regular Session, which completed, so
+    its record is final and the numbers below are stable.
+    """
+
+    SENATE_FLOOR = 300418  # Passed Senate (21-Y 19-N 0-A)
+    HOUSE_FLOOR = 294006  # Read third time and passed House (64-Y 34-N 0-A)
+    HOUSE_COMMITTEE = 291609  # Reported from Labor and Commerce (15-Y 7-N)
+    SENATE_BLOCK = 300173  # one 40-member roll call covering 50 bills
+    SENATE_VOICE = 300174  # a voice vote: no members at all
+
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_a_floor_vote_carries_every_member(self):
+        vote = self.client.get_vote(self.SENATE_FLOOR)
+
+        self.assertEqual(vote.VoteID, self.SENATE_FLOOR)
+        self.assertEqual(vote.ChamberCode, "S")
+        self.assertEqual(vote.VoteType, "Floor")
+        self.assertEqual(len(vote.vote_members), 40)
+
+    def test_a_committee_vote_names_its_committee(self):
+        vote = self.client.get_vote(self.HOUSE_COMMITTEE)
+
+        self.assertEqual(vote.VoteType, "Committee")
+        self.assertEqual(vote.CommitteeName, "Labor and Commerce")
+        self.assertEqual(len(vote.vote_members), 22)
+
+    def test_response_code_x_is_absent_from_the_tally(self):
+        """Summing the member rows does not reproduce VoteTally."""
+        vote = self.client.get_vote(self.HOUSE_FLOOR)
+
+        codes = [m.ResponseCode for m in vote.vote_members]
+        self.assertEqual(codes.count("X"), 2)
+        self.assertEqual(vote.VoteTally, "(64-Y 34-N 0-A)")
+        self.assertEqual(len(vote.vote_members), 100)
+
+    def test_a_block_vote_covers_many_bills(self):
+        vote = self.client.get_vote(self.SENATE_BLOCK)
+
+        self.assertTrue(vote.IsBlock)
+        self.assertEqual(len(vote.vote_members), 40)
+        self.assertGreater(len(vote.vote_legislation), 1)
+
+    def test_a_voice_vote_records_no_members(self):
+        vote = self.client.get_vote(self.SENATE_VOICE)
+
+        self.assertTrue(vote.IsVoice)
+        self.assertEqual(vote.vote_members, [])
+        self.assertEqual(vote.VoteTally, "(Voice Vote)")
+
+    def test_the_vote_event_code_can_disagree_with_the_event(self):
+        """Vote 294006 says H9999; the event that points at it says H5000."""
+        vote = self.client.get_vote(self.HOUSE_FLOOR)
+        events = self.client.get_bill_events(legislation_id=98525)
+
+        source = next(e for e in events if e.VoteID == self.HOUSE_FLOOR)
+        self.assertEqual(source.EventCode, "H5000")
+        self.assertNotEqual(vote.EventCode, source.EventCode)
+
+    def test_vote_legislation_links_back_to_the_event(self):
+        vote = self.client.get_vote(self.HOUSE_FLOOR)
+
+        self.assertIn(98525, [v.LegislationID for v in vote.vote_legislation])
+
+    def test_an_out_of_range_vote_id_returns_none(self):
+        """LIS answers 204 No Content, which the client turns into None."""
+        self.assertIsNone(self.client.get_vote(999999999))
+
+    def test_votes_reach_back_to_1994(self):
+        """Votes predate the bill data by three decades, so do not assume 2024."""
+        vote = self.client.get_vote(1)
+
+        self.assertEqual(vote.SessionCode, "19941")
+        self.assertEqual(vote.VoteDate.year, 1994)
+
+    def test_statement_vote_member_id_is_really_a_member_id(self):
+        """The field is misnamed: it joins on MemberID, never on VoteMemberID."""
+        vote = self.client.get_vote(self.HOUSE_FLOOR)
+
+        statement_ids = {s.VoteMemberID for s in vote.VoteStatements}
+        self.assertEqual(statement_ids, {17, 217})
+        self.assertEqual(statement_ids & {m.VoteMemberID for m in vote.vote_members}, set())
+        self.assertEqual(statement_ids, statement_ids & {m.MemberID for m in vote.vote_members})
+
+    def test_response_code_x_means_not_voting(self):
+        """A statement names an X member as 'recorded as not voting'."""
+        vote = self.client.get_vote(self.HOUSE_FLOOR)
+
+        by_member = {m.MemberID: m for m in vote.vote_members}
+        knight = by_member[217]
+        self.assertEqual(knight.ResponseCode, "X")
+        self.assertIn(
+            "not voting",
+            next(s.VoteStatement for s in vote.VoteStatements if s.VoteMemberID == 217),
+        )
+
+    def test_member_names_need_stripping(self):
+        vote = self.client.get_vote(self.HOUSE_FLOOR)
+
+        dirty = [m for m in vote.vote_members if m.MemberDisplayName != m.name]
+        self.assertGreater(len(dirty), 0)
+        self.assertTrue(all(m.name == m.MemberDisplayName.strip() for m in dirty))
+
+    def test_vote_types_reference(self):
+        types = self.client.get_vote_types()
+
+        self.assertEqual(
+            {t.VoteTypeID: t.Name for t in types},
+            {1: "Committee", 2: "Subcommittee", 3: "Floor"},
+        )
+
+
+@_skip_live
+class LiveEventTypeJoinTest(unittest.TestCase):
+    """EventCode is not unique, so the vocabulary needs a three-part key.
+
+    3,912 rows carry 1,502 distinct codes.  ``H1405`` alone returns four rows,
+    two of which mean the opposite of the other two.
+    """
+
+    def setUp(self):
+        self.types = LISClient().get_event_types()
+
+    def test_event_code_alone_does_not_identify_a_row(self):
+        codes = [t.EventCode for t in self.types]
+
+        self.assertGreater(len(codes), len(set(codes)))
+
+    def test_code_chamber_and_outcome_identify_exactly_one_row(self):
+        keys = [(t.EventCode, t.LegislationChamberCode, t.IsPassed) for t in self.types]
+
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_one_code_carries_opposite_outcomes(self):
+        rows = [t for t in self.types if t.EventCode == "H1405"]
+
+        descriptions = {t.LegislationDescription for t in rows}
+        self.assertIn("Reported from Labor and Commerce", descriptions)
+        self.assertIn("Failed to report (defeated) in Labor and Commerce", descriptions)
+
+
 class ClientConfigTest(unittest.TestCase):
     """Unit tests for client configuration (no network calls)."""
 

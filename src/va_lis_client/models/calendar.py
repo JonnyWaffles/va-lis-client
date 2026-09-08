@@ -5,6 +5,19 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 from va_lis_client.models.legislation import Patron
+from va_lis_client.models.vote import VoteMember
+
+__all__ = [
+    "Agenda",
+    "AgendaItem",
+    "CalendarCategory",
+    "CalendarComment",
+    "CalendarDetail",
+    "CalendarFile",
+    "CalendarItem",
+    "Staff",
+    "VoteMember",
+]
 
 
 class CalendarFile(BaseModel):
@@ -81,25 +94,6 @@ class CalendarItem(BaseModel):
     DeletionDate: datetime | None = None
     CalendarFiles: list[CalendarFile] = []
     CalendarComments: list[CalendarComment] = []
-
-
-class VoteMember(BaseModel):
-    """A member's vote on an agenda item.
-
-    Example::
-
-        {"VoteMemberID": 11270974, "MemberID": 503,
-         "MemberNumber": "H0353",
-         "MemberDisplayName": "Bonita G. Anthony",
-         "ResponseCode": "Y"}
-    """
-
-    VoteMemberID: int | None = None
-    MemberID: int | None = None
-    MemberNumber: str | None = None
-    MemberDisplayName: str | None = None
-    PatronDisplayName: str | None = None
-    ResponseCode: str | None = None  # "Y", "N", "A" (abstain), etc.
 
 
 class AgendaItem(BaseModel):

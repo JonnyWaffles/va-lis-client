@@ -8,6 +8,7 @@ from va_lis_client.exceptions import (
 )
 from va_lis_client.service import (
     DEFAULT_BILL_LIST_TTL,
+    BillVote,
     LISService,
     normalize_bill_number,
     pick_text_version,
@@ -16,6 +17,7 @@ from va_lis_client.service import (
 
 __all__ = [
     "BillNotFoundError",
+    "BillVote",
     "DEFAULT_BILL_LIST_TTL",
     "InvalidBillNumberError",
     "LISClient",

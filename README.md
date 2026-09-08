@@ -73,12 +73,34 @@ item, detail = service.bill_text("HB1", 20261)
 item, detail = service.bill_text("HB1", 20261, "HB1ER")
 print(strip_html(detail.DraftText))
 
+# Votes: per-member roll calls, both chambers, committee and floor.
+for record in service.bill_votes("HB1", 20261, roll_calls_only=True):
+    notes = record.statements_by_member()
+    for code, members in record.responses().items():   # "Y" "N" "A" "X"
+        for m in members:
+            print(code, m.MemberNumber, m.name, notes.get(m.MemberID, []))
+
 # Reference joins. Events carry a null type ID and a null status ID, so these
 # index the vocabularies on the keys that events actually carry.
-types = service.event_types_by_code()          # EventCode -> LegislationEventType
+types = service.event_types_by_code()          # EventCode -> [LegislationEventType]
+kind = service.event_type_for(event)           # the one row describing an event
 statuses = service.statuses_by_name()          # Name      -> LegislationStatus
 label = service.bill_status_label(bill, item)  # best available status label
 ```
+
+**Voting records.** `bill_votes` walks a bill's events, takes each `VoteID`,
+and fetches the roll call behind it. Events are the only bill-first route,
+because no vote endpoint accepts a `legislationID`. HB1 in 20261 returns eight
+votes: two House committee, one House floor, two Senate committee, three
+Senate floor. Six of the eight are attributable to HB1 alone. See
+[Votes](#votes-per-member-roll-calls) for why the other two are not.
+
+**`EventCode` is not unique.** The event-type vocabulary holds 3,912 rows under
+only 1,502 codes, and `H1405` alone returns four. Two of those four read
+"Reported from Labor and Commerce" and two read "Failed to report (defeated)
+in Labor and Commerce". `event_types_by_code` therefore returns **every** row
+per code, and `event_type_for` picks the one that describes a given event. See
+[Joining the event vocabulary](#joining-the-event-vocabulary).
 
 **Resolving an id cheaply.** The text list endpoint takes a bill number and
 returns rows carrying the `LegislationID`, so `resolve_bill_id` costs about
@@ -129,6 +151,9 @@ PartnerAuthentication service.
 - The session reference list reaches back to **1994**.
 - Bill data has been observed working for the **2024–2027 sessions** (as of
   Aug 2026). Earlier guidance said only 2025–2026 was authorized via the API.
+- **Votes reach back to 1994** — much further than bills. `voteID=1` is a
+  January 1994 committee vote. Do not assume a vote ID belongs to a recent
+  session.
 - Older session data is available as `legacylis.virginia.gov` CSV downloads.
 - No rate limits are documented anywhere.
 
@@ -151,6 +176,14 @@ several overlapping identifiers:
 | `DocketID` | `21114` | PK for a Senate committee docket |
 | `ScheduleID` | `3626` | PK for a scheduled meeting |
 | `LegislationEventID` | `1561089` | PK for a bill history event — follows the bill across carry-over (see below) |
+| `VoteID` | `294006` | PK for one vote. Reachable only from `LegislationEvent.VoteID` |
+| `MemberID` | `217` | PK for a **person**. Stable across every vote and session |
+| `VoteMemberID` | `10988439` | PK for one **ballot** — that person's response on that one vote. New every vote |
+| `MemberNumber` | `"H0206"` | Chamber prefix + number, the human-facing member id |
+
+**`MemberID` and `VoteMemberID` are not interchangeable, and one LIS field
+mixes them up.** See [The `VoteStatement.VoteMemberID`
+trap](#the-votestatementvotememberid-trap).
 
 ## Bill identity & carry-over
 
@@ -314,6 +347,53 @@ floor and conference continuances are covered by statuses 46–48 instead.
 `EventDate` is the true action date — a committee continuance is dated on
 the committee vote, not at crossover.
 
+#### Joining the event vocabulary
+
+`EventCode` is the join key onto the event-type reference, but **a code does
+not identify a row**. Measured 2026-09-08: 3,912 rows carry only 1,502
+distinct codes, and 1,326 codes repeat.
+
+The repeats are not harmless copies. `H1405` returns four rows:
+
+| `LegislationChamberCode` | `IsPassed` | `LegislationDescription` |
+| --- | --- | --- |
+| `H` | `true` | Reported from Labor and Commerce |
+| `S` | `true` | Reported from Labor and Commerce |
+| `H` | `false` | Failed to report (defeated) in Labor and Commerce |
+| `S` | `false` | Failed to report (defeated) in Labor and Commerce |
+
+A `dict[str, LegislationEventType]` keyed on the code keeps whichever row
+arrives last, so it can report a bill as **defeated when it passed**.
+
+`(EventCode, LegislationChamberCode, IsPassed)` is the real primary key: it
+yields 3,912 distinct keys for 3,912 rows, with no collisions.
+
+Two traps in that key:
+
+- **`LegislationChamberCode` is the bill's chamber, not the actor's.** A
+  Senate bill reported from a House committee carries the House actor code
+  `H1405` against a row whose chamber is `S`. The event's own `ChamberCode`
+  mirrors the code prefix, so it names the actor and cannot serve here. Take
+  the chamber from the event's `LegislationNumber` instead.
+- **`IsPassed` separates the twins.** Fixing the code and chamber still leaves
+  the pass/fail pair.
+
+Fixing `(EventCode, IsPassed)` and flipping only the chamber changes
+`LegislationDescription` for just 7 codes, five of which differ by a typo or
+a trailing space (`Privilegse` for `Privileges`). The two real ones are
+`G7210` (received by House versus Senate) and `H4620` (`Printed as engrossed`
+versus `Printed as second chamber engrossed`). `CalendarDescription` differs
+across the chamber pair far more often, in 148 codes.
+
+`LISService.event_type_for(event)` applies all of this.
+
+#### Vote (`/Vote/api/`)
+- `get_vote(vote_id)` → one vote with its per-member roll call
+- `get_vote_types()` → 3 vote types (1=Committee, 2=Subcommittee, 3=Floor)
+
+**This service is absent from the LIS developer portal service list.** It is
+the only route to per-member votes. See [Votes](#votes-per-member-roll-calls).
+
 ### Modeled but not yet wired to client methods
 
 #### Schedule (`/Schedule/api/`)
@@ -388,13 +468,173 @@ These services exist in the portal but haven't been investigated:
 - LegislationFileGeneration
 - LegislationPatron
 - LegislationSubject
-- Member
-- MemberVoteSearch
 - MembersByCommittee
 - MinutesBook
 - Organization
 - Person
 - Personnel
+
+#### Probed, live, not yet wired
+
+Endpoint names confirmed 2026-09-08 but no client method exists yet:
+
+| Endpoint | Parameters | Notes |
+|---|---|---|
+| `MemberVoteSearch/getmembervotelistasync` | `memberID`, `sessionCode` | The member-first axis: every vote one member cast. Envelope `MemberVoteList`. Roughly **1.9 MB per member**, and it includes attendance roll calls, not only legislation |
+| `Member/getmemberlistasync` | `sessionCode`, `chamberCode` | Envelope `ShallowMembers` |
+| `Member/getmembersasync` | `sessionCode` | Envelope `Members` |
+| `Member/getmemberbyidasync` | `memberID`, `sessionCode` | Envelope `Members` |
+
+Wiring `Member` is the natural next step: a roll call gives `MemberID` and a
+display name, but party and district live here.
+
+## Votes (per-member roll calls)
+
+The `/Vote` service is the only route to who voted how. It covers **both
+chambers**, and **committee, subcommittee, and floor** votes alike.
+
+**There is no bill-first endpoint.** Every `getvotesby...legislation...` name
+returns 404. Reach a vote through an event:
+
+```
+Legislation ──→ LegislationEvent.VoteID ──→ /Vote/api/getvotebyidasync
+                                              └── VoteMember[]  (the roll call)
+                                              └── VoteLegislation[] (bills covered)
+                                              └── VoteStatements[] (corrections)
+```
+
+`LISService.bill_votes(bill_number, session_code)` does that walk. It costs
+one request per vote.
+
+### A VoteID on a bill event is often not that bill's roll call
+
+Three flags decide whether you may attribute the members to the bill:
+
+| Flag | Meaning | Example |
+|---|---|---|
+| `IsVoice` | **No members recorded at all.** `VoteMember` is empty and `VoteTally` reads `(Voice Vote)` | vote 300174 |
+| `IsBlock` | One roll call disposing of **many bills at once**. Read `vote_legislation` for the count | vote 300173: 40 members, **50 bills** |
+| `IsPublic` | False on some block and voice votes | vote 300174 |
+
+A voice vote is not always a block: SB1 has a single-bill voice vote. Check
+both flags, not one.
+
+`BillVote.is_roll_call` applies this test, and
+`bill_votes(..., roll_calls_only=True)` filters on it. HB1 in 20261 has eight
+votes; six survive the filter.
+
+### Who voted which way
+
+`BillVote.responses()` groups the members by `ResponseCode`:
+
+| Code | Meaning |
+|---|---|
+| `Y` | yea |
+| `N` | nay |
+| `A` | abstain |
+| `X` | **not voting** |
+
+`X` is confirmed by a vote statement that reads "Delegate Knight was recorded
+as not voting" against Knight's `X` row on vote 294006.
+
+Each member carries `MemberID`, `MemberNumber` (e.g. `H0206`),
+`MemberDisplayName`, and `PatronDisplayName` (the surname alone). Use
+`VoteMember.name` rather than `MemberDisplayName`: LIS ships leading-space
+dirt on some rows, 2 of the 100 on vote 294006.
+
+Party and district are **not** in the roll call. They live in the `Member`
+service, which is probed but not yet wired.
+
+```
+HB1  House floor  2026-02-03  (64-Y 34-N 0-A)
+
+  yea (64)
+     H0386  Jessica L. Anderson
+     H0353  Bonita G. Anthony
+     H0253  Terry L. Austin      <-- recorded as yea. Intended to vote nay.
+     ...
+  nay (34)
+     H0333  Jason S. Ballard
+     ...
+  not voting (2)
+     H0370  Karen Keys-Gamarra
+     H0206  Barry D. Knight      <-- recorded as not voting. Intended to vote nay.
+```
+
+### Other traps
+
+**The tally string omits `X`.** House floor vote 294006 returns 100 member
+rows — 64 `Y`, 34 `N`, 2 `X` — against a tally of `(64-Y 34-N 0-A)`. Summing
+the members will not reproduce the tally, and the `X` members are neither yes,
+no, nor the abstentions the tally counts.
+
+**`VoteStatements` carries corrections the roll call does not reflect.** Vote
+294006 holds two, including "Delegate Austin was recorded as yea. Intended to
+vote nay." The member rows are **not** amended. Both facts are true, and only
+the recorded one counts. Surface the statements alongside any voting record
+you publish.
+
+### The `VoteStatement.VoteMemberID` trap
+
+**`VoteStatement.VoteMemberID` does not hold a `VoteMemberID`. It holds a
+`MemberID`.** The obvious join matches nothing, returns an empty result, and
+raises no error.
+
+Every row in a vote's `VoteMember` list carries two different IDs:
+
+| Column | Identifies | Stable across votes? |
+|---|---|---|
+| `MemberID` | The **person** | Yes. Barry Knight is `217` everywhere |
+| `VoteMemberID` | The **ballot** — one person's response on one vote | No. New every vote |
+
+The same delegate on two different votes:
+
+```
+bill  voteID   MemberID  VoteMemberID  response
+HB1   294006   217       10988439      X
+HB5   297524   217       11092143      X
+```
+
+Now the two statement rows on vote 294006:
+
+```
+VoteStatementID  VoteMemberID  VoteStatement
+126              17            Delegate Austin was recorded as yea. Intended to vote nay.
+224              217           Delegate Knight was recorded as not voting. Intended to vote nay.
+```
+
+And the member rows they concern:
+
+```
+MemberID  VoteMemberID  ResponseCode  name
+17        10988428      Y             Terry L. Austin
+217       10988439      X             Barry D. Knight
+```
+
+The statement says `217`. That is Knight's **`MemberID`**, not his
+`VoteMemberID` of `10988439`.
+
+```python
+statement.VoteMemberID == member.VoteMemberID   # WRONG — never matches
+statement.VoteMemberID == member.MemberID       # right
+```
+
+The ranges do not overlap at all, so the wrong join fails silently for every
+statement on every vote: statement IDs on this vote are 17 and 217, while the
+ballot IDs run from 10988428 to 10988537.
+
+`BillVote.statements_by_member()` applies the correct join and keys the result
+by `MemberID`. Without it, the only link from a correction to a member is the
+surname inside the English sentence.
+
+**The vote's `EventCode` can disagree with the event's.** Vote 294006 reports
+`H9999`; the event pointing at it reports `H5000`. Join on `VoteID` alone.
+
+**Smaller ones.** `VotingSequence` appears on committee votes and is absent on
+floor votes. `VoteFile.TextFormatID` is a **string** (`"5"`) here, where
+`CalendarFile.TextFormatID` is an int. `voteID=0` returns HTTP 400
+`"Failed, Database Error (51000)"` rather than an empty result; an
+out-of-range ID returns a clean 204.
 
 ## How meetings/dockets work
 
@@ -634,7 +874,8 @@ src/va_lis_client/
     ├── pagination.py   # Pagination, PagedList — the X-Pagination protocol
     ├── committee.py    # Committee, CommitteeMember, CommitteeAction
     ├── schedule.py     # Schedule, ScheduleType, MeetingRoom
-    ├── calendar.py     # CalendarDetail, Agenda, VoteMember, ...
+    ├── calendar.py     # CalendarDetail, Agenda, ...
+    ├── vote.py         # Vote, VoteMember, VoteLegislation, VoteStatement
     └── docket.py       # DocketDetail, DocketItem, DocketCategory, ...
 ```
 

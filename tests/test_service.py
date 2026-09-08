@@ -18,13 +18,16 @@ from va_lis_client.exceptions import (
 )
 from va_lis_client.models import (
     Legislation,
+    LegislationEvent,
     LegislationEventType,
     LegislationStatus,
     LegislationSummaryItem,
     LegislationTextDetail,
     LegislationTextItem,
+    Vote,
 )
 from va_lis_client.service import (
+    BillVote,
     LISService,
     normalize_bill_number,
     pick_text_version,
@@ -78,10 +81,65 @@ def text_detail(text_id, document_code, draft_text="<p>An Act to amend.</p>"):
     )
 
 
+def event(event_id=1, code="H5000", vote_id=None, number="HB1", chamber="H", is_passed=True):
+    return LegislationEvent(
+        LegislationEventID=event_id,
+        EventCode=code,
+        LegislationID=98525,
+        LegislationNumber=number,
+        ChamberCode=chamber,
+        IsPassed=is_passed,
+        VoteID=vote_id,
+    )
+
+
+def vote(
+    vote_id=294006,
+    responses=("Y", "Y", "N"),
+    is_voice=False,
+    is_block=False,
+    bills=1,
+    committee_id=None,
+    tally="(2-Y 1-N 0-A)",
+    statements=(),
+):
+    return Vote(
+        VoteID=vote_id,
+        ChamberCode="H",
+        VoteTypeID=1 if committee_id else 3,
+        VoteType="Committee" if committee_id else "Floor",
+        CommitteeID=committee_id,
+        VoteTally=tally,
+        IsVoice=is_voice,
+        IsBlock=is_block,
+        # Mirror the real shape: the ballot ID looks nothing like the person
+        # ID, so a test cannot pass by confusing the two.
+        VoteMember=[
+            {"VoteMemberID": 10988427 + i, "MemberID": i, "ResponseCode": code}
+            for i, code in enumerate(responses, start=1)
+        ],
+        VoteLegislation=[
+            {"VoteLegislationID": n, "LegislationID": 98525 + n, "LegislationNumber": f"HB{n}"}
+            for n in range(1, bills + 1)
+        ],
+        # VoteMemberID on a statement really holds a MemberID.
+        VoteStatements=[
+            {"VoteStatementID": i, "VoteMemberID": member_id, "VoteStatement": text}
+            for i, (member_id, text) in enumerate(statements, start=1)
+        ],
+    )
+
+
+def service_with_types():
+    return LISService(FakeClient())
+
+
 class FakeClient:
     """A stand-in for LISClient that serves fixtures and counts calls."""
 
-    def __init__(self, bills=None, detail=None, texts=None, details=None):
+    def __init__(self, bills=None, detail=None, texts=None, details=None, events=None, votes=None):
+        self.events = events if events is not None else []
+        self.votes = votes if votes is not None else {}
         self.bills = bills if bills is not None else [bill_row()]
         self.detail = detail if detail is not None else bill_detail()
         self.texts = (
@@ -130,7 +188,41 @@ class FakeClient:
             ),
             LegislationEventType(EventCode="H1401", LegislationDescription="Referred"),
             LegislationEventType(EventCode=None, LegislationDescription="Unusable row"),
+            # The real H1405 family.  LIS repeats 1,326 codes like this, and
+            # two of these four rows mean the opposite of the other two.
+            LegislationEventType(
+                EventCode="H1405",
+                LegislationChamberCode="H",
+                IsPassed=True,
+                LegislationDescription="Reported from Labor and Commerce",
+            ),
+            LegislationEventType(
+                EventCode="H1405",
+                LegislationChamberCode="S",
+                IsPassed=True,
+                LegislationDescription="Reported from Labor and Commerce",
+            ),
+            LegislationEventType(
+                EventCode="H1405",
+                LegislationChamberCode="H",
+                IsPassed=False,
+                LegislationDescription="Failed to report (defeated) in Labor and Commerce",
+            ),
+            LegislationEventType(
+                EventCode="H1405",
+                LegislationChamberCode="S",
+                IsPassed=False,
+                LegislationDescription="Failed to report (defeated) in Labor and Commerce",
+            ),
         ]
+
+    def get_bill_events(self, legislation_id):
+        self._count("get_bill_events")
+        return list(self.events)
+
+    def get_vote(self, vote_id):
+        self._count("get_vote")
+        return self.votes.get(vote_id)
 
     def get_legislation_statuses(self):
         self._count("get_legislation_statuses")
@@ -395,17 +487,49 @@ class BillTextTest(unittest.TestCase):
 
 
 class ReferenceJoinTest(unittest.TestCase):
-    def test_event_types_key_on_event_code(self):
+    def test_event_types_group_every_row_under_its_code(self):
         service = LISService(FakeClient())
 
         types = service.event_types_by_code()
 
-        self.assertTrue(types["H5000"].IsPassage)
+        self.assertTrue(types["H5000"][0].IsPassage)
+        # A code is not unique, so nothing may be dropped.
+        self.assertEqual(len(types["H1405"]), 4)
 
     def test_event_types_drop_rows_with_no_event_code(self):
         service = LISService(FakeClient())
 
-        self.assertEqual(len(service.event_types_by_code()), 2)
+        self.assertEqual(len(service.event_types_by_code()), 3)
+
+    def test_event_type_for_picks_the_row_matching_the_outcome(self):
+        service = LISService(FakeClient())
+
+        passed = service.event_type_for(event(code="H1405", is_passed=True))
+        failed = service.event_type_for(event(code="H1405", is_passed=False))
+
+        self.assertEqual(passed.LegislationDescription, "Reported from Labor and Commerce")
+        self.assertEqual(
+            failed.LegislationDescription,
+            "Failed to report (defeated) in Labor and Commerce",
+        )
+
+    def test_event_type_for_reads_the_chamber_off_the_bill_not_the_actor(self):
+        # A Senate bill reported from a House committee: actor H, bill S.
+        senate_bill = event(code="H1405", number="SB1", chamber="H")
+
+        picked = service_with_types().event_type_for(senate_bill)
+
+        self.assertEqual(picked.LegislationChamberCode, "S")
+
+    def test_event_type_for_keeps_the_outcome_when_the_chamber_is_unknown(self):
+        orphan = event(code="H1405", number="", chamber=None, is_passed=False)
+
+        picked = service_with_types().event_type_for(orphan)
+
+        self.assertIs(picked.IsPassed, False)
+
+    def test_event_type_for_returns_none_for_an_unknown_code(self):
+        self.assertIsNone(service_with_types().event_type_for(event(code="Z9999")))
 
     def test_event_types_are_fetched_once(self):
         client = FakeClient()
@@ -456,6 +580,150 @@ class BillStatusLabelTest(unittest.TestCase):
         )
 
         self.assertEqual(label, "In Committee")
+
+
+class BillVoteTest(unittest.TestCase):
+    def test_walks_events_and_fetches_each_vote(self):
+        client = FakeClient(
+            events=[
+                event(1, "H1405", vote_id=291609),
+                event(2, "H4110"),  # no VoteID, so no request
+                event(3, "H5000", vote_id=294006),
+            ],
+            votes={
+                291609: vote(291609, committee_id=14),
+                294006: vote(294006),
+            },
+        )
+
+        votes = LISService(client).bill_votes("HB1", 20261)
+
+        self.assertEqual([v.vote.VoteID for v in votes], [291609, 294006])
+        self.assertEqual(client.calls["get_vote"], 2)
+
+    def test_keeps_events_in_chronological_order(self):
+        client = FakeClient(
+            events=[event(1, "H1405", vote_id=1), event(2, "S5100", vote_id=2)],
+            votes={1: vote(1), 2: vote(2)},
+        )
+
+        votes = LISService(client).bill_votes("HB1", 20261)
+
+        self.assertEqual([v.event.EventCode for v in votes], ["H1405", "S5100"])
+
+    def test_skips_a_vote_id_the_api_cannot_resolve(self):
+        client = FakeClient(events=[event(1, "H5000", vote_id=999)], votes={})
+
+        self.assertEqual(LISService(client).bill_votes("HB1", 20261), [])
+
+    def test_a_voice_vote_is_not_a_roll_call(self):
+        voice = vote(
+            300174, responses=(), is_voice=True, is_block=True, bills=50, tally="(Voice Vote)"
+        )
+
+        record = BillVote(event=event(1, "S4160", vote_id=300174), vote=voice)
+
+        self.assertFalse(record.is_roll_call)
+
+    def test_a_block_vote_is_not_a_roll_call_for_one_bill(self):
+        block = vote(300173, responses=("Y",) * 40, is_block=True, bills=50)
+
+        record = BillVote(event=event(1, "S4145", vote_id=300173), vote=block)
+
+        self.assertFalse(record.is_roll_call)
+        self.assertEqual(record.bill_count, 50)
+
+    def test_a_plain_floor_vote_is_a_roll_call(self):
+        record = BillVote(event=event(1, "H5000", vote_id=294006), vote=vote())
+
+        self.assertTrue(record.is_roll_call)
+        self.assertFalse(record.is_committee)
+
+    def test_roll_calls_only_drops_voice_and_block_votes(self):
+        client = FakeClient(
+            events=[
+                event(1, "H5000", vote_id=1),
+                event(2, "S4160", vote_id=2),
+                event(3, "S4145", vote_id=3),
+            ],
+            votes={
+                1: vote(1),
+                2: vote(2, responses=(), is_voice=True, is_block=True, bills=50),
+                3: vote(3, responses=("Y",) * 40, is_block=True, bills=50),
+            },
+        )
+
+        votes = LISService(client).bill_votes("HB1", 20261, roll_calls_only=True)
+
+        self.assertEqual([v.vote.VoteID for v in votes], [1])
+
+    def test_responses_group_by_code_including_x(self):
+        # "X" is absent from the tally string, so the groups must not be
+        # derived from it.
+        record = BillVote(
+            event=event(1, "H5000", vote_id=294006),
+            vote=vote(responses=("Y", "Y", "N", "X"), tally="(2-Y 1-N 0-A)"),
+        )
+
+        grouped = record.responses()
+
+        self.assertEqual({k: len(v) for k, v in grouped.items()}, {"Y": 2, "N": 1, "X": 1})
+
+    def test_member_name_strips_the_lis_leading_space(self):
+        record = BillVote(event=event(1, "H5000", vote_id=1), vote=vote())
+
+        member = record.vote.vote_members[0]
+        member.MemberDisplayName = " Jessica L. Anderson"
+
+        self.assertEqual(member.name, "Jessica L. Anderson")
+
+    def test_statements_key_on_member_id_not_vote_member_id(self):
+        """VoteStatement.VoteMemberID is misnamed and holds a MemberID.
+
+        Guards against anyone "simplifying" the join back to the two columns
+        that share a name.  That join matches nothing and raises nothing.
+        """
+        # MemberID 2 is the second member; their VoteMemberID is 10988429.
+        record = BillVote(
+            event=event(1, "H5000", vote_id=294006),
+            vote=vote(
+                294006,
+                responses=("Y", "X"),
+                statements=[(2, "Delegate Knight was recorded as not voting.")],
+            ),
+        )
+
+        keyed = record.statements_by_member()
+
+        knight = record.vote.vote_members[1]
+        self.assertEqual(knight.MemberID, 2)
+        self.assertEqual(knight.VoteMemberID, 10988429)
+        self.assertEqual(list(keyed), [knight.MemberID])
+        self.assertNotIn(knight.VoteMemberID, keyed)
+
+    def test_the_naive_statement_join_finds_nothing(self):
+        """Documents the failure mode rather than only the fix."""
+        record = BillVote(
+            event=event(1, "H5000", vote_id=294006),
+            vote=vote(294006, responses=("Y", "X"), statements=[(2, "...")]),
+        )
+
+        ballot_ids = {m.VoteMemberID for m in record.vote.vote_members}
+        statement_ids = {s.VoteMemberID for s in record.vote.VoteStatements}
+
+        self.assertEqual(statement_ids & ballot_ids, set())
+
+    def test_statements_are_empty_when_none_were_filed(self):
+        record = BillVote(event=event(1, "H5000", vote_id=1), vote=vote())
+
+        self.assertEqual(record.statements_by_member(), {})
+
+    def test_committee_votes_report_their_committee(self):
+        record = BillVote(
+            event=event(1, "H1405", vote_id=291609), vote=vote(291609, committee_id=14)
+        )
+
+        self.assertTrue(record.is_committee)
 
 
 if __name__ == "__main__":

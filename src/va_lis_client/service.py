@@ -12,9 +12,12 @@ questions the raw endpoints leave to every caller:
   runs to roughly 3 MB, so it needs caching.
 - Events come back with ``LegislationEventTypeID`` and ``LegislationStatusID``
   null, so the reference vocabularies join on ``EventCode`` and status
-  ``Name`` instead.
+  ``Name`` instead.  ``EventCode`` alone is not unique, so resolving one event
+  to one vocabulary row takes the bill's chamber and ``IsPassed`` as well.
 - Bill text spans two endpoints whose rows match on ``LegislationTextID``,
   and the body arrives as HTML.
+- Votes have no bill-first endpoint.  Reaching a bill's roll calls means
+  walking its events for ``VoteID`` and fetching each one.
 
 Usage::
 
@@ -35,6 +38,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+from dataclasses import dataclass
 from html.parser import HTMLParser
 
 from va_lis_client.client import LISClient
@@ -45,16 +49,104 @@ from va_lis_client.exceptions import (
 )
 from va_lis_client.models import (
     Legislation,
+    LegislationEvent,
     LegislationEventType,
     LegislationStatus,
     LegislationSummaryItem,
     LegislationTextDetail,
     LegislationTextItem,
+    Vote,
+    VoteMember,
+    VoteStatement,
 )
 
 DEFAULT_BILL_LIST_TTL = 15 * 60
 
 _BILL_NUMBER_RE = re.compile(r"([A-Z]+)(\d+)")
+
+
+@dataclass(frozen=True)
+class BillVote:
+    """One bill action paired with the vote record it produced.
+
+    :meth:`LISService.bill_votes` returns these.  ``event`` is the bill's own
+    action; ``vote`` is the roll call that ``event.VoteID`` resolves to.
+
+    Check :attr:`is_roll_call` before you attribute the member rows to this
+    bill.  A voice vote records nobody, and a block vote records a chamber
+    disposing of many bills at once.
+    """
+
+    event: LegislationEvent
+    vote: Vote
+
+    @property
+    def is_roll_call(self) -> bool:
+        """True when the members voted on this bill and this bill alone.
+
+        False for a voice vote (no members recorded) and for a block vote
+        (the members voted on a bundle, so crediting them on this bill
+        misstates the record).
+        """
+        return not self.vote.IsVoice and not self.vote.IsBlock and bool(self.vote.vote_members)
+
+    @property
+    def is_committee(self) -> bool:
+        """True for a committee or subcommittee vote, false on the floor."""
+        return self.vote.CommitteeID is not None
+
+    @property
+    def chamber(self) -> str | None:
+        """``"H"`` or ``"S"`` — the chamber that voted, not the bill's."""
+        return self.vote.ChamberCode or self.event.ChamberCode
+
+    @property
+    def bill_count(self) -> int:
+        """How many bills this one vote disposed of.  Above 1 means a block."""
+        return len(self.vote.vote_legislation)
+
+    def responses(self) -> dict[str, list[VoteMember]]:
+        """Members grouped by ``ResponseCode``.
+
+        The codes are ``"Y"`` yea, ``"N"`` nay, ``"A"`` abstain, and ``"X"``
+        not voting.  ``"X"`` is absent from ``Vote.VoteTally``, so these
+        groups do not sum to the tally string.  Members with no response code
+        are omitted.
+
+        Groups arrive in the order LIS lists the members, which is
+        alphabetical on floor votes and by seniority on committee votes.
+        """
+        grouped: dict[str, list[VoteMember]] = {}
+        for member in self.vote.vote_members:
+            if member.ResponseCode:
+                grouped.setdefault(member.ResponseCode, []).append(member)
+
+        return grouped
+
+    def statements_by_member(self) -> dict[int, list[VoteStatement]]:
+        """Record corrections, keyed by the ``MemberID`` they concern.
+
+        A member recorded wrongly files a statement, and **the roll call is
+        never amended**.  Vote 294006 records Delegate Knight as ``"X"`` and
+        carries a statement reading "Delegate Knight was recorded as not
+        voting. Intended to vote nay."  Both are true; only the first counts.
+
+        ``VoteStatement.VoteMemberID`` is misnamed and holds a ``MemberID``,
+        so this keys on :attr:`VoteMember.MemberID`.  Statements with no ID
+        are omitted.
+
+        Returns:
+            ``MemberID`` to that member's statements on this vote.
+        """
+        keyed: dict[int, list[VoteStatement]] = {}
+        for statement in self.vote.VoteStatements:
+            # Do NOT match this against VoteMember.VoteMemberID.  Despite the
+            # name, the value is a MemberID; that join silently matches
+            # nothing.  See VoteStatement for the numbers.
+            if statement.VoteMemberID is not None:
+                keyed.setdefault(statement.VoteMemberID, []).append(statement)
+
+        return keyed
 
 
 class LISService:
@@ -82,7 +174,7 @@ class LISService:
         self.bill_list_ttl = bill_list_ttl
 
         self._bill_lists: dict[int, tuple[float, list[LegislationSummaryItem]]] = {}
-        self._event_types: dict[str, LegislationEventType] | None = None
+        self._event_types: dict[str, list[LegislationEventType]] | None = None
         self._statuses_by_name: dict[str, LegislationStatus] | None = None
         self._statuses_by_id: dict[int, LegislationStatus] | None = None
 
@@ -284,12 +376,80 @@ class LISService:
 
         return selected, detail
 
-    def event_types_by_code(self) -> dict[str, LegislationEventType]:
-        """The event type reference, keyed by ``EventCode``.
+    def bill_votes(
+        self,
+        bill_number: str,
+        session_code: int,
+        *,
+        roll_calls_only: bool = False,
+    ) -> list[BillVote]:
+        """Every recorded vote on a bill, in both chambers, with the members.
+
+        This walks the bill's events, takes each ``VoteID``, and fetches the
+        roll call behind it.  Events are the only bill-first route to votes,
+        because no vote endpoint accepts a ``legislationID``.
+
+        Committee, subcommittee, and floor votes all come back, from whichever
+        chamber cast them.  HB1 in session 20261 returns 8: two House
+        committee votes, one House floor vote, two Senate committee votes, and
+        three Senate floor votes.
+
+        **Not every result is a roll call for this bill.**  A voice vote
+        records no members, and a block vote records one roster disposing of
+        many bills.  Read :attr:`BillVote.is_roll_call`, or pass
+        ``roll_calls_only=True`` to drop them here.
+
+        This costs one request per vote, so a heavily amended bill costs a
+        dozen.  Results are not cached, because votes accrue through a session.
+
+        Args:
+            bill_number: Any case, padded or not.  ``hb0001`` resolves ``HB1``.
+            session_code: e.g. ``20261``.
+            roll_calls_only: Return only votes that record members for this
+                bill alone.
+
+        Returns:
+            :class:`BillVote` records in event order, so chronological.
+
+        Raises:
+            InvalidBillNumberError: The string does not parse as a bill number.
+            BillNotFoundError: The bill is not in that session.
+        """
+        legislation_id = self.resolve_bill_id(bill_number, session_code)
+
+        results = []
+        for event in self.client.get_bill_events(legislation_id=legislation_id):
+            if not event.VoteID:
+                continue
+
+            vote = self.client.get_vote(event.VoteID)
+            if vote is None:
+                continue
+
+            record = BillVote(event=event, vote=vote)
+            if roll_calls_only and not record.is_roll_call:
+                continue
+
+            results.append(record)
+
+        return results
+
+    def event_types_by_code(self) -> dict[str, list[LegislationEventType]]:
+        """The event type reference, grouped by ``EventCode``.
 
         The endpoint returns 3,912 rows with ``LegislationEventTypeID`` null,
         so ``EventCode`` is the only join key onto a bill's events.  The
         vocabulary is static, so the service fetches it once.
+
+        **``EventCode`` is not unique.**  3,912 rows carry only 1,502 distinct
+        codes, and 1,326 codes repeat.  The repeats are not harmless copies:
+        ``H1405`` returns four rows, two reading "Reported from Labor and
+        Commerce" and two reading "Failed to report (defeated) in Labor and
+        Commerce".  A ``dict[str, LegislationEventType]`` keyed on the code
+        keeps whichever row arrives last, so it can report a bill as defeated
+        when it passed.  That is why this returns every row per code.
+
+        Use :meth:`event_type_for` to resolve one event to one row.
 
         That response is 2.19 MB and the endpoint ignores ``X-Pagination``
         (measured 2026-08-28), so caching is the only way to avoid paying
@@ -298,10 +458,53 @@ class LISService:
         if self._event_types is None:
             with self._reference_lock:
                 if self._event_types is None:
-                    types = self.client.get_event_types()
-                    self._event_types = {t.EventCode: t for t in types if t.EventCode}
+                    grouped: dict[str, list[LegislationEventType]] = {}
+                    for t in self.client.get_event_types():
+                        if t.EventCode:
+                            grouped.setdefault(t.EventCode, []).append(t)
+                    self._event_types = grouped
 
         return self._event_types
+
+    def event_type_for(self, event: LegislationEvent) -> LegislationEventType | None:
+        """The single event type row that describes ``event``.
+
+        ``(EventCode, LegislationChamberCode, IsPassed)`` is the real primary
+        key of the vocabulary: it yields 3,912 distinct keys for 3,912 rows,
+        with no collisions (measured 2026-09-08).
+
+        ``LegislationChamberCode`` is the **bill's** chamber, not the actor's.
+        A Senate bill reported from a House committee carries the House actor
+        code ``H1405`` against a row whose chamber is ``S``.  The event's own
+        ``ChamberCode`` mirrors the code prefix, so it names the actor and
+        cannot serve here; the bill's chamber comes from
+        ``event.LegislationNumber`` instead.
+
+        ``IsPassed`` separates the pass and fail twins that share a code, so
+        the method keeps it even when the chamber does not match.
+
+        Returns:
+            The matching :class:`LegislationEventType`, or ``None`` when the
+            code is absent from the vocabulary.
+        """
+        rows = self.event_types_by_code().get(event.EventCode or "")
+        if not rows:
+            return None
+
+        number = event.LegislationNumber or event.ChamberCode or ""
+        chamber = number[:1].upper() or None
+
+        exact = [
+            r for r in rows if r.LegislationChamberCode == chamber and r.IsPassed == event.IsPassed
+        ]
+        if exact:
+            return exact[0]
+
+        by_passed = [r for r in rows if r.IsPassed == event.IsPassed]
+        if by_passed:
+            return by_passed[0]
+
+        return rows[0]
 
     def statuses_by_name(self) -> dict[str, LegislationStatus]:
         """The 52 status rows, keyed by internal ``Name``.

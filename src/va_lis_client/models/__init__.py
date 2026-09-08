@@ -13,8 +13,10 @@ Modules:
                    LegislationSummary
     committee    — CommitteeFile, Committee, CommitteeMember, CommitteeAction
     schedule     — Schedule, ScheduleType, MeetingRoom
-    calendar     — CalendarFile, CalendarComment, CalendarItem, VoteMember,
+    calendar     — CalendarFile, CalendarComment, CalendarItem,
                    AgendaItem, Agenda, CalendarCategory, Staff, CalendarDetail
+    vote         — VoteMember, VoteLegislation, VoteStatement, VoteFile,
+                   VoteType, Vote
     docket       — DocketItem, DocketCategory, DocketListItem, CalendarDisplay,
                    DocketDetail
     event        — EventReference, LegislationEvent, LegislationEventType,
@@ -31,7 +33,6 @@ from va_lis_client.models.calendar import (
     CalendarFile,
     CalendarItem,
     Staff,
-    VoteMember,
 )
 from va_lis_client.models.committee import (
     Committee,
@@ -74,6 +75,14 @@ from va_lis_client.models.text import (
     LegislationTextItem,
     TextFile,
 )
+from va_lis_client.models.vote import (
+    Vote,
+    VoteFile,
+    VoteLegislation,
+    VoteMember,
+    VoteStatement,
+    VoteType,
+)
 
 __all__ = [
     # common
@@ -112,7 +121,13 @@ __all__ = [
     "CalendarFile",
     "CalendarItem",
     "Staff",
+    # vote
+    "Vote",
+    "VoteFile",
+    "VoteLegislation",
     "VoteMember",
+    "VoteStatement",
+    "VoteType",
     # docket
     "CalendarDisplay",
     "DocketCategory",

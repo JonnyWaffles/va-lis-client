@@ -76,6 +76,8 @@ from va_lis_client.models import (
     Pagination,
     Partner,
     Session,
+    Vote,
+    VoteType,
     page_request_header,
 )
 
@@ -691,3 +693,66 @@ class LISClient:
         if data is None:
             return []
         return [ActorType.model_validate(a) for a in data.get("ActorTypes", [])]
+
+    # ------------------------------------------------------------------
+    # Votes (per-member roll calls)
+    # ------------------------------------------------------------------
+
+    def get_vote(self, vote_id: int) -> Vote | None:
+        """A single vote record, with its per-member roll call.
+
+        This is the only route to per-member votes, and it covers both
+        chambers for floor votes and committee votes alike.  The ``/Vote``
+        service does not appear in the LIS developer portal service list.
+
+        **No endpoint accepts a ``legislationID``.**  Reach a vote through
+        ``LegislationEvent.VoteID``: call
+        :meth:`get_bill_events`, then this method for each event that
+        carries one.
+
+        **A VoteID on a bill event is often not a roll call for that bill.**
+        Check the returned record before you attribute it:
+
+        - ``IsVoice`` — no members are recorded at all.
+        - ``IsBlock`` — one roll call disposing of many bills; read
+          ``vote_legislation`` to see how many.
+        - ``ResponseCode`` ``"X"`` is excluded from ``VoteTally``, so the
+          member rows do not sum to the tally string.
+
+        **Votes reach back to 1994**, three decades before the bill data.
+        ``voteID=1`` is a 1994 committee vote, so do not assume a vote ID
+        belongs to a recent session.
+
+        Args:
+            vote_id: Surrogate PK from an event, e.g. ``300418``.
+
+        Returns:
+            The :class:`Vote`, or ``None`` when LIS holds no such ID (it
+            answers 204 No Content).
+
+        Raises:
+            requests.HTTPError: ``vote_id=0`` returns HTTP 400
+                ``"Failed, Database Error (51000)"`` rather than an empty
+                result.
+
+        Envelope key: ``Votes`` — a list holding exactly one vote.
+        """
+        data = self._get("/Vote/api/getvotebyidasync", params={"voteID": vote_id})
+        if data is None:
+            return None
+
+        votes = data.get("Votes", [])
+        if not votes:
+            return None
+
+        return Vote.model_validate(votes[0])
+
+    def get_vote_types(self) -> list[VoteType]:
+        """Reference list of 3 vote types (Committee, Subcommittee, Floor).
+
+        Envelope key: ``VoteTypes``.
+        """
+        data = self._get("/Vote/api/getvotetypereferencesasync")
+        if data is None:
+            return []
+        return [VoteType.model_validate(t) for t in data.get("VoteTypes", [])]
