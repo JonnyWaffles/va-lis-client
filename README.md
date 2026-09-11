@@ -511,15 +511,18 @@ Not wired: `getcalendaractionsreferenceasync` returns 4,952 rows and 2 MB, and
 
 ### Not yet explored
 
-These services exist in the portal but haven't been investigated:
+These services exist in the portal but haven't been investigated, except
+where noted:
 
-- AdvancedLegislationSearch
+- AdvancedLegislationSearch (spec read 2026-09-11: a POST keyword search,
+  `getmostfrequentlegislationsasync`, introduction date lists; not wired)
 - CommunicationFileGeneration
 - Contact
 - LegislationCollections
 - LegislationCommunications
 - LegislationFileGeneration
-- LegislationSubject
+- LegislationSubject (spec read 2026-09-11: `getsubjectreferencesasync`, a
+  subject vocabulary per session; not wired)
 - MemberVoteSearch (only `getmembervotelistasync` is wired)
 - MinutesBook
 - Organization
