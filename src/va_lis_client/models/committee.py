@@ -2,10 +2,10 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel
+from va_lis_client.models.common import LISModel
 
 
-class CommitteeFile(BaseModel):
+class CommitteeFile(LISModel):
     """A file attachment on a committee (e.g. roster PDF).
 
     Example::
@@ -25,7 +25,7 @@ class CommitteeFile(BaseModel):
     Description: str | None = None
 
 
-class Committee(BaseModel):
+class Committee(LISModel):
     """A legislative committee from ``/Committee/api/getcommitteelistasync``.
 
     Key: ``CommitteeID`` (surrogate PK) or ``CommitteeNumber`` (e.g. ``"H14"``).
@@ -64,7 +64,7 @@ class Committee(BaseModel):
     CommitteeFiles: list[CommitteeFile] = []
 
 
-class CommitteeMember(BaseModel):
+class CommitteeMember(LISModel):
     """A member's role on a committee, nested in docket/calendar detail.
 
     Example::
@@ -92,7 +92,7 @@ class CommitteeMember(BaseModel):
     EffectiveDate: datetime | None = None
 
 
-class CommitteeAction(BaseModel):
+class CommitteeAction(LISModel):
     """Committee action reference from
     ``/CommitteeLegislationReferral/api/getcommitteeactionreferencesasync``.
 

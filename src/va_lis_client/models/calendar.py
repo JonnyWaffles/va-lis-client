@@ -2,8 +2,9 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
+from va_lis_client.models.common import LISModel
 from va_lis_client.models.legislation import Patron
 from va_lis_client.models.vote import VoteMember
 
@@ -20,7 +21,7 @@ __all__ = [
 ]
 
 
-class CalendarFile(BaseModel):
+class CalendarFile(LISModel):
     """A file attachment on a calendar or docket (PDF, JSON).
 
     Example::
@@ -40,7 +41,7 @@ class CalendarFile(BaseModel):
     ModificationDate: datetime | None = None
 
 
-class CalendarComment(BaseModel):
+class CalendarComment(LISModel):
     """A comment/note on a calendar entry.
 
     Example::
@@ -56,7 +57,7 @@ class CalendarComment(BaseModel):
     DeletionDate: datetime | None = None
 
 
-class CalendarItem(BaseModel):
+class CalendarItem(LISModel):
     """A calendar list entry from ``/Calendar/api/getcalendarlistasync``.
 
     These are floor calendars (House and Senate).  For full detail with
@@ -96,7 +97,7 @@ class CalendarItem(BaseModel):
     CalendarComments: list[CalendarComment] = []
 
 
-class AgendaItem(BaseModel):
+class AgendaItem(LISModel):
     """A sub-item on an agenda entry (action taken, vote result, etc.).
 
     Example::
@@ -122,7 +123,7 @@ class AgendaItem(BaseModel):
     vote_members: list[VoteMember] = Field(default=[], alias="VoteMember")
 
 
-class Agenda(BaseModel):
+class Agenda(LISModel):
     """An agenda entry on a calendar — typically one bill or action.
 
     Nested inside ``CalendarCategory.Agendas`` in calendar detail.
@@ -161,7 +162,7 @@ class Agenda(BaseModel):
     AgendaItems: list[AgendaItem] = []
 
 
-class CalendarCategory(BaseModel):
+class CalendarCategory(LISModel):
     """A section within a calendar (e.g. "Order of Business", "Senate Bills").
 
     Example::
@@ -186,7 +187,7 @@ class CalendarCategory(BaseModel):
     Agendas: list[Agenda] = []
 
 
-class Staff(BaseModel):
+class Staff(LISModel):
     """A staff member assigned to a committee or calendar.
 
     Example::
@@ -207,7 +208,7 @@ class Staff(BaseModel):
     ModificationDate: datetime | None = None
 
 
-class CalendarDetail(BaseModel):
+class CalendarDetail(LISModel):
     """Full calendar detail from ``/Calendar/api/getcalendarsbyidasync``.
 
     Includes the complete agenda with categories, legislation, votes, staff.

@@ -2,10 +2,10 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel
+from va_lis_client.models.common import LISModel
 
 
-class SessionEvent(BaseModel):
+class SessionEvent(LISModel):
     """A milestone within a legislative session (start, adjourn, reconvene, etc.).
 
     Example::
@@ -22,7 +22,7 @@ class SessionEvent(BaseModel):
     ProjectedDate: datetime | None = None
 
 
-class Session(BaseModel):
+class Session(LISModel):
     """A legislative session from ``/Session/api/getsessionlistasync``.
 
     Key: ``SessionCode`` or ``SessionID``.

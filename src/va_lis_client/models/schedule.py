@@ -2,12 +2,11 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel
-
+from va_lis_client.models.common import LISModel
 from va_lis_client.models.text import TextFile
 
 
-class Schedule(BaseModel):
+class Schedule(LISModel):
     """A scheduled meeting from ``/Schedule/api/getschedulelistasync``.
 
     The master meeting calendar — all committee hearings, caucuses, floor
@@ -57,7 +56,7 @@ class Schedule(BaseModel):
     ScheduleFiles: list[TextFile] = []
 
 
-class ScheduleType(BaseModel):
+class ScheduleType(LISModel):
     """Schedule type reference from ``/Schedule/api/getscheduletypesreferenceasync``.
 
     6 types observed::
@@ -69,7 +68,7 @@ class ScheduleType(BaseModel):
     ScheduleType: str
 
 
-class MeetingRoom(BaseModel):
+class MeetingRoom(LISModel):
     """Meeting room reference from ``/Schedule/api/getmeetingroomsreferenceasync``.
 
     Query by ``chamberCode`` (H or S).  Includes both GAB rooms and Capitol rooms.

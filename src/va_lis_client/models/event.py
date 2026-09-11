@@ -2,10 +2,10 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel
+from va_lis_client.models.common import LISModel
 
 
-class EventReference(BaseModel):
+class EventReference(LISModel):
     """A reference link on a legislation event (to a text version, vote, etc.).
 
     Example::
@@ -28,7 +28,7 @@ class EventReference(BaseModel):
     IsMandatory: bool | None = None
 
 
-class LegislationEvent(BaseModel):
+class LegislationEvent(LISModel):
     """A bill history event from ``/LegislationEvent/api/getlegislationeventbylegislationidasync``.
 
     The chronological action log for a bill — every action from prefiling
@@ -121,7 +121,7 @@ class LegislationEvent(BaseModel):
     EventReferences: list[EventReference] | None = None
 
 
-class LegislationEventType(BaseModel):
+class LegislationEventType(LISModel):
     """Event type reference from ``/LegislationEvent/api/getlegislationeventtypereferencesasync``.
 
     There are 3,912 types — most are duplicates with different chamber
@@ -171,7 +171,7 @@ class LegislationEventType(BaseModel):
     ReconsiderationDescription: str | None = None
 
 
-class ActorType(BaseModel):
+class ActorType(LISModel):
     """Actor type reference from ``/LegislationEvent/api/getactortypereferencesasync``.
 
     Five actor types::

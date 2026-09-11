@@ -2,15 +2,16 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from va_lis_client.models.calendar import CalendarFile, Staff
 from va_lis_client.models.committee import CommitteeMember
+from va_lis_client.models.common import LISModel
 from va_lis_client.models.legislation import Patron
 from va_lis_client.models.schedule import Schedule
 
 
-class DocketItem(BaseModel):
+class DocketItem(LISModel):
     """A bill on a Senate committee docket.
 
     Includes the bill summary, patrons, and draft title — everything a
@@ -47,7 +48,7 @@ class DocketItem(BaseModel):
     Patrons: list[Patron] = []
 
 
-class DocketCategory(BaseModel):
+class DocketCategory(LISModel):
     """A section within a docket (e.g. "Senate Bills in Committee").
 
     Example::
@@ -71,7 +72,7 @@ class DocketCategory(BaseModel):
     DocketItems: list[DocketItem] = []
 
 
-class DocketListItem(BaseModel):
+class DocketListItem(LISModel):
     """A docket list entry from ``/Calendar/api/getdocketlistasync``.
 
     **Senate only** — House returns 400 with "Dockets can only be for
@@ -111,14 +112,14 @@ class DocketListItem(BaseModel):
     DocketFiles: list[CalendarFile] = []
 
 
-class CalendarDisplay(BaseModel):
+class CalendarDisplay(LISModel):
     """Display column configuration for a docket."""
 
     DisplayColumn: str | None = None
     IsDisplayed: bool = False
 
 
-class DocketDetail(BaseModel):
+class DocketDetail(LISModel):
     """Full docket detail from ``/Calendar/api/getdocketsbyidasync``.
 
     **Senate only.**  Includes the complete agenda with bills, committee

@@ -2,12 +2,11 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel
-
+from va_lis_client.models.common import LISModel
 from va_lis_client.models.legislation import Patron
 
 
-class TextFile(BaseModel):
+class TextFile(LISModel):
     """A file attachment (PDF, HTML, impact statement, etc.) on a text version.
 
     ``TextFormatID`` / ``TextFormat`` indicate the type.  ``FileURL`` is
@@ -30,7 +29,7 @@ class TextFile(BaseModel):
     PageCount: int | None = None  # PDF only
 
 
-class LegislationTextItem(BaseModel):
+class LegislationTextItem(LISModel):
     """A text version record from ``/LegislationText/api/getlegislationtextlistasync``.
 
     Query by ``legislation_number`` + ``session_code`` (e.g. ``HB1`` + ``20261``).
@@ -71,7 +70,7 @@ class LegislationTextItem(BaseModel):
     LinkFile: list[TextFile] | None = None
 
 
-class LegislationTextDetail(BaseModel):
+class LegislationTextDetail(LISModel):
     """Full text detail from ``/LegislationText/api/getlegislationtextbyidasync``.
 
     Query by ``legislation_id`` + ``session_code``.  Returns one row per
@@ -132,7 +131,7 @@ class LegislationTextDetail(BaseModel):
     JSONFile: list[TextFile] | None = None
 
 
-class LegislationSummary(BaseModel):
+class LegislationSummary(LISModel):
     """Bill summary from ``/LegislationSummary/api/getlegislationsummarylistasync``.
 
     Query by ``legislation_number`` + ``session_code`` (e.g. ``HB1`` + ``20261``).

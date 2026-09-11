@@ -26,6 +26,14 @@ class LISModel(BaseModel):
     at validation instead, so ``MemberNumber == "H0386"`` and
     ``ResponseCode == "Y"`` hold whatever LIS sends.
 
+    It is not a roster problem.  Bill detail pads patron names too:
+    ``getlegislationbyidasync`` returned ``" Charlie Schmidt"`` as chief
+    patron of HB1408 and ``" Jessica L. Anderson"`` as a co-patron of HB1482
+    in 20261 (observed 2026-09-11), and floor actions end with a space
+    (``"Amendments agreed to "``).  Every response model in this package
+    therefore inherits this base; only the ``X-Pagination`` header model does
+    not, because LIS never pads it.
+
     A string of only whitespace becomes ``""``, not ``None``.
     """
 
@@ -41,7 +49,7 @@ class LISModel(BaseModel):
         return value
 
 
-class Heartbeat(BaseModel):
+class Heartbeat(LISModel):
     """Health-check response from any ``/{Service}/api/heartbeatasync``.
 
     Does NOT validate the API key — returns ``Success=True`` for any value.
@@ -62,7 +70,7 @@ class Heartbeat(BaseModel):
     FailureMessage: str | None = None
 
 
-class Partner(BaseModel):
+class Partner(LISModel):
     """Partner record from ``/PartnerAuthentication/api/checkpartnerkeyasync/{apiKey}``.
 
     This is the only endpoint that actually validates whether an API key is

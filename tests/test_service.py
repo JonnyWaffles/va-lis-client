@@ -887,6 +887,72 @@ class RosterTest(unittest.TestCase):
         self.assertEqual(ballot.ResponseCode, "Y")
 
 
+class EveryResponseModelStripsTest(unittest.TestCase):
+    """The padding is not a roster problem, so the strip is not roster-only.
+
+    Observed live 2026-09-11: ``getlegislationbyidasync`` returned
+    ``" Charlie Schmidt"`` as chief patron of HB1408 (20261) and
+    ``" Jessica L. Anderson"`` as a co-patron of HB1482 (20261), and the
+    history of HB1476 ends a floor action with a space.
+    """
+
+    def patron(self, display_name, surname=" Schmidt "):
+        return {
+            "LegislationID": 100874,
+            "ChamberCode": "H",
+            "MemberID": 544,
+            "MemberNumber": " H0402",
+            "PatronTypeID": 1,
+            "Name": "Chief Patron ",
+            "MemberDisplayName": display_name,
+            "PatronDisplayName": surname,
+        }
+
+    def test_bill_detail_patron_names_are_stripped(self):
+        bill = Legislation.model_validate(
+            {
+                "LegislationID": 100874,
+                "LegislationNumber": "HB1408",
+                "Description": "Landlord and tenant; landlord remedies.",
+                "ChamberCode": "H",
+                "LegislationTypeCode": "B",
+                "Patrons": [self.patron(" Charlie Schmidt")],
+            }
+        )
+
+        patron = bill.Patrons[0]
+        self.assertEqual(patron.MemberDisplayName, "Charlie Schmidt")
+        self.assertEqual(patron.PatronDisplayName, "Schmidt")
+        self.assertEqual(patron.MemberNumber, "H0402")
+        self.assertEqual(patron.Name, "Chief Patron")
+
+    def test_bill_list_rows_strip_the_same_way(self):
+        row = LegislationSummaryItem.model_validate(
+            {
+                "LegislationID": 100979,
+                "LegislationNumber": " HB1482 ",
+                "Description": "Law-enforcement officers; facial coverings. ",
+                "ChamberCode": "H",
+                "LegislationTypeCode": "B",
+                "LegislationStatus": "Acts of Assembly Chapter ",
+                "Patrons": [self.patron(" Jessica L. Anderson", " Anderson")],
+            }
+        )
+
+        self.assertEqual(row.LegislationNumber, "HB1482")
+        self.assertEqual(row.LegislationStatus, "Acts of Assembly Chapter")
+        self.assertEqual(row.Patrons[0].MemberDisplayName, "Jessica L. Anderson")
+
+    def test_event_descriptions_lose_their_trailing_space(self):
+        row = LegislationEvent(
+            LegislationEventID=1,
+            Description="General Laws and Technology Amendments agreed to ",
+        )
+
+        expected = "General Laws and Technology Amendments agreed to"
+        self.assertEqual(row.Description, expected)
+
+
 class RollCallTest(unittest.TestCase):
     def roster_client(self, **kwargs):
         return FakeClient(

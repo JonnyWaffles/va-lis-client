@@ -2,10 +2,10 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel
+from va_lis_client.models.common import LISModel
 
 
-class Patron(BaseModel):
+class Patron(LISModel):
     """A bill patron (sponsor/co-sponsor).
 
     ``PatronTypeID`` determines the role:
@@ -40,7 +40,7 @@ class Patron(BaseModel):
     LegislationTextID: int | None = None
 
 
-class LegislationSession(BaseModel):
+class LegislationSession(LISModel):
     """Session cross-reference on a bill (which sessions it appeared in).
 
     This list is the explicit carry-over lineage record: a bill continued
@@ -59,7 +59,7 @@ class LegislationSession(BaseModel):
     IsPrefile: bool = False
 
 
-class LegislationSummaryItem(BaseModel):
+class LegislationSummaryItem(LISModel):
     """Lightweight bill record from the per-session list endpoint.
 
     Returned by ``/Legislation/api/getlegislationsessionlistasync``.
@@ -94,7 +94,7 @@ class LegislationSummaryItem(BaseModel):
     Patrons: list[Patron] = []
 
 
-class Legislation(BaseModel):
+class Legislation(LISModel):
     """Full bill detail from ``/Legislation/api/getlegislationbyidasync/{id}``.
 
     Query by ``LegislationID`` (the surrogate PK).  Returns one record.
@@ -158,7 +158,7 @@ class Legislation(BaseModel):
     Sessions: list[LegislationSession] = []
 
 
-class LegislationStatus(BaseModel):
+class LegislationStatus(LISModel):
     """Reference entry from ``/Legislation/api/getlegislationstatuslistasync``.
 
     52 statuses in total.  ``LegislationVersionID`` is set on statuses that
@@ -178,7 +178,7 @@ class LegislationStatus(BaseModel):
     LegislationVersionID: int | None = None  # linked version type, if any
 
 
-class LegislationVersion(BaseModel):
+class LegislationVersion(LISModel):
     """Reference entry from ``/LegislationText/api/getlegislationversionlistasync``.
 
     13 version types.  ``Suffix`` is the code appended to the bill number

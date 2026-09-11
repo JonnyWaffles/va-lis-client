@@ -616,6 +616,9 @@ Chasing that with a per-field accessor loses to the next field LIS pads, so
 `LISModel` strips every string at validation. `MemberNumber == "H0386"` and
 `ResponseCode == "Y"` hold whatever LIS sends. `Member.name`, `.list_name`,
 and `.email` remain as shorthand that never returns `None`.
+Bill detail pads patron names too: `getlegislationbyidasync` returned
+`" Charlie Schmidt"` as chief patron of HB1408 in 20261. Every response
+model therefore inherits `LISModel` now, not only the roster and vote models.
 
 **`getmemberlistasync` is strictly worse than both.** It returns the same 148
 rows under `ShallowMembers` with only 16 fields, dropping `DistrictID`,
