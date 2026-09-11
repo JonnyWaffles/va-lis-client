@@ -50,11 +50,14 @@ from html.parser import HTMLParser
 from va_lis_client.client import LISClient
 from va_lis_client.exceptions import (
     BillNotFoundError,
+    CommitteeNotFoundError,
     InvalidBillNumberError,
     SessionNotFoundError,
     TextVersionNotFoundError,
 )
 from va_lis_client.models import (
+    Committee,
+    CommitteeMember,
     Legislation,
     LegislationEvent,
     LegislationEventType,
@@ -238,6 +241,47 @@ class MemberVote:
         return self.result.LegislationNumber
 
 
+@dataclass(frozen=True)
+class CommitteeSeat:
+    """One member's seat on one committee, with the session roster joined on.
+
+    :meth:`LISService.committee_members` and
+    :meth:`LISService.member_committees` return these.  ``seat`` is the row
+    from ``/MembersByCommittee``, which names the member and the role and
+    nothing else; ``member`` is the session roster row that adds party and
+    district, or ``None`` when the roster lacks the member.
+    """
+
+    committee: Committee
+    seat: CommitteeMember
+    member: Member | None
+
+    @property
+    def role(self) -> str:
+        """``"Chair"``, ``"Vice-Chair"``, ``"Co-Chair"``, ``"Member"``, or ``"Ex-Officio"``."""
+        return self.seat.role
+
+    @property
+    def is_chair(self) -> bool:
+        """True for a chair or co-chair; a vice-chair is not a chair."""
+        return self.role in ("Chair", "Co-Chair")
+
+    @property
+    def name(self) -> str:
+        """The member's display name."""
+        return self.seat.MemberDisplayName or (self.member.name if self.member else "")
+
+    @property
+    def party(self) -> str | None:
+        """``"D"``, ``"I"``, or ``"R"``, from the roster."""
+        return self.member.PartyCode if self.member else self.seat.PartyCode
+
+    @property
+    def district(self) -> str | None:
+        """The district label, e.g. ``"71st"``, from the roster."""
+        return self.member.DistrictName if self.member else None
+
+
 class LISService:
     """Resolution and reference joins over a :class:`LISClient`.
 
@@ -274,6 +318,8 @@ class LISService:
             tuple[int, int, int | None], tuple[float, list[MemberLegislation]]
         ] = {}
         self._session_ids: dict[int, int] | None = None
+        self._committees: dict[tuple[str | None, bool], tuple[float, list[Committee]]] = {}
+        self._committee_rosters: dict[tuple[int, int], tuple[float, list[CommitteeMember]]] = {}
         self._event_types: dict[str, list[LegislationEventType]] | None = None
         self._statuses_by_name: dict[str, LegislationStatus] | None = None
         self._statuses_by_id: dict[int, LegislationStatus] | None = None
@@ -285,6 +331,8 @@ class LISService:
         self._roster_locks: dict[int, threading.Lock] = {}
         self._member_vote_locks: dict[tuple[int, int], threading.Lock] = {}
         self._member_bill_locks: dict[tuple[int, int, int | None], threading.Lock] = {}
+        self._committee_locks: dict[tuple[str | None, bool], threading.Lock] = {}
+        self._committee_roster_locks: dict[tuple[int, int], threading.Lock] = {}
         self._guard = threading.Lock()
         self._reference_lock = threading.Lock()
 
@@ -786,6 +834,162 @@ class LISService:
         """
         return self.client.get_bill_patrons(self.resolve_bill_id(bill_number, session_code))
 
+    def committees(
+        self,
+        chamber_code: str | None = None,
+        *,
+        include_subcommittees: bool = False,
+        refresh: bool = False,
+    ) -> list[Committee]:
+        """The standing committees, cached for ``roster_ttl``.
+
+        The list is not session scoped (LIS ignores the session code it is
+        sent), so the cache is keyed on chamber and whether subcommittees are
+        included.
+
+        Args:
+            chamber_code: ``"H"`` or ``"S"``.  Omit for both.
+            include_subcommittees: Add every subcommittee; 67 House rows
+                instead of 14.
+            refresh: Fetch again even when a fresh copy is cached.
+        """
+        key = (chamber_code, include_subcommittees)
+
+        return self._memo(
+            self._committees,
+            self._committee_locks,
+            key,
+            lambda: self.client.get_committees(
+                chamber_code=chamber_code,
+                include_subcommittees=include_subcommittees,
+            ),
+            refresh=refresh,
+        )
+
+    def resolve_committee(self, query: str, chamber_code: str | None = None) -> Committee:
+        """Find one committee by number or name, subcommittees included.
+
+        ``"H08"`` matches the number.  ``"Courts of Justice"`` matches the name
+        exactly, and ``"courts"`` matches as a substring, both ignoring case
+        and inner whitespace.  Both chambers have a Courts of Justice, so
+        pass ``chamber_code`` when a name could exist in either.
+
+        A substring that matches one standing committee and several of its
+        subcommittees resolves to the standing committee.
+
+        Args:
+            query: A committee number or any part of a name.
+            chamber_code: ``"H"`` or ``"S"`` to search one chamber.
+
+        Raises:
+            CommitteeNotFoundError: Nothing matches, or more than one does.
+        """
+        wanted = " ".join(query.split())
+        if not wanted:
+            raise CommitteeNotFoundError("A committee number or name is required.")
+
+        rows = self.committees(chamber_code, include_subcommittees=True)
+
+        by_number = [c for c in rows if c.CommitteeNumber.upper() == wanted.upper()]
+        if by_number:
+            return by_number[0]
+
+        lowered = wanted.lower()
+        matches = [c for c in rows if c.name.lower() == lowered]
+        if not matches:
+            matches = [c for c in rows if lowered in c.name.lower()]
+            standing = [c for c in matches if not c.is_subcommittee]
+            if len(standing) == 1:
+                matches = standing
+
+        if len(matches) == 1:
+            return matches[0]
+
+        if not matches:
+            raise CommitteeNotFoundError(f"No committee matches {query!r}.")
+
+        names = ", ".join(f"{c.CommitteeNumber} {c.name}" for c in matches)
+        raise CommitteeNotFoundError(
+            f"{query!r} matches {len(matches)} committees: {names}. "
+            "Pass the committee number, or a chamber code."
+        )
+
+    def committee_members(
+        self,
+        committee_id: int,
+        session_code: int,
+        *,
+        refresh: bool = False,
+    ) -> list[CommitteeSeat]:
+        """Who sits on a committee in a session, with party and district.
+
+        The seat list from ``/MembersByCommittee`` names the member and the
+        role and nothing else, so this joins the session roster on, the way
+        :meth:`roll_call` does for ballots.  Both lists are cached for
+        ``roster_ttl``.  Seats come back in LIS order, which puts the chair
+        first.
+
+        Args:
+            committee_id: ``CommitteeID`` from :meth:`committees` or
+                :meth:`resolve_committee`.  Subcommittees work too.
+            session_code: e.g. ``20261``.
+            refresh: Fetch the seat list again even when a fresh copy is
+                cached.
+
+        Raises:
+            CommitteeNotFoundError: No committee has that ID.
+        """
+        committee = self._committee_by_id(committee_id, session_code)
+        roster = self.members_by_id(session_code)
+
+        seats = self._memo(
+            self._committee_rosters,
+            self._committee_roster_locks,
+            (committee_id, session_code),
+            lambda: self.client.get_committee_members(committee_id, session_code),
+            refresh=refresh,
+        )
+
+        return [CommitteeSeat(committee, seat, roster.get(seat.MemberID)) for seat in seats]
+
+    def member_committees(
+        self,
+        member_id: int,
+        session_code: int,
+        chamber_code: str | None = None,
+        *,
+        include_subcommittees: bool = False,
+        refresh: bool = False,
+    ) -> list[CommitteeSeat]:
+        """Every committee seat one member holds in a session.
+
+        LIS has no member-first committee endpoint, so this walks every
+        committee in the member's chamber and reads each seat list: 14
+        requests for a House member, 67 with subcommittees, all cached for
+        ``roster_ttl``.  The chamber comes from the session roster when it
+        is not given; a member absent from the roster searches both chambers.
+
+        Args:
+            member_id: ``MemberID`` from the roster or :meth:`find_members`.
+            session_code: e.g. ``20261``.
+            chamber_code: ``"H"`` or ``"S"``; omit to read it off the roster.
+            include_subcommittees: Walk the subcommittees too.
+            refresh: Fetch every seat list again.
+        """
+        if chamber_code is None:
+            member = self.members_by_id(session_code).get(member_id)
+            chamber_code = member.ChamberCode if member else None
+
+        seats = []
+        for committee in self.committees(chamber_code, include_subcommittees=include_subcommittees):
+            for seat in self.committee_members(
+                committee.CommitteeID, session_code, refresh=refresh
+            ):
+                if seat.seat.MemberID == member_id:
+                    seats.append(seat)
+
+        return seats
+
     def session_id(self, session_code: int) -> int:
         """The ``SessionID`` behind a session code, e.g. ``59`` for ``20261``.
 
@@ -943,6 +1147,8 @@ class LISService:
             self._rosters.clear()
             self._member_votes.clear()
             self._member_bills.clear()
+            self._committees.clear()
+            self._committee_rosters.clear()
 
         with self._reference_lock:
             self._session_ids = None
@@ -1058,6 +1264,42 @@ class LISService:
     def _member_bill_lock(self, key: tuple[int, int, int | None]) -> threading.Lock:
         with self._guard:
             return self._member_bill_locks.setdefault(key, threading.Lock())
+
+    def _memo(self, store, locks, key, fetch, *, refresh: bool = False):
+        """``store[key]`` while it is younger than ``roster_ttl``, else ``fetch()``.
+
+        One lock per key, so a cold fetch for one key does not block another.
+        """
+        if not refresh:
+            cached = store.get(key)
+            if cached is not None and time.monotonic() - cached[0] < self.roster_ttl:
+                return cached[1]
+
+        with self._guard:
+            lock = locks.setdefault(key, threading.Lock())
+
+        with lock:
+            # Another thread may have filled the slot while this one waited.
+            if not refresh:
+                cached = store.get(key)
+                if cached is not None and time.monotonic() - cached[0] < self.roster_ttl:
+                    return cached[1]
+
+            value = fetch()
+            store[key] = (time.monotonic(), value)
+            return value
+
+    def _committee_by_id(self, committee_id: int, session_code: int) -> Committee:
+        """The committee row for an ID, from the cached list or the by-id call."""
+        for committee in self.committees(include_subcommittees=True):
+            if committee.CommitteeID == committee_id:
+                return committee
+
+        committee = self.client.get_committee(committee_id, self.session_id(session_code))
+        if committee is None:
+            raise CommitteeNotFoundError(f"No committee has CommitteeID {committee_id}.")
+
+        return committee
 
     def _load_statuses(self) -> None:
         if self._statuses_by_name is not None:

@@ -30,3 +30,7 @@ class TextVersionNotFoundError(LISError, LookupError):
 
 class SessionNotFoundError(LISError, LookupError):
     """Raised when a session code does not appear in the session reference list."""
+
+
+class CommitteeNotFoundError(LISError, LookupError):
+    """Raised when no committee, or more than one, matches a number or name."""

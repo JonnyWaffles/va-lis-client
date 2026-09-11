@@ -92,6 +92,12 @@ for b in service.member_bills(schmidt.MemberID, 20261):
 chief = service.member_bills(schmidt.MemberID, 20261, role=CHIEF_PATRON)
 patrons = service.bill_patrons("HB1408", 20261)                # every role
 
+# Committees: who sits where, with party and district, and the reverse.
+courts = service.resolve_committee("Courts of Justice", "H")   # H08
+for s in service.committee_members(courts.CommitteeID, 20261):
+    print(s.name, s.role, s.party, s.district)
+seats = service.member_committees(schmidt.MemberID, 20261)     # 14 cached requests
+
 # Every vote including the ones no member can be credited with.
 for record in service.bill_votes("HB1", 20261):
     notes = record.statements_by_member()
@@ -155,6 +161,7 @@ the package. The resolution errors also derive from the builtin that fits them.
 | `BillNotFoundError` | `LookupError` | A bill number is not in the session |
 | `TextVersionNotFoundError` | `LookupError` | No text version matches, or the version has no body |
 | `SessionNotFoundError` | `LookupError` | A session code is not in the session reference |
+| `CommitteeNotFoundError` | `LookupError` | No committee, or more than one, matches a number or name |
 
 ## Authentication
 
@@ -460,6 +467,24 @@ patron in a chamber with their bills, 1.3 MB for the 2026 House;
 `getmemberpatrontypelistasync` lists the roles one member holds, including a
 `PatronTypeID` of `0` for budget amendment requests.
 
+#### Committee (`/Committee/api/`)
+- `get_committees(chamber_code=None, include_subcommittees=False)` → 14 House and 11 Senate standing committees; 67 House rows with subcommittees
+- `get_committee(committee_id, session_id)` → one committee, with `MeetingNote` and `EffectiveBeginDate`
+- `get_committee_by_number(committee_number)` → the same by number, e.g. `"H14"`
+
+The list ignores the session it is sent. See
+[Committees and seats](#committees-and-seats).
+
+#### MembersByCommittee (`/MembersByCommittee/api/`)
+- `get_committee_members(committee_id, session_code)` → who sits on a committee, with roles; session required
+- `get_committee_roles()` → 8 roles, with chamber specific IDs
+
+#### CommitteeLegislationReferral (`/CommitteeLegislationReferral/api/`)
+- `get_committee_actions()` → 41 committee actions
+
+Despite the name, this service does not list the bills referred to a
+committee. The action vocabulary is its only data operation.
+
 ### Modeled but not yet wired to client methods
 
 #### Schedule (`/Schedule/api/`)
@@ -509,18 +534,6 @@ Calendar detail includes:
 - `AgendaItems` → `VoteMember` with per-member vote responses (Y/N)
 - Order of business (Call to Order, Invocation, etc.)
 
-#### Committee (`/Committee/api/`)
-
-| Endpoint | Description |
-|---|---|
-| `getcommitteesasync` | Full committee detail (by number or date) |
-| `getcommitteelistasync` | Shallow list by session + chamber |
-| `getcommitteebyidasync` | Single committee by ID + session |
-
-Key fields: `CommitteeID`, `CommitteeNumber` (e.g. `H14`, `S02`), `Name`,
-`ChamberCode`, `Abbreviation`, `MeetingNote`, `ParentCommitteeID` (for
-subcommittees).
-
 ### Not yet explored
 
 These services exist in the portal but haven't been investigated:
@@ -533,7 +546,6 @@ These services exist in the portal but haven't been investigated:
 - LegislationFileGeneration
 - LegislationSubject
 - MemberVoteSearch (only `getmembervotelistasync` is wired)
-- MembersByCommittee
 - MinutesBook
 - Organization
 - Person
@@ -712,6 +724,62 @@ rest: the chief patron, in a thin shape with no `LegislationID`,
 it. Those four fields are therefore optional on `Patron`, and `Patron.role`
 names the role on every shape. For the real list call
 `bill_patrons("HB1408", 20261)`, which returns 12 rows for that bill.
+
+## Committees and seats
+
+`/Committee` lists the committees, and `/MembersByCommittee` says who sits on
+one in a session. Neither is member-first, so `member_committees` walks a
+chamber's committees and reads every seat list, all cached for an hour.
+
+```python
+courts = service.resolve_committee("Courts of Justice", "H")
+for s in service.committee_members(courts.CommitteeID, 20261):
+    print(s.name, s.role, s.party, s.district)
+# Patrick A. Hope   Chair   D   1st
+# ...
+for s in service.member_committees(544, 20261, include_subcommittees=True):
+    print(s.committee.name, s.role)
+# Courts of Justice                           Member
+# Communications, Technology and Innovation   Member
+# HCJ Sub: Criminal                           Member
+```
+
+### The committee list is not session scoped
+
+`getcommitteelistasync` accepts a session and ignores it: the cache key reads
+`{SESSIONID=0}` for every call, and 20251 and 20261 return the same 14 House
+committees. The seat list is the session scoped half, and it requires a
+session; omitting it returns HTTP 400. Courts of Justice seats 23 in 20261
+and 22 in 20251.
+
+### Role IDs differ by chamber
+
+`getcommitteerolesasync` returns eight rows, and the same title carries a
+different ID in each chamber: a House chair is `3`, a Senate chair is `1`, a
+House member is `6`, a Senate member is `5`. Compare `CommitteeRoleTitle`,
+not the ID. The titles are Chair, Co-Chair (Senate), Vice-Chair (House),
+Member, and Ex-Officio; a full committee's chair sits on its subcommittees as
+Ex-Officio.
+
+### Two seat shapes, and padded subcommittee names
+
+The seat list names the role in `CommitteeRoleTitle` and carries no party. The
+seat nested in docket detail names it in `Title` and does carry `PartyCode`.
+`CommitteeMember.role` reads either. `committee_members` joins the session
+roster for party and district instead of trusting either row.
+
+A subcommittee number is its parent's number plus a three-digit sequence
+(`H08001`), and subcommittee names arrive padded inside: `"HAPP     Sub:
+Commerce Agriculture & Natural Resources"`. The model strips only the ends, so
+`Committee.name` collapses the middle.
+
+### There is no "bills in committee" endpoint
+
+`CommitteeLegislationReferral` sounds like one, but its only data operation is
+the 41-row action vocabulary. The bill list says "In Committee" without naming
+the committee, and bill detail nulls `CommitteeName`. The events carry it:
+read `LegislationEvent.CommitteeName` on a bill's history for the committee it
+sits in.
 
 ## The member-first axis
 

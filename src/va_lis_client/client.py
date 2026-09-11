@@ -62,6 +62,10 @@ from va_lis_client.exceptions import LISClientError
 from va_lis_client.http import requests_session
 from va_lis_client.models import (
     ActorType,
+    Committee,
+    CommitteeAction,
+    CommitteeMember,
+    CommitteeRole,
     District,
     Heartbeat,
     Legislation,
@@ -1000,3 +1004,158 @@ class LISClient:
         if data is None:
             return []
         return [PatronRole.model_validate(r) for r in data.get("PatronRolesList", [])]
+
+    # ------------------------------------------------------------------
+    # Committees and seats
+    # ------------------------------------------------------------------
+
+    def get_committees(
+        self,
+        chamber_code: str | None = None,
+        *,
+        session_code: int | None = None,
+        parent_committee_id: int | None = None,
+        include_subcommittees: bool = False,
+    ) -> list[Committee]:
+        """The standing committees, and optionally every subcommittee.
+
+        14 House and 11 Senate standing committees; the House list grows to
+        67 rows with subcommittees (measured 2026-09-11).
+
+        **The session is ignored.**  The response's cache key reads
+        ``{SESSIONID=0}`` whatever ``session_code`` is sent, and 20251 and
+        20261 return the same rows.  The list describes the committees that
+        exist now; who sits on them is session scoped and comes from
+        :meth:`get_committee_members`.
+
+        The list nulls ``EffectiveBeginDate``, ``MeetingNote``, and
+        ``IsPublic``.  :meth:`get_committee` and
+        :meth:`get_committee_by_number` fill them.
+
+        Args:
+            chamber_code: ``"H"`` or ``"S"``.  Omit for both.
+            session_code: Accepted and ignored by LIS; sent when given.
+            parent_committee_id: Only the subcommittees of one committee.
+            include_subcommittees: Add every subcommittee to the list.
+
+        Envelope key: ``Committees``.
+        """
+        params: dict[str, str | int] = {}
+        if chamber_code:
+            params["chamberCode"] = chamber_code
+        if session_code is not None:
+            params["sessionCode"] = session_code
+        if parent_committee_id is not None:
+            params["parentCommitteeID"] = parent_committee_id
+        if include_subcommittees:
+            params["includeSubCommittees"] = "true"
+
+        data = self._get("/Committee/api/getcommitteelistasync", params=params or None)
+        if data is None:
+            return []
+        return [Committee.model_validate(c) for c in data.get("Committees", [])]
+
+    def get_committee(self, committee_id: int, session_id: int) -> Committee | None:
+        """One committee with the fields the list leaves null.
+
+        Adds ``EffectiveBeginDate``, ``MeetingNote`` (e.g. "Monday,
+        Wednesday, and Friday, 1 hour after adjournment"), and ``IsPublic``.
+
+        Args:
+            committee_id: e.g. ``8`` for House Courts of Justice.
+            session_id: ``Session.SessionID``; the spec marks it required.
+                :meth:`LISService.session_id` resolves a code.
+
+        Returns:
+            The :class:`Committee`, or ``None`` when LIS answers 204.
+
+        Envelope key: ``Committees`` — a list holding one committee.
+        """
+        data = self._get(
+            "/Committee/api/getcommitteebyidasync",
+            params={"id": committee_id, "sessionID": session_id},
+        )
+        if data is None:
+            return None
+
+        rows = data.get("Committees", [])
+        return Committee.model_validate(rows[0]) if rows else None
+
+    def get_committee_by_number(
+        self,
+        committee_number: str,
+        effective_date: str | None = None,
+    ) -> Committee | None:
+        """One committee by its number, e.g. ``"H14"``, with the detail fields.
+
+        Args:
+            committee_number: Chamber prefix and number, e.g. ``"S02"``.
+            effective_date: Passed through to LIS as ``effectiveDate``.
+
+        Returns:
+            The :class:`Committee`, or ``None`` when LIS answers 204.
+
+        Envelope key: ``Committees``.
+        """
+        params: dict[str, str] = {"committeeNumber": committee_number}
+        if effective_date:
+            params["effectiveDate"] = effective_date
+
+        data = self._get("/Committee/api/getcommitteesasync", params=params)
+        if data is None:
+            return None
+
+        rows = data.get("Committees", [])
+        return Committee.model_validate(rows[0]) if rows else None
+
+    def get_committee_members(self, committee_id: int, session_code: int) -> list[CommitteeMember]:
+        """Who sits on a committee in a session, with their roles.
+
+        Works for subcommittees too: the House Courts of Justice Criminal
+        subcommittee returns 11 seats, with the full committee's chair as
+        ``Ex-Officio``.  The session filter is real (cache key
+        ``{SESSIONID=59}{COMMITTEEID=8}``): Courts of Justice returns 23 seats
+        for 20261 and 22 for 20251.
+
+        The rows carry no party or district.  :meth:`LISService.committee_members`
+        joins the session roster on.
+
+        Args:
+            committee_id: ``CommitteeID`` from :meth:`get_committees`.
+            session_code: e.g. ``20261``.  Required: omitting it returns HTTP
+                400 "Must provide either a valid Session ID or Session Code".
+
+        Envelope key: ``MemberList``.
+        """
+        data = self._get(
+            "/MembersByCommittee/api/getcommitteememberslistasync",
+            params={"committeeID": committee_id, "sessionCode": session_code},
+        )
+        if data is None:
+            return []
+        return [CommitteeMember.model_validate(m) for m in data.get("MemberList", [])]
+
+    def get_committee_roles(self) -> list[CommitteeRole]:
+        """Reference list of 8 committee roles, with chamber specific IDs.
+
+        A House chair is ``3`` and a Senate chair is ``1``; compare titles,
+        not IDs, across chambers.  Envelope key: ``CommitteeRoles``.
+        """
+        data = self._get("/MembersByCommittee/api/getcommitteerolesasync")
+        if data is None:
+            return []
+        return [CommitteeRole.model_validate(r) for r in data.get("CommitteeRoles", [])]
+
+    def get_committee_actions(self) -> list[CommitteeAction]:
+        """Reference list of 41 committee actions.
+
+        This is the only data operation in ``/CommitteeLegislationReferral``.
+        The service does not list the bills referred to a committee; that
+        question still has no endpoint (probed 2026-09-11).
+
+        Envelope key: ``CommitteeActions``.
+        """
+        data = self._get("/CommitteeLegislationReferral/api/getcommitteeactionreferencesasync")
+        if data is None:
+            return []
+        return [CommitteeAction.model_validate(a) for a in data.get("CommitteeActions", [])]

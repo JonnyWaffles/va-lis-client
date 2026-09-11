@@ -12,7 +12,8 @@ Modules:
                    LegislationVersion, PATRON_ROLES
     text         — TextFile, LegislationTextItem, LegislationTextDetail,
                    LegislationSummary
-    committee    — CommitteeFile, Committee, CommitteeMember, CommitteeAction
+    committee    — CommitteeFile, Committee, CommitteeMember, CommitteeRole,
+                   CommitteeAction
     schedule     — Schedule, ScheduleType, MeetingRoom
     calendar     — CalendarFile, CalendarComment, CalendarItem,
                    AgendaItem, Agenda, CalendarCategory, Staff, CalendarDetail
@@ -42,6 +43,7 @@ from va_lis_client.models.committee import (
     CommitteeAction,
     CommitteeFile,
     CommitteeMember,
+    CommitteeRole,
 )
 from va_lis_client.models.common import Heartbeat, Partner
 from va_lis_client.models.docket import (
@@ -125,6 +127,7 @@ __all__ = [
     "CommitteeAction",
     "CommitteeFile",
     "CommitteeMember",
+    "CommitteeRole",
     # schedule
     "MeetingRoom",
     "Schedule",

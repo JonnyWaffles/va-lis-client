@@ -675,3 +675,148 @@ class ClientConfigTest(unittest.TestCase):
         client = LISClient(api_key="test-key-123")
         self.assertEqual(client.api_key, "test-key-123")
         self.assertEqual(client._headers(), {"WebAPIKey": "test-key-123"})
+
+
+@_skip_live
+class LiveMemberBillsTest(unittest.TestCase):
+    """The member-first bill axis, anchored on Delegate Schmidt (MemberID 544)."""
+
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_session_id_selects_the_session(self):
+        rows = self.client.get_member_legislation(544, session_id=61)
+
+        self.assertGreater(len(rows), 0)
+        self.assertEqual({r.SessionID for r in rows}, {61})
+
+    def test_the_chief_patron_filter_matches_the_bill_list(self):
+        chief = {
+            r.LegislationNumber
+            for r in self.client.get_member_legislation(544, session_id=59, patron_type_id=1)
+        }
+        listed = {
+            b.LegislationNumber
+            for b in self.client.get_session_bills(session_code=20261)
+            if any(p.MemberID == 544 for p in b.Patrons)
+        }
+
+        self.assertIn("HB1408", chief)
+        self.assertEqual(chief, listed)
+
+    def test_rows_repeat_per_summary_version(self):
+        rows = self.client.get_member_legislation(544, session_id=59)
+
+        per_bill = Counter(r.LegislationID for r in rows)
+        self.assertGreater(max(per_bill.values()), 1)
+        self.assertGreater(len(rows), len(per_bill))
+
+    def test_an_unknown_member_answers_nothing(self):
+        self.assertEqual(self.client.get_member_legislation(999999, session_id=59), [])
+
+    def test_bill_patrons_match_the_detail_record(self):
+        patrons = self.client.get_bill_patrons(100874)
+        detail = self.client.get_bill(100874)
+
+        self.assertEqual(
+            sorted(p.MemberID for p in patrons), sorted(p.MemberID for p in detail.Patrons)
+        )
+        self.assertEqual(patrons[0].role, "Chief Patron")
+        self.assertEqual(patrons[0].MemberDisplayName, "Charlie Schmidt")
+
+    def test_patron_roles(self):
+        roles = {r.PatronTypeID: r.Name for r in self.client.get_patron_roles()}
+
+        self.assertEqual(len(roles), 5)
+        self.assertEqual(roles[1], "Chief Patron")
+        self.assertEqual(roles[4], "Co-Patron")
+
+    def test_the_service_finds_a_member_and_collapses_the_rows(self):
+        service = LISService(self.client)
+
+        self.assertEqual([m.MemberID for m in service.find_members("schmidt", 20261)], [544])
+
+        bills = service.member_bills(544, 20261)
+        self.assertEqual(len(bills), len({b.LegislationID for b in bills}))
+        self.assertEqual(len(service.member_bills(544, 20261, role=1)), 11)
+
+
+@_skip_live
+class LiveCommitteeTest(unittest.TestCase):
+    """Committees, seats, and the roles vocabulary."""
+
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_standing_committees_per_chamber(self):
+        house = self.client.get_committees("H")
+        senate = self.client.get_committees("S")
+
+        self.assertEqual(len(house), 14)
+        self.assertEqual(len(senate), 11)
+        self.assertTrue(all(not c.is_subcommittee for c in house + senate))
+
+    def test_subcommittees_extend_the_parent_number(self):
+        rows = self.client.get_committees("H", include_subcommittees=True)
+
+        parents = {c.CommitteeID: c for c in rows if not c.is_subcommittee}
+        subs = [c for c in rows if c.is_subcommittee]
+        self.assertGreater(len(subs), 40)
+        for sub in subs:
+            parent = parents[sub.ParentCommitteeID]
+            self.assertTrue(sub.CommitteeNumber.startswith(parent.CommitteeNumber))
+
+    def test_the_list_ignores_the_session(self):
+        now = [(c.CommitteeID, c.Name) for c in self.client.get_committees("H", session_code=20261)]
+        then = [
+            (c.CommitteeID, c.Name) for c in self.client.get_committees("H", session_code=20251)
+        ]
+
+        self.assertEqual(now, then)
+
+    def test_by_id_fills_the_meeting_note(self):
+        courts = self.client.get_committee(8, session_id=59)
+
+        self.assertEqual(courts.CommitteeNumber, "H08")
+        self.assertTrue(courts.MeetingNote)
+
+    def test_by_number(self):
+        self.assertEqual(self.client.get_committee_by_number("H14").Name, "Labor and Commerce")
+
+    def test_seats_are_session_scoped_and_carry_roles(self):
+        now = self.client.get_committee_members(8, 20261)
+        then = self.client.get_committee_members(8, 20251)
+
+        self.assertEqual(now[0].role, "Chair")
+        self.assertIn(544, {m.MemberID for m in now})
+        self.assertNotIn(544, {m.MemberID for m in then})
+
+    def test_a_session_is_required(self):
+        with self.assertRaises(requests.HTTPError):
+            self.client.get_committee_members(8, None)
+
+    def test_role_ids_differ_by_chamber(self):
+        chairs = {
+            r.ChamberCode: r.CommitteeRoleID
+            for r in self.client.get_committee_roles()
+            if r.Title == "Chair"
+        }
+
+        self.assertEqual(chairs, {"S": 1, "H": 3})
+
+    def test_committee_actions_are_a_vocabulary(self):
+        actions = self.client.get_committee_actions()
+
+        self.assertGreater(len(actions), 30)
+        self.assertIn("Referred to Committee", {a.Description for a in actions})
+
+    def test_the_service_joins_seats_and_finds_a_members_committees(self):
+        service = LISService(self.client)
+
+        courts = service.resolve_committee("Courts of Justice", "H")
+        seats = service.committee_members(courts.CommitteeID, 20261)
+        self.assertEqual((seats[0].role, seats[0].party), ("Chair", "D"))
+        self.assertTrue(all(s.member is not None for s in seats))
+
+        numbers = {s.committee.CommitteeNumber for s in service.member_committees(544, 20261)}
+        self.assertEqual(numbers, {"H08", "H21"})

@@ -12,6 +12,7 @@ import unittest
 
 from va_lis_client.exceptions import (
     BillNotFoundError,
+    CommitteeNotFoundError,
     InvalidBillNumberError,
     LISError,
     SessionNotFoundError,
@@ -19,6 +20,8 @@ from va_lis_client.exceptions import (
 )
 from va_lis_client.models import (
     CHIEF_PATRON,
+    Committee,
+    CommitteeMember,
     Legislation,
     LegislationEvent,
     LegislationEventType,
@@ -217,6 +220,26 @@ def member_bill(
     )
 
 
+def committee(committee_id=8, number="H08", name="Courts of Justice", chamber="H", parent=None):
+    return Committee(
+        CommitteeID=committee_id,
+        Name=name,
+        CommitteeNumber=number,
+        ChamberCode=chamber,
+        ParentCommitteeID=parent,
+    )
+
+
+def seat(committee_id=8, member_id=1, title="Member", role_id=6):
+    return CommitteeMember(
+        CommitteeMemberID=33000 + member_id,
+        CommitteeID=committee_id,
+        MemberID=member_id,
+        CommitteeRoleID=role_id,
+        CommitteeRoleTitle=title,
+    )
+
+
 def service_with_types():
     return LISService(FakeClient())
 
@@ -237,6 +260,8 @@ class FakeClient:
         sessions=None,
         member_legislation=None,
         bill_patrons=None,
+        committees=None,
+        committee_members=None,
     ):
         self.events = events if events is not None else []
         self.votes = votes if votes is not None else {}
@@ -248,6 +273,18 @@ class FakeClient:
         # Keyed by patron type: None holds the unfiltered rows.
         self.member_legislation = member_legislation if member_legislation is not None else {}
         self.bill_patrons = bill_patrons if bill_patrons is not None else []
+        self.committees = (
+            committees
+            if committees is not None
+            else [
+                committee(8, "H08", "Courts of Justice"),
+                committee(21, "H21", "Communications, Technology and Innovation"),
+                committee(202, "S13", "Courts of Justice", chamber="S"),
+                committee(41, "H08001", "HCJ      Sub: Criminal", parent=8),
+            ]
+        )
+        # Keyed by CommitteeID.
+        self.committee_members = committee_members if committee_members is not None else {}
         self.bills = bills if bills is not None else [bill_row()]
         self.detail = detail if detail is not None else bill_detail()
         self.texts = (
@@ -353,6 +390,28 @@ class FakeClient:
         self._count("get_bill_patrons")
         self.last_patron_legislation_id = legislation_id
         return list(self.bill_patrons)
+
+    def get_committees(
+        self,
+        chamber_code=None,
+        *,
+        session_code=None,
+        parent_committee_id=None,
+        include_subcommittees=False,
+    ):
+        self._count("get_committees")
+        rows = [c for c in self.committees if chamber_code is None or c.ChamberCode == chamber_code]
+        if not include_subcommittees:
+            rows = [c for c in rows if c.ParentCommitteeID is None]
+        return rows
+
+    def get_committee(self, committee_id, session_id):
+        self._count("get_committee")
+        return None
+
+    def get_committee_members(self, committee_id, session_code):
+        self._count("get_committee_members")
+        return list(self.committee_members.get(committee_id, []))
 
     def get_legislation_statuses(self):
         self._count("get_legislation_statuses")
@@ -1415,3 +1474,141 @@ class PatronShapesTest(unittest.TestCase):
         self.assertEqual(row.SummaryVersion, "SUMMARY AS PASSED")
         self.assertEqual(row.SessionID, 59)
         self.assertEqual(row.Patrons[0].role, "Chief Patron")
+
+
+class CommitteesTest(unittest.TestCase):
+    def test_caches_per_chamber_and_subcommittee_flag(self):
+        client = FakeClient()
+        service = LISService(client)
+
+        service.committees("H")
+        service.committees("H")
+        self.assertEqual(client.calls["get_committees"], 1)
+
+        service.committees("H", include_subcommittees=True)
+        self.assertEqual(client.calls["get_committees"], 2)
+
+    def test_resolves_by_number_ignoring_case(self):
+        self.assertEqual(LISService(FakeClient()).resolve_committee("h08").CommitteeID, 8)
+
+    def test_resolves_by_exact_name_within_a_chamber(self):
+        found = LISService(FakeClient()).resolve_committee("Courts of Justice", "S")
+
+        self.assertEqual(found.CommitteeID, 202)
+
+    def test_a_name_in_both_chambers_is_ambiguous_without_a_chamber(self):
+        with self.assertRaises(CommitteeNotFoundError):
+            LISService(FakeClient()).resolve_committee("Courts of Justice")
+
+    def test_a_substring_prefers_the_standing_committee_over_its_subcommittees(self):
+        self.assertEqual(LISService(FakeClient()).resolve_committee("courts", "H").CommitteeID, 8)
+
+    def test_a_substring_can_name_a_subcommittee(self):
+        self.assertEqual(
+            LISService(FakeClient()).resolve_committee("criminal", "H").CommitteeID, 41
+        )
+
+    def test_nothing_matching_raises_a_lookup_error(self):
+        with self.assertRaises(LookupError):
+            LISService(FakeClient()).resolve_committee("Fungi")
+
+    def test_a_blank_query_raises(self):
+        with self.assertRaises(CommitteeNotFoundError):
+            LISService(FakeClient()).resolve_committee("  ")
+
+
+class CommitteeMembersTest(unittest.TestCase):
+    def client(self):
+        return FakeClient(
+            members=[
+                member(186, "H0219", "Patrick A. Hope", party="D", district="1st"),
+                member(544, "H0402", "Charlie Schmidt", party="D", district="77th"),
+            ],
+            committee_members={
+                8: [seat(8, 186, "Chair", 3), seat(8, 544)],
+                21: [seat(21, 544)],
+                41: [seat(41, 544), seat(41, 186, "Ex-Officio", 7)],
+            },
+        )
+
+    def test_joins_party_and_district_from_the_roster(self):
+        seats = LISService(self.client()).committee_members(8, 20261)
+
+        self.assertEqual(
+            [(s.name, s.role, s.party, s.district) for s in seats],
+            [("Patrick A. Hope", "Chair", "D", "1st"), ("Charlie Schmidt", "Member", "D", "77th")],
+        )
+        self.assertTrue(seats[0].is_chair)
+        self.assertFalse(seats[1].is_chair)
+        self.assertEqual(seats[0].committee.CommitteeNumber, "H08")
+
+    def test_a_member_missing_from_the_roster_still_has_a_seat(self):
+        client = self.client()
+        client.committee_members[8].append(seat(8, 999))
+
+        seats = LISService(client).committee_members(8, 20261)
+
+        self.assertIsNone(seats[-1].member)
+        self.assertIsNone(seats[-1].party)
+
+    def test_caches_the_seat_list(self):
+        client = self.client()
+        service = LISService(client)
+
+        service.committee_members(8, 20261)
+        service.committee_members(8, 20261)
+        self.assertEqual(client.calls["get_committee_members"], 1)
+
+        service.committee_members(8, 20261, refresh=True)
+        self.assertEqual(client.calls["get_committee_members"], 2)
+
+    def test_an_unknown_committee_raises(self):
+        with self.assertRaises(CommitteeNotFoundError):
+            LISService(self.client()).committee_members(999, 20261)
+
+    def test_member_committees_walks_the_members_chamber(self):
+        client = self.client()
+
+        seats = LISService(client).member_committees(544, 20261)
+
+        self.assertEqual([s.committee.CommitteeNumber for s in seats], ["H08", "H21"])
+        self.assertEqual(client.calls["get_committee_members"], 2)
+
+    def test_member_committees_can_include_subcommittees(self):
+        seats = LISService(self.client()).member_committees(544, 20261, include_subcommittees=True)
+
+        self.assertEqual(
+            [s.committee.name for s in seats],
+            ["Courts of Justice", "Communications, Technology and Innovation", "HCJ Sub: Criminal"],
+        )
+
+    def test_member_committees_takes_an_explicit_chamber(self):
+        client = self.client()
+
+        seats = LISService(client).member_committees(544, 20261, "S")
+
+        self.assertEqual(seats, [])
+        self.assertEqual(client.calls["get_committee_members"], 1)
+
+
+class CommitteeShapesTest(unittest.TestCase):
+    def test_role_reads_either_shape(self):
+        roster = CommitteeMember(
+            CommitteeMemberID=1, CommitteeID=8, MemberID=186, CommitteeRoleTitle="Chair"
+        )
+        docket = CommitteeMember(CommitteeMemberID=2, CommitteeID=23, MemberID=114, Title="Chair")
+        bare = CommitteeMember(CommitteeMemberID=3, CommitteeID=8, MemberID=1)
+
+        self.assertEqual((roster.role, docket.role, bare.role), ("Chair", "Chair", ""))
+
+    def test_name_collapses_inner_padding(self):
+        sub = Committee(
+            CommitteeID=35,
+            Name="HAPP     Sub: Commerce Agriculture & Natural Resources",
+            CommitteeNumber="H02001",
+            ChamberCode="H",
+            ParentCommitteeID=2,
+        )
+
+        self.assertEqual(sub.name, "HAPP Sub: Commerce Agriculture & Natural Resources")
+        self.assertTrue(sub.is_subcommittee)
