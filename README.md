@@ -176,7 +176,10 @@ PartnerAuthentication service.
   January 1994 committee vote. Do not assume a vote ID belongs to a recent
   session.
 - Older session data is available as `legacylis.virginia.gov` CSV downloads.
-- No rate limits are documented anywhere.
+- **No rate limit is enforced, but usage is tracked per key.** DLAS said in
+  September 2026 that they do not rate limit, that they watch per key usage,
+  and that they have revoked keys after sending warnings. Rate limit yourself;
+  see [Rate limiting](#rate-limiting-optional).
 
 ## Identifier cheat-sheet
 
@@ -1072,6 +1075,11 @@ corresponds to that state:
 | Reenrolled-Senate (43) | 7 | Reenrolled |
 
 ## Rate limiting (optional)
+
+LIS enforces no rate limit, but DLAS tracks usage per key and has revoked keys
+after sending warnings (stated September 2026). No threshold is published.
+Treat self imposed rate limiting as required in production, even though the
+extra is optional to install.
 
 If you're running many workers and want to share a global rate limit across
 them, install the `rate-limiting` extra and use `try_acquire_request_permit`:
