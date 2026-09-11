@@ -55,6 +55,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from datetime import date, datetime
 
 import requests as _requests
 
@@ -62,11 +63,17 @@ from va_lis_client.exceptions import LISClientError
 from va_lis_client.http import requests_session
 from va_lis_client.models import (
     ActorType,
+    CalendarCategoryType,
+    CalendarDetail,
+    CalendarItem,
+    CalendarType,
     Committee,
     CommitteeAction,
     CommitteeMember,
     CommitteeRole,
     District,
+    DocketDetail,
+    DocketListItem,
     Heartbeat,
     Legislation,
     LegislationEvent,
@@ -77,6 +84,7 @@ from va_lis_client.models import (
     LegislationTextDetail,
     LegislationTextItem,
     LegislationVersion,
+    MeetingRoom,
     Member,
     MemberLegislation,
     MemberVoteResult,
@@ -86,6 +94,8 @@ from va_lis_client.models import (
     Party,
     Patron,
     PatronRole,
+    Schedule,
+    ScheduleType,
     Session,
     Vote,
     VoteType,
@@ -1159,3 +1169,260 @@ class LISClient:
         if data is None:
             return []
         return [CommitteeAction.model_validate(a) for a in data.get("CommitteeActions", [])]
+
+    # ------------------------------------------------------------------
+    # Meetings: the master schedule (when and where)
+    # ------------------------------------------------------------------
+
+    def get_schedules(
+        self,
+        start_date: str | date | datetime | None = None,
+        end_date: str | date | datetime | None = None,
+        *,
+        owner_id: int | None = None,
+        schedule_type_id: int | None = None,
+        vote_room_id: int | None = None,
+        schedule_ids: str | None = None,
+    ) -> list[Schedule]:
+        """Meetings from the master schedule: committees, caucuses, floor, other.
+
+        **Always pass a date range.**  With no parameters the endpoint
+        returns every meeting it holds, 3,631 rows and 2 MB spanning October
+        2022 to December 2026 (measured 2026-09-11).  The week of
+        2026-02-02 alone is 147 rows and 80 KB.
+
+        ``owner_id`` is a ``CommitteeID``: ``8`` with the 2026 session dates
+        returns the 22 House Courts of Justice meetings.  Rows that are not
+        committee meetings omit ``OwnerID`` and ``CommitteeNumber``.
+
+        ``ScheduleTime`` is free text and often blank; ``IsCancelled`` is
+        set on cancelled meetings, which stay in the list.  Senate dockets
+        appear here too, as type ``"Docket"``.
+
+        Args:
+            start_date: Inclusive; a ``date``, ``datetime``, or
+                ``"YYYY-MM-DD"``.
+            end_date: Inclusive, same forms.
+            owner_id: ``CommitteeID`` of the meeting's owner.
+            schedule_type_id: 1 Committee, 2 Chamber, 3 Conference, 4 Caucus,
+                5 Other, 6 Docket.
+            vote_room_id: A room from :meth:`get_meeting_rooms`.
+            schedule_ids: Passed through to LIS as ``scheduleIDs``.
+
+        Envelope key: ``Schedules``.
+        """
+        params: dict[str, str | int] = {}
+        if start_date is not None:
+            params["startDate"] = _date_param(start_date)
+        if end_date is not None:
+            params["endDate"] = _date_param(end_date)
+        if owner_id is not None:
+            params["ownerID"] = owner_id
+        if schedule_type_id is not None:
+            params["scheduleTypeID"] = schedule_type_id
+        if vote_room_id is not None:
+            params["voteRoomID"] = vote_room_id
+        if schedule_ids:
+            params["scheduleIDs"] = schedule_ids
+
+        data = self._get("/Schedule/api/getschedulelistasync", params=params or None)
+        if data is None:
+            return []
+        return [Schedule.model_validate(s) for s in data.get("Schedules", [])]
+
+    def get_schedule_types(self) -> list[ScheduleType]:
+        """Reference list of 6 schedule types.  Envelope key: ``ScheduleTypes``."""
+        data = self._get("/Schedule/api/getscheduletypesreferenceasync")
+        if data is None:
+            return []
+        return [ScheduleType.model_validate(t) for t in data.get("ScheduleTypes", [])]
+
+    def get_meeting_rooms(self, chamber_code: str | None = None) -> list[MeetingRoom]:
+        """Reference list of meeting rooms; 18 for the House.
+
+        Args:
+            chamber_code: ``"H"`` or ``"S"``.  Omit for both.
+
+        Envelope key: ``MeetingRooms``.
+        """
+        params = {"chamberCode": chamber_code} if chamber_code else None
+        data = self._get("/Schedule/api/getmeetingroomsreferenceasync", params=params)
+        if data is None:
+            return []
+        return [MeetingRoom.model_validate(r) for r in data.get("MeetingRooms", [])]
+
+    # ------------------------------------------------------------------
+    # Meetings: floor calendars and Senate dockets (what is up)
+    # ------------------------------------------------------------------
+
+    def get_calendars(self, chamber_code: str, session_code: int) -> list[CalendarItem]:
+        """The floor calendars of a chamber for a session.
+
+        56 for the 2026 House, every one of type ``"Chamber"``, with the
+        PDF and JSON files attached.  The list carries no agendas; call
+        :meth:`get_calendar` for one calendar's bills and votes.
+
+        The endpoint's ``calendarDate`` filter answered 204 for
+        ``2026-02-17`` (measured 2026-09-11), so it is not wired.  Filter
+        the list on ``CalendarDate`` instead.
+
+        Args:
+            chamber_code: ``"H"`` or ``"S"``.  Required.
+            session_code: e.g. ``20261``.
+
+        Envelope key: ``Calendars``.
+        """
+        data = self._get(
+            "/Calendar/api/getcalendarlistasync",
+            params={"chamberCode": chamber_code, "sessionCode": session_code},
+        )
+        if data is None:
+            return []
+        return [CalendarItem.model_validate(c) for c in data.get("Calendars", [])]
+
+    def get_calendar(self, calendar_id: int) -> CalendarDetail | None:
+        """One floor calendar with its categories, agendas, and vote rows.
+
+        Calendar 20885 (``HC20114``) carries one Resolutions category with
+        four agendas, each naming a bill, and 88 ``VoteMember`` rows on the
+        agenda items.  ``CalendarDetail.bills`` flattens the agendas that
+        name a bill.
+
+        Args:
+            calendar_id: ``CalendarID`` from :meth:`get_calendars`.
+
+        Returns:
+            The :class:`CalendarDetail`, or ``None`` when LIS answers 204.
+
+        Envelope key: ``Calendars`` — a list holding one calendar.
+        """
+        data = self._get("/Calendar/api/getcalendarsbyidasync", params={"calendarId": calendar_id})
+        if data is None:
+            return None
+
+        rows = data.get("Calendars", [])
+        return CalendarDetail.model_validate(rows[0]) if rows else None
+
+    def get_dockets(
+        self,
+        committee_id: int,
+        session_code: int,
+        chamber_code: str = "S",
+    ) -> list[DocketListItem]:
+        """A Senate committee's dockets for a session.
+
+        **Senate only.**  A House committee answers 204, so this returns an
+        empty list for one.  Senate Courts of Justice (``CommitteeID`` 202)
+        has 16 dockets in 20261.  The list carries no bills; call
+        :meth:`get_docket` for one docket's items.
+
+        Args:
+            committee_id: ``CommitteeID`` from :meth:`get_committees`.
+            session_code: e.g. ``20261``.
+            chamber_code: ``"S"``; sent as given.
+
+        Envelope key: ``Dockets``.
+        """
+        data = self._get(
+            "/Calendar/api/getdocketlistasync",
+            params={
+                "committeeID": committee_id,
+                "sessionCode": session_code,
+                "chamberCode": chamber_code,
+            },
+        )
+        if data is None:
+            return []
+        return [DocketListItem.model_validate(d) for d in data.get("Dockets", [])]
+
+    def get_dockets_by_committee_number(
+        self,
+        committee_number: str,
+        session_code: int,
+        chamber_code: str = "S",
+    ) -> list[DocketListItem]:
+        """The same docket list by committee number, e.g. ``"S13"``.
+
+        All three parameters are required by LIS.  Envelope key: ``Dockets``.
+        """
+        data = self._get(
+            "/Calendar/api/getdocketlistbycommitteenumberasync",
+            params={
+                "committeeNumber": committee_number,
+                "sessionCode": session_code,
+                "chamberCode": chamber_code,
+            },
+        )
+        if data is None:
+            return []
+        return [DocketListItem.model_validate(d) for d in data.get("Dockets", [])]
+
+    def get_docket(self, docket_id: int) -> DocketDetail | None:
+        """One Senate docket with its bills, members, staff, and schedule.
+
+        Docket 21123 (Senate Courts of Justice, 2026-03-09) carries one
+        category of 16 bills, each with its summary and patrons, and one
+        linked schedule with the room.  ``DocketDetail.bills`` flattens the
+        items that name a bill.
+
+        The envelope reports ``Success: false`` with a null
+        ``FailureMessage`` on this complete response; the flag is ignored.
+
+        Args:
+            docket_id: ``DocketID`` from :meth:`get_dockets`.
+
+        Returns:
+            The :class:`DocketDetail`, or ``None`` when LIS answers 204.
+
+        Envelope key: ``Dockets`` — a list holding one docket.
+        """
+        data = self._get("/Calendar/api/getdocketsbyidasync", params={"docketId": docket_id})
+        if data is None:
+            return None
+
+        rows = data.get("Dockets", [])
+        return DocketDetail.model_validate(rows[0]) if rows else None
+
+    def get_calendar_types(self) -> list[CalendarType]:
+        """Reference list of 2 calendar types: 1 Chamber, 2 Committee.
+
+        Envelope key: ``CalendarTypes``.
+        """
+        data = self._get("/Calendar/api/getcalendartypesreferenceasync")
+        if data is None:
+            return []
+        return [CalendarType.model_validate(t) for t in data.get("CalendarTypes", [])]
+
+    def get_calendar_category_types(
+        self,
+        chamber_code: str | None = None,
+    ) -> list[CalendarCategoryType]:
+        """Reference list of 98 calendar category types, 44 House and 54 Senate.
+
+        The vocabulary behind ``CategoryCode`` on calendar and docket
+        categories.  The sibling ``getcalendaractionsreferenceasync`` is not
+        wired: it returns 4,952 rows and 2 MB.
+
+        Args:
+            chamber_code: ``"H"`` or ``"S"``.  Omit for both.
+
+        Envelope key: ``CalendarCategoryTypes``.
+        """
+        params = {"chamberCode": chamber_code} if chamber_code else None
+        data = self._get("/Calendar/api/getcalendarcategorytypesreferenceasync", params=params)
+        if data is None:
+            return []
+        return [
+            CalendarCategoryType.model_validate(t) for t in data.get("CalendarCategoryTypes", [])
+        ]
+
+
+def _date_param(value: str | date | datetime) -> str:
+    """``YYYY-MM-DD`` for a date or datetime; a string passes through as sent."""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+
+    if isinstance(value, date):
+        return value.isoformat()
+
+    return value

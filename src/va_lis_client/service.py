@@ -45,6 +45,7 @@ import threading
 import time
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime
 from html.parser import HTMLParser
 
 from va_lis_client.client import LISClient
@@ -58,6 +59,8 @@ from va_lis_client.exceptions import (
 from va_lis_client.models import (
     Committee,
     CommitteeMember,
+    DocketDetail,
+    DocketItem,
     Legislation,
     LegislationEvent,
     LegislationEventType,
@@ -282,6 +285,35 @@ class CommitteeSeat:
         return self.member.DistrictName if self.member else None
 
 
+@dataclass(frozen=True)
+class DocketEntry:
+    """One bill on one Senate committee docket, with the docket it sits on.
+
+    :meth:`LISService.docket_entries` returns these.  ``docket`` is the full
+    docket, carried on every entry because one docket lists many bills;
+    ``item`` is the bill's row on it, with the summary and patrons.
+    """
+
+    docket: DocketDetail
+    item: DocketItem
+
+    @property
+    def bill_number(self) -> str | None:
+        """e.g. ``"HB128"``."""
+        return self.item.LegislationNumber
+
+    @property
+    def date(self) -> datetime | None:
+        """The docket date.  The linked schedule may disagree on the hour."""
+        return self.docket.DocketDate
+
+    @property
+    def room(self) -> str | None:
+        """The room from the linked schedule, when one is attached."""
+        schedule = self.docket.schedule
+        return schedule.RoomDescription if schedule else None
+
+
 class LISService:
     """Resolution and reference joins over a :class:`LISClient`.
 
@@ -320,6 +352,7 @@ class LISService:
         self._session_ids: dict[int, int] | None = None
         self._committees: dict[tuple[str | None, bool], tuple[float, list[Committee]]] = {}
         self._committee_rosters: dict[tuple[int, int], tuple[float, list[CommitteeMember]]] = {}
+        self._dockets: dict[int, tuple[float, DocketDetail | None]] = {}
         self._event_types: dict[str, list[LegislationEventType]] | None = None
         self._statuses_by_name: dict[str, LegislationStatus] | None = None
         self._statuses_by_id: dict[int, LegislationStatus] | None = None
@@ -333,6 +366,7 @@ class LISService:
         self._member_bill_locks: dict[tuple[int, int, int | None], threading.Lock] = {}
         self._committee_locks: dict[tuple[str | None, bool], threading.Lock] = {}
         self._committee_roster_locks: dict[tuple[int, int], threading.Lock] = {}
+        self._docket_locks: dict[int, threading.Lock] = {}
         self._guard = threading.Lock()
         self._reference_lock = threading.Lock()
 
@@ -990,6 +1024,55 @@ class LISService:
 
         return seats
 
+    def docket_entries(
+        self,
+        committee: int | str,
+        session_code: int,
+        *,
+        refresh: bool = False,
+    ) -> list[DocketEntry]:
+        """Every bill on every docket of a Senate committee in a session.
+
+        This is the Senate half of "when is a bill heard".  The docket list
+        names no bills, so this fetches each docket's detail, one request per
+        docket, cached for ``roster_ttl``: 17 requests for Senate Courts of
+        Justice in 20261, which docketed 16 meetings.  Entries come back in
+        docket order, newest docket first as LIS lists them.
+
+        The House keeps no dockets; its committee agendas are not in the API.
+        Read a House bill's committee from its events instead.
+
+        Args:
+            committee: A ``CommitteeID``, or a number or name for
+                :meth:`resolve_committee` (``"S13"``, ``"Courts of Justice"``).
+            session_code: e.g. ``20261``.
+            refresh: Fetch every docket again even when cached.
+
+        Raises:
+            CommitteeNotFoundError: A name or number matches nothing, or more
+                than one committee.
+        """
+        if isinstance(committee, str):
+            committee_id = self.resolve_committee(committee, "S").CommitteeID
+        else:
+            committee_id = committee
+
+        entries = []
+        for docket in self.client.get_dockets(committee_id, session_code):
+            detail = self._memo(
+                self._dockets,
+                self._docket_locks,
+                docket.DocketID,
+                lambda docket_id=docket.DocketID: self.client.get_docket(docket_id),
+                refresh=refresh,
+            )
+            if detail is None:
+                continue
+
+            entries.extend(DocketEntry(detail, item) for item in detail.bills)
+
+        return entries
+
     def session_id(self, session_code: int) -> int:
         """The ``SessionID`` behind a session code, e.g. ``59`` for ``20261``.
 
@@ -1149,6 +1232,7 @@ class LISService:
             self._member_bills.clear()
             self._committees.clear()
             self._committee_rosters.clear()
+            self._dockets.clear()
 
         with self._reference_lock:
             self._session_ids = None

@@ -3,7 +3,36 @@
 from datetime import datetime
 
 from va_lis_client.models.common import LISModel
-from va_lis_client.models.text import TextFile
+
+
+class ScheduleFile(LISModel):
+    """An attachment on a meeting, from ``Schedule.ScheduleFiles``.
+
+    Usually an agenda PDF.  415 of the 3,631 meetings in the unfiltered
+    schedule list carry one, and a few carry up to five.  This is not the
+    bill text file shape: there is no ``LegislationTextID`` or
+    ``TextFormatID``, and ``FileFormat`` is null on every observed row.
+
+    Example::
+
+        {"FileID": 1005518,
+         "FileURL": "https://lis.blob.core.windows.net/files/1005518.PDF",
+         "ModificationDate": "2024-06-18T15:08:10.727",
+         "IsGenerated": true, "IsActive": true, "IsPublic": true,
+         "IsDeleted": null, "BlobURL": null, "FileFormat": null,
+         "FileContents": null, "Success": false, "FailureMessage": null}
+    """
+
+    FileID: int | None = None
+    FileURL: str | None = None
+    BlobURL: str | None = None
+    FileFormat: str | None = None  # null on every observed row
+    FileContents: str | None = None
+    ModificationDate: datetime | None = None
+    IsGenerated: bool = False
+    IsActive: bool = True
+    IsPublic: bool = True
+    IsDeleted: bool | None = None
 
 
 class Schedule(LISModel):
@@ -16,11 +45,16 @@ class Schedule(LISModel):
 
     **Data quality warning:** ``ScheduleTime`` is frequently free-text
     (e.g. ``"15 minutes after the Senate adjourns"``, ``"TBD"``) rather
-    than a parseable time.  ``IsCancelled`` flips frequently with
-    last-minute changes.
+    than a parseable time, and blank on 35 of the 147 meetings in the week
+    of 2026-02-02.  ``IsCancelled`` flips frequently with last-minute
+    changes; 8 of those 147 were cancelled.
 
     ``ScheduleType`` values: Committee, Chamber, Conference, Caucus,
-    Docket, Other.
+    Docket, Other.  Rows that are not committee meetings (caucuses, press
+    events, ``"Other"``) omit ``OwnerID`` and ``CommitteeNumber`` from the
+    JSON rather than sending null, so both are optional here.  Committee
+    rows name the committee: ``OwnerID`` 8, ``OwnerName`` "House Courts of
+    Justice", ``CommitteeNumber`` "H08"; a subcommittee reads "H10001".
 
     Example::
 
@@ -53,7 +87,7 @@ class Schedule(LISModel):
     IsPublic: bool = True
     LinkURL: str | None = None  # link to LIS page for this meeting
     OnCalendar: bool = False
-    ScheduleFiles: list[TextFile] = []
+    ScheduleFiles: list[ScheduleFile] = []  # agenda attachments; absent on most rows
 
 
 class ScheduleType(LISModel):

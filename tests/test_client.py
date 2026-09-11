@@ -820,3 +820,64 @@ class LiveCommitteeTest(unittest.TestCase):
 
         numbers = {s.committee.CommitteeNumber for s in service.member_committees(544, 20261)}
         self.assertEqual(numbers, {"H08", "H21"})
+
+
+@_skip_live
+class LiveMeetingsTest(unittest.TestCase):
+    """The master schedule, floor calendars, and Senate dockets."""
+
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_a_week_of_meetings(self):
+        rows = self.client.get_schedules("2026-02-02", "2026-02-06")
+
+        self.assertGreater(len(rows), 100)
+        self.assertIn("Committee", {r.ScheduleType for r in rows})
+        self.assertTrue(any(r.IsCancelled for r in rows))
+
+    def test_owner_filters_to_one_committee(self):
+        rows = self.client.get_schedules("2026-01-14", "2026-03-14", owner_id=8)
+
+        self.assertGreater(len(rows), 10)
+        self.assertEqual({r.OwnerName for r in rows}, {"House Courts of Justice"})
+        self.assertEqual({r.CommitteeNumber for r in rows}, {"H08"})
+
+    def test_references(self):
+        types = {t.ScheduleTypeID: t.ScheduleType for t in self.client.get_schedule_types()}
+        self.assertEqual(types[6], "Docket")
+        self.assertGreater(len(self.client.get_meeting_rooms("H")), 10)
+
+        names = {t.Name for t in self.client.get_calendar_types()}
+        self.assertEqual(names, {"Chamber", "Committee"})
+        self.assertGreater(len(self.client.get_calendar_category_types()), 90)
+
+    def test_house_calendars_and_detail(self):
+        calendars = self.client.get_calendars("H", 20261)
+
+        self.assertEqual(len(calendars), 56)
+        self.assertEqual({c.CalendarType for c in calendars}, {"Chamber"})
+
+        detail = self.client.get_calendar(20885)
+        self.assertEqual(detail.ReferenceNumber, "HC20114")
+        self.assertEqual(len(detail.bills), 4)
+
+    def test_senate_dockets_and_detail(self):
+        dockets = self.client.get_dockets(202, 20261)
+
+        self.assertEqual(len(dockets), 16)
+        self.assertEqual(len(self.client.get_dockets_by_committee_number("S13", 20261)), 16)
+
+        detail = self.client.get_docket(21123)
+        self.assertEqual(len(detail.bills), 16)
+        self.assertTrue(detail.schedule.RoomDescription)
+
+    def test_a_house_committee_has_no_dockets(self):
+        self.assertEqual(self.client.get_dockets(8, 20261, chamber_code="H"), [])
+
+    def test_the_service_lists_every_docketed_bill(self):
+        entries = LISService(self.client).docket_entries("S13", 20261)
+
+        self.assertGreater(len(entries), 50)
+        self.assertTrue(all(e.bill_number for e in entries))
+        self.assertEqual(len({e.docket.DocketID for e in entries}), 16)

@@ -98,6 +98,10 @@ for s in service.committee_members(courts.CommitteeID, 20261):
     print(s.name, s.role, s.party, s.district)
 seats = service.member_committees(schmidt.MemberID, 20261)     # 14 cached requests
 
+# Senate dockets: every bill a committee has scheduled, with the date and room.
+for e in service.docket_entries("Courts of Justice", 20261):
+    print(e.date, e.bill_number, e.room)
+
 # Every vote including the ones no member can be credited with.
 for record in service.bill_votes("HB1", 20261):
     notes = record.statements_by_member()
@@ -485,54 +489,25 @@ The list ignores the session it is sent. See
 Despite the name, this service does not list the bills referred to a
 committee. The action vocabulary is its only data operation.
 
-### Modeled but not yet wired to client methods
-
 #### Schedule (`/Schedule/api/`)
-The master meeting calendar. All committee hearings, caucuses, floor sessions.
+- `get_schedules(start_date, end_date, owner_id=None, schedule_type_id=None, vote_room_id=None)` → meetings in a date range; always pass dates
+- `get_schedule_types()` → 6 types (1 Committee, 2 Chamber, 3 Conference, 4 Caucus, 5 Other, 6 Docket)
+- `get_meeting_rooms(chamber_code=None)` → room reference, 18 for the House
 
-| Endpoint | Description |
-|---|---|
-| `getschedulelistasync` | List meetings by date range, committee, type, room |
-| `previewvcalfileasync` | Generate vCal file for calendar integration |
-| `getmeetingroomsreferenceasync` | Room reference (by chamber) |
-| `getscheduletypesreferenceasync` | Schedule type reference |
-
-Key fields: `ScheduleDate`, `ScheduleTime` (often free-text like "15 minutes
-after the Senate adjourns"), `RoomDescription`, `OwnerName` (committee),
-`IsCancelled`, `ScheduleType` (Committee/Chamber/Conference/Caucus/Docket/Other).
-
-**Data quality warning:** `ScheduleTime` is frequently free-text, not a
-parseable time. The API faithfully reflects whatever the LIS clerks entered.
+Not wired: `previewvcalfileasync`, a vCal export.
 
 #### Calendar (`/Calendar/api/`)
-Floor calendars (both chambers) and committee dockets (Senate only).
+- `get_calendars(chamber_code, session_code)` → a chamber's floor calendars, 56 for the 2026 House
+- `get_calendar(calendar_id)` → one calendar with categories, agendas, and per-member vote rows
+- `get_dockets(committee_id, session_code)` → a Senate committee's dockets; a House committee returns nothing
+- `get_dockets_by_committee_number(committee_number, session_code)` → the same by number, e.g. `"S13"`
+- `get_docket(docket_id)` → one docket with its bills, members, staff, and linked schedule
+- `get_calendar_types()` → 2 types (1 Chamber, 2 Committee)
+- `get_calendar_category_types(chamber_code=None)` → 98 category codes, e.g. `CSGEN` = Senate Bill in Committee
 
-| Endpoint | Description |
-|---|---|
-| `getcalendarlistasync` | List calendars by session + chamber |
-| `getcalendarsbyidasync` | Full calendar with categories, agendas, votes |
-| `getdocketlistasync` | List dockets by committee (**Senate only**) |
-| `getdocketlistbycommitteenumberasync` | Dockets by committee number (**Senate only**) |
-| `getdocketsbyidasync` | Full docket with agenda items, bills, patrons |
-| `getcalendaractionsreferenceasync` | Calendar action reference |
-| `getcalendarcategorytypesreferenceasync` | Category type reference |
-| `getcalendartypesreferenceasync` | Calendar type reference |
-
-**Important:** Dockets are **Senate-only**. The House uses Calendars. Requesting
-a docket with `chamberCode=H` returns HTTP 400 with the message
-"Dockets can only be for ChamberCode = S".
-
-Docket detail includes:
-- `DocketCategories` → `DocketItems` → bills with summaries and patrons
-- `CommitteeMember` roster with roles (Chair, etc.)
-- `Staff` assignments
-- `Schedules` (linked back to the Schedule service for when/where)
-- PDF/JSON file downloads
-
-Calendar detail includes:
-- `CalendarCategories` → `Agendas` → bills with vote tallies
-- `AgendaItems` → `VoteMember` with per-member vote responses (Y/N)
-- Order of business (Call to Order, Invocation, etc.)
+Not wired: `getcalendaractionsreferenceasync` returns 4,952 rows and 2 MB, and
+`getcategorytypesreferenceasync` is unprobed. See
+[How meetings and dockets work](#how-meetings-and-dockets-work).
 
 ### Not yet explored
 
@@ -1037,7 +1012,7 @@ floor votes. `VoteFile.TextFormatID` is a **string** (`"5"`) here, where
 `"Failed, Database Error (51000)"` rather than an empty result; an
 out-of-range ID returns a clean 204.
 
-## How meetings/dockets work
+## How meetings and dockets work
 
 ```
 Committee ──→ Docket (Senate) or Calendar (House) ──→ Schedule ──→ Room
@@ -1049,10 +1024,49 @@ Committee ──→ Docket (Senate) or Calendar (House) ──→ Schedule ─�
                                                        └──→ VoteRoom reference
 ```
 
-- **Schedule** is the "when and where" — but `ScheduleTime` is often free-text
+- **Schedule** is the "when and where", but `ScheduleTime` is often free text
   like "15 minutes after adjournment"
-- **Docket/Calendar** is the "what" — which bills are on the agenda
-- **Committee** is the "who" — membership, chair, staff
+- **Docket/Calendar** is the "what": which bills are on the agenda
+- **Committee** is the "who": membership, chair, staff
+
+```python
+# Senate: every bill on every docket of a committee, one request per docket.
+for e in service.docket_entries("Courts of Justice", 20261):
+    print(e.date, e.bill_number, e.room)
+
+# Both chambers: a week of committee meetings, cancelled ones included.
+for m in client.get_schedules("2026-02-02", "2026-02-06", schedule_type_id=1):
+    print(m.ScheduleDate, m.ScheduleTime, m.OwnerName, m.IsCancelled)
+
+# House: a floor calendar's bills, and the votes taken on each.
+calendar = client.get_calendar(client.get_calendars("H", 20261)[0].CalendarID)
+for agenda in calendar.bills:
+    print(agenda.LegislationNumber, [i.VoteID for i in agenda.AgendaItems])
+```
+
+**Always give the schedule a date range.** Unfiltered, `getschedulelistasync`
+returns every meeting it holds: 3,631 rows and 2 MB from October 2022 to
+December 2026. The week of 2026-02-02 is 147 rows, 8 of them cancelled and 35
+with a blank `ScheduleTime`. Rows that are not committee meetings (caucuses,
+press events) omit `OwnerID` and `CommitteeNumber` from the JSON entirely.
+
+**Dockets are Senate only, and a docket and its schedule can disagree on the
+hour.** A House committee answers 204 on the docket list, which the client
+returns as an empty list. Senate Courts of Justice has 16 dockets in 20261.
+Docket 21123 carries `DocketDate` `2026-03-09T16:30:00` while its linked
+schedule reads `8:00 AM` for the same day, and the API does not say which is
+right. The docket detail envelope also reports `Success: false` with a null
+message on a complete response; the client ignores the flag.
+
+**House committee agendas are not in the API.** The calendar list returns floor
+calendars only (all 56 of the 2026 House list are type `Chamber`), and no
+docket exists for a House committee, so "when will House committee X hear
+bill Y" has no endpoint as probed on 2026-09-11. The schedule gives the
+meeting, the bill's events give the referral, and the agenda itself lives on
+the committee's web page.
+
+**The `calendarDate` filter answers 204.** `get_calendars` fetches the whole
+list, which is small, and leaves the date filter to you.
 
 ## How a bill becomes law (Virginia)
 

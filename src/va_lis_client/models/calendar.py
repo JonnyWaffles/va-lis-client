@@ -12,10 +12,12 @@ __all__ = [
     "Agenda",
     "AgendaItem",
     "CalendarCategory",
+    "CalendarCategoryType",
     "CalendarComment",
     "CalendarDetail",
     "CalendarFile",
     "CalendarItem",
+    "CalendarType",
     "Staff",
     "VoteMember",
 ]
@@ -61,10 +63,12 @@ class CalendarItem(LISModel):
     """A calendar list entry from ``/Calendar/api/getcalendarlistasync``.
 
     These are floor calendars (House and Senate).  For full detail with
-    agendas and votes, use ``getcalendarsbyidasync``.
+    agendas and votes, use ``getcalendarsbyidasync``.  The 2026 House list
+    holds 56, every one of type ``"Chamber"``.
 
     Key: ``CalendarID``.  ``ReferenceNumber`` is a human-readable code
-    like ``"HC10314"`` (House Calendar 1, March 14).
+    like ``"HC10314"`` (House Calendar 1, March 14); ``"HC20114"`` is the
+    second calendar of January 14.
 
     Example::
 
@@ -249,3 +253,58 @@ class CalendarDetail(LISModel):
     CalendarCategories: list[CalendarCategory] = []
     CalendarComments: list[CalendarComment] = []
     CalendarFiles: list[CalendarFile] = []
+
+    @property
+    def agendas(self) -> list[Agenda]:
+        """Every agenda entry across the categories, in calendar order."""
+        return [a for c in self.CalendarCategories for a in c.Agendas]
+
+    @property
+    def bills(self) -> list[Agenda]:
+        """The agenda entries that name a bill, in calendar order.
+
+        Order-of-business entries (call to order, invocation) carry no
+        ``LegislationNumber`` and are left out.
+        """
+        return [a for a in self.agendas if a.LegislationNumber]
+
+
+class CalendarType(LISModel):
+    """A row of ``/Calendar/api/getcalendartypesreferenceasync``: 1 Chamber, 2 Committee."""
+
+    CalendarTypeID: int
+    Name: str
+
+
+class CalendarCategoryType(LISModel):
+    """A row of ``/Calendar/api/getcalendarcategorytypesreferenceasync``.
+
+    The vocabulary behind ``CategoryCode`` on calendar and docket
+    categories: 98 rows, 44 House and 54 Senate, e.g. ``"CSGEN"`` = Senate
+    Bill in Committee, ``"HFIC"`` = For Immediate Consideration.
+
+    Example::
+
+        {"CalendarCategoryTypeID": 70, "CategoryCode": "BOX1",
+         "Description": "Comments", "PluralDescription": "Comments",
+         "CategoryType": "Miscellaneous", "ChamberCode": "S",
+         "CalendarTypeID": 1, "CategoryTypeID": 4,
+         "IsLegislationCategory": false, "IsPrint": true}
+    """
+
+    CalendarCategoryTypeID: int
+    CategoryCode: str | None = None
+    Description: str | None = None
+    PluralDescription: str | None = None
+    CategoryType: str | None = None
+    CategoryTypeID: int | None = None
+    CalendarTypeID: int | None = None  # 1 Chamber, 2 Committee
+    ChamberCode: str | None = None
+    LegislationTypeCode: str | None = None
+    LegislationChamberCode: str | None = None
+    Sequence: int | None = None
+    IsLegislationCategory: bool = False
+    IsPrint: bool = False
+    DisplayType: bool = False
+    OnDemand: bool = False
+    ClerksCopy: bool = False

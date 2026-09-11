@@ -9,7 +9,9 @@ Run with:
 """
 
 import unittest
+from datetime import date, datetime
 
+from va_lis_client.client import _date_param
 from va_lis_client.exceptions import (
     BillNotFoundError,
     CommitteeNotFoundError,
@@ -20,8 +22,11 @@ from va_lis_client.exceptions import (
 )
 from va_lis_client.models import (
     CHIEF_PATRON,
+    CalendarDetail,
     Committee,
     CommitteeMember,
+    DocketDetail,
+    DocketListItem,
     Legislation,
     LegislationEvent,
     LegislationEventType,
@@ -33,6 +38,7 @@ from va_lis_client.models import (
     MemberLegislation,
     MemberVoteResult,
     Patron,
+    Schedule,
     Session,
     Vote,
 )
@@ -240,6 +246,37 @@ def seat(committee_id=8, member_id=1, title="Member", role_id=6):
     )
 
 
+def docket_row(docket_id=21123, committee_id=202, when="2026-03-09T16:30:00"):
+    return DocketListItem(
+        DocketID=docket_id,
+        CommitteeID=committee_id,
+        DocketDate=when,
+        ChamberCode="S",
+        CommitteeName="Courts of Justice",
+    )
+
+
+def docket_detail(docket_id=21123, bills=("HB128", "HB148"), extras=0, room="Senate Room A"):
+    items = [
+        {
+            "DocketItemID": i,
+            "LegislationID": 98000 + i,
+            "LegislationNumber": number,
+            "LegislationDescription": f"{number}; a description.",
+        }
+        for i, number in enumerate(bills, start=1)
+    ]
+    items += [{"DocketItemID": 900 + i, "Description": "Comments"} for i in range(extras)]
+    return DocketDetail(
+        DocketID=docket_id,
+        DocketDate="2026-03-09T16:30:00",
+        CommitteeID=202,
+        CommitteeName="Courts of Justice",
+        DocketCategories=[{"CategoryCode": "CSGEN", "DocketItems": items}],
+        Schedules=[{"ScheduleID": 1, "ScheduleTime": "8:00 AM", "RoomDescription": room}],
+    )
+
+
 def service_with_types():
     return LISService(FakeClient())
 
@@ -262,6 +299,8 @@ class FakeClient:
         bill_patrons=None,
         committees=None,
         committee_members=None,
+        dockets=None,
+        docket_details=None,
     ):
         self.events = events if events is not None else []
         self.votes = votes if votes is not None else {}
@@ -285,6 +324,9 @@ class FakeClient:
         )
         # Keyed by CommitteeID.
         self.committee_members = committee_members if committee_members is not None else {}
+        # Keyed by CommitteeID, then by DocketID.
+        self.dockets = dockets if dockets is not None else {}
+        self.docket_details = docket_details if docket_details is not None else {}
         self.bills = bills if bills is not None else [bill_row()]
         self.detail = detail if detail is not None else bill_detail()
         self.texts = (
@@ -412,6 +454,14 @@ class FakeClient:
     def get_committee_members(self, committee_id, session_code):
         self._count("get_committee_members")
         return list(self.committee_members.get(committee_id, []))
+
+    def get_dockets(self, committee_id, session_code, chamber_code="S"):
+        self._count("get_dockets")
+        return list(self.dockets.get(committee_id, []))
+
+    def get_docket(self, docket_id):
+        self._count("get_docket")
+        return self.docket_details.get(docket_id)
 
     def get_legislation_statuses(self):
         self._count("get_legislation_statuses")
@@ -1612,3 +1662,103 @@ class CommitteeShapesTest(unittest.TestCase):
 
         self.assertEqual(sub.name, "HAPP Sub: Commerce Agriculture & Natural Resources")
         self.assertTrue(sub.is_subcommittee)
+
+
+class DocketEntriesTest(unittest.TestCase):
+    """The Senate half of "when is a bill heard"."""
+
+    def client(self):
+        return FakeClient(
+            dockets={202: [docket_row(21123), docket_row(21117)]},
+            docket_details={
+                21123: docket_detail(21123, ("HB128", "HB148"), extras=1),
+                21117: docket_detail(21117, ("SB5",)),
+            },
+        )
+
+    def test_flattens_every_bill_on_every_docket(self):
+        entries = LISService(self.client()).docket_entries(202, 20261)
+
+        self.assertEqual(
+            [(e.docket.DocketID, e.bill_number) for e in entries],
+            [(21123, "HB128"), (21123, "HB148"), (21117, "SB5")],
+        )
+        self.assertEqual(entries[0].room, "Senate Room A")
+        self.assertEqual(entries[0].date.isoformat(), "2026-03-09T16:30:00")
+
+    def test_resolves_a_name_or_number_in_the_senate(self):
+        service = LISService(self.client())
+
+        self.assertEqual(len(service.docket_entries("Courts of Justice", 20261)), 3)
+        self.assertEqual(len(service.docket_entries("s13", 20261)), 3)
+
+    def test_caches_each_docket_detail(self):
+        client = self.client()
+        service = LISService(client)
+
+        service.docket_entries(202, 20261)
+        service.docket_entries(202, 20261)
+
+        self.assertEqual(client.calls["get_docket"], 2)
+        self.assertEqual(client.calls["get_dockets"], 2)
+
+    def test_a_house_committee_has_no_dockets(self):
+        self.assertEqual(LISService(self.client()).docket_entries(8, 20261), [])
+
+    def test_a_docket_that_answers_nothing_is_skipped(self):
+        client = self.client()
+        del client.docket_details[21117]
+
+        entries = LISService(client).docket_entries(202, 20261)
+
+        self.assertEqual([e.bill_number for e in entries], ["HB128", "HB148"])
+
+
+class MeetingShapesTest(unittest.TestCase):
+    def test_docket_detail_flattens_bills_and_exposes_the_schedule(self):
+        detail = docket_detail(bills=("HB128",), extras=2)
+
+        self.assertEqual(len(detail.items), 3)
+        self.assertEqual([i.LegislationNumber for i in detail.bills], ["HB128"])
+        self.assertEqual(detail.schedule.ScheduleTime, "8:00 AM")
+        self.assertIsNone(DocketDetail(DocketID=1).schedule)
+
+    def test_calendar_detail_flattens_agendas_that_name_a_bill(self):
+        detail = CalendarDetail(
+            CalendarID=1,
+            CalendarCategories=[
+                {"CategoryCode": "Order", "Agendas": [{"AgendaID": 1, "Description": "Call"}]},
+                {
+                    "CategoryCode": "RCRES",
+                    "Agendas": [
+                        {"AgendaID": 2, "LegislationNumber": "SJ209"},
+                        {"AgendaID": 3, "LegislationNumber": "HJ265"},
+                    ],
+                },
+            ],
+        )
+
+        self.assertEqual(len(detail.agendas), 3)
+        self.assertEqual([a.LegislationNumber for a in detail.bills], ["SJ209", "HJ265"])
+
+    def test_a_meeting_attachment_is_not_a_text_file(self):
+        """Agenda PDFs on a schedule carry a FileID and no text IDs."""
+        meeting = Schedule(
+            ScheduleID=3626,
+            ScheduleFiles=[
+                {
+                    "FileID": 1005518,
+                    "FileURL": "https://lis.blob.core.windows.net/files/1005518.PDF",
+                    "IsGenerated": True,
+                    "Success": False,
+                    "FailureMessage": None,
+                }
+            ],
+        )
+
+        self.assertEqual(meeting.ScheduleFiles[0].FileID, 1005518)
+
+    def test_date_params_are_iso_dates(self):
+        self.assertEqual(_date_param(date(2026, 2, 2)), "2026-02-02")
+        self.assertEqual(_date_param(datetime(2026, 2, 2, 9, 30)), "2026-02-02")
+        self.assertEqual(_date_param("2026-02-02"), "2026-02-02")

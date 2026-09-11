@@ -14,9 +14,10 @@ Modules:
                    LegislationSummary
     committee    — CommitteeFile, Committee, CommitteeMember, CommitteeRole,
                    CommitteeAction
-    schedule     — Schedule, ScheduleType, MeetingRoom
+    schedule     — Schedule, ScheduleFile, ScheduleType, MeetingRoom
     calendar     — CalendarFile, CalendarComment, CalendarItem,
-                   AgendaItem, Agenda, CalendarCategory, Staff, CalendarDetail
+                   AgendaItem, Agenda, CalendarCategory, Staff, CalendarDetail,
+                   CalendarType, CalendarCategoryType
     vote         — VoteMember, VoteLegislation, VoteStatement, VoteFile,
                    VoteType, Vote
     docket       — DocketItem, DocketCategory, DocketListItem, CalendarDisplay,
@@ -32,10 +33,12 @@ from va_lis_client.models.calendar import (
     Agenda,
     AgendaItem,
     CalendarCategory,
+    CalendarCategoryType,
     CalendarComment,
     CalendarDetail,
     CalendarFile,
     CalendarItem,
+    CalendarType,
     Staff,
 )
 from va_lis_client.models.committee import (
@@ -80,7 +83,7 @@ from va_lis_client.models.pagination import (
     Pagination,
     page_request_header,
 )
-from va_lis_client.models.schedule import MeetingRoom, Schedule, ScheduleType
+from va_lis_client.models.schedule import MeetingRoom, Schedule, ScheduleFile, ScheduleType
 from va_lis_client.models.session import Session, SessionEvent
 from va_lis_client.models.text import (
     LegislationSummary,
@@ -131,15 +134,18 @@ __all__ = [
     # schedule
     "MeetingRoom",
     "Schedule",
+    "ScheduleFile",
     "ScheduleType",
     # calendar
     "Agenda",
     "AgendaItem",
     "CalendarCategory",
+    "CalendarCategoryType",
     "CalendarComment",
     "CalendarDetail",
     "CalendarFile",
     "CalendarItem",
+    "CalendarType",
     "Staff",
     # vote
     "Vote",

@@ -126,7 +126,14 @@ class DocketDetail(LISModel):
     members, staff, and linked schedules (when/where).
 
     The ``Schedules`` array links back to the Schedule service for the
-    actual meeting time and room.  Chain: Docket -> Schedule -> Room.
+    actual meeting time and room.  Chain: Docket -> Schedule -> Room.  The
+    two can disagree on the hour: docket 21123 carries ``DocketDate``
+    ``2026-03-09T16:30:00`` while its schedule reads ``ScheduleTime``
+    ``"8:00 AM"`` for the same day (observed 2026-09-11).
+
+    **The envelope reports ``Success: false`` with a null
+    ``FailureMessage``** on a complete, valid response.  The client ignores
+    the flag, as it does everywhere.
 
     Key: ``DocketID``.
 
@@ -166,3 +173,18 @@ class DocketDetail(LISModel):
     DocketCategories: list[DocketCategory] = []
     DocketFiles: list[CalendarFile] = []
     Schedules: list[Schedule] = []
+
+    @property
+    def items(self) -> list[DocketItem]:
+        """Every docket item across the categories, in docket order."""
+        return [i for c in self.DocketCategories for i in c.DocketItems]
+
+    @property
+    def bills(self) -> list[DocketItem]:
+        """The docket items that name a bill, in docket order."""
+        return [i for i in self.items if i.LegislationNumber]
+
+    @property
+    def schedule(self) -> Schedule | None:
+        """The first linked schedule, for the room and the clerk's time."""
+        return self.Schedules[0] if self.Schedules else None
