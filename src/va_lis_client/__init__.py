@@ -4,6 +4,7 @@ from va_lis_client.exceptions import (
     InvalidBillNumberError,
     LISClientError,
     LISError,
+    SessionNotFoundError,
     TextVersionNotFoundError,
 )
 from va_lis_client.service import (
@@ -30,6 +31,7 @@ __all__ = [
     "LISService",
     "MemberVote",
     "RollCallEntry",
+    "SessionNotFoundError",
     "TextVersionNotFoundError",
     "normalize_bill_number",
     "pick_text_version",

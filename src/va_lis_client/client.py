@@ -74,11 +74,14 @@ from va_lis_client.models import (
     LegislationTextItem,
     LegislationVersion,
     Member,
+    MemberLegislation,
     MemberVoteResult,
     PagedList,
     Pagination,
     Partner,
     Party,
+    Patron,
+    PatronRole,
     Session,
     Vote,
     VoteType,
@@ -900,3 +903,100 @@ class LISClient:
         if data is None:
             return []
         return [District.model_validate(d) for d in data.get("Districts", [])]
+
+    # ------------------------------------------------------------------
+    # Bills by member (the member-first bill axis)
+    # ------------------------------------------------------------------
+
+    def get_member_legislation(
+        self,
+        member_id: int,
+        session_id: int,
+        patron_type_id: int | None = None,
+    ) -> list[MemberLegislation]:
+        """Every bill a member patrons in a session, in any role.
+
+        The bill-first list (:meth:`get_session_bills`) names only the chief
+        patron, so this is the only route to a member's co-patronage without
+        one detail call per bill.
+
+        **Pass ``session_id``, never a session code.**  The endpoint accepts
+        ``sessionCode`` too, but it caches each answer under a key naming the
+        member and the ``sessionID`` only.  A ``sessionCode`` call is honored
+        on a cache miss and then stored under the member alone, so every
+        later ``sessionCode`` call for that member, from any partner, gets
+        the first session's answer back.  Verified 2026-09-11: member 186
+        queried with ``sessionCode=20251`` and then ``20271`` got the same 225
+        rows of session 57 both times, while ``sessionID=61`` got 25 rows of
+        session 61.  :meth:`LISService.session_id` resolves a code.
+
+        **Never call this without a member.**  With no parameters the server
+        sets out to return every bill for every member, and the request hangs
+        past 60 seconds.  An unknown ``member_id`` answers 204.
+
+        **One row per summary version.**  A bill with three published
+        summaries appears three times; see :class:`MemberLegislation`.  The
+        rows carry the summary HTML, so the response is heavy: 334 KB for
+        member 544's 236 rows.  Prefer :meth:`LISService.member_bills`, which
+        caches and collapses.
+
+        Args:
+            member_id: ``MemberID`` from the roster.
+            session_id: ``Session.SessionID``, e.g. ``59`` for 20261.
+            patron_type_id: Restrict to one role: ``1`` chief patron, ``2``
+                chief co-patron, ``4`` co-patron (see ``PATRON_ROLES``).
+                Omit for every role.
+
+        Envelope key: ``Legislations``.
+        """
+        params: dict[str, int] = {"memberID": member_id, "sessionID": session_id}
+        if patron_type_id is not None:
+            params["patronTypeID"] = patron_type_id
+
+        data = self._get("/LegislationByMember/api/getmemberlegislationlistasync", params=params)
+        if data is None:
+            return []
+        return [MemberLegislation.model_validate(r) for r in data.get("Legislations", [])]
+
+    # ------------------------------------------------------------------
+    # Patrons
+    # ------------------------------------------------------------------
+
+    def get_bill_patrons(self, legislation_id: int) -> list[Patron]:
+        """Every patron of a bill, in every role, in display order.
+
+        The same list :meth:`get_bill` carries, without the rest of the
+        detail record: 12 rows for HB1408 in 20261, one chief patron and
+        eleven co-patrons.  Names arrive padded (``" Charlie Schmidt"``);
+        the model strips them.
+
+        The sibling ``getlegislationpatronlistasync`` is not wired.  It serves
+        chief patron relationships only (any other ``patronType`` answers
+        204), and unfiltered it returns every chief patron in a chamber with
+        their bills, 1.3 MB for the 2026 House.
+
+        Args:
+            legislation_id: Surrogate PK, e.g. ``100874`` for HB1408 in 20261.
+
+        Envelope key: ``Patrons``.
+        """
+        data = self._get(f"/LegislationPatron/api/getlegislationpatronsbyidasync/{legislation_id}")
+        if data is None:
+            return []
+        return [Patron.model_validate(p) for p in data.get("Patrons", [])]
+
+    def get_patron_roles(self) -> list[PatronRole]:
+        """Reference list of 5 patron roles.
+
+        ``PATRON_ROLES`` in :mod:`va_lis_client.models` holds the same
+        vocabulary as a constant, plus the ``0`` that
+        ``getmemberpatrontypelistasync`` returns for budget amendment
+        requests.  That endpoint (the roles one member holds in a session) is
+        not wired.
+
+        Envelope key: ``PatronRolesList``.
+        """
+        data = self._get("/LegislationPatron/api/getpatronroletypelistasync")
+        if data is None:
+            return []
+        return [PatronRole.model_validate(r) for r in data.get("PatronRolesList", [])]

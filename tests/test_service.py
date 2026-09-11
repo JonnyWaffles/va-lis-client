@@ -14,9 +14,11 @@ from va_lis_client.exceptions import (
     BillNotFoundError,
     InvalidBillNumberError,
     LISError,
+    SessionNotFoundError,
     TextVersionNotFoundError,
 )
 from va_lis_client.models import (
+    CHIEF_PATRON,
     Legislation,
     LegislationEvent,
     LegislationEventType,
@@ -25,7 +27,10 @@ from va_lis_client.models import (
     LegislationTextDetail,
     LegislationTextItem,
     Member,
+    MemberLegislation,
     MemberVoteResult,
+    Patron,
+    Session,
     Vote,
 )
 from va_lis_client.service import (
@@ -179,6 +184,39 @@ def vote_result(
     )
 
 
+def session(session_id=59, code="20261", year=2026):
+    return Session(
+        SessionID=session_id,
+        SessionCode=code,
+        DisplayName="Regular Session",
+        SessionYear=year,
+        SessionTypeID=1,
+        SessionType="Regular",
+        IsDefault=False,
+        IsActive=True,
+    )
+
+
+def member_bill(
+    legislation_id=98641,
+    number="HB18",
+    version="SUMMARY AS INTRODUCED",
+    status="In Committee",
+    session_id=59,
+):
+    return MemberLegislation(
+        LegislationID=legislation_id,
+        LegislationNumber=number,
+        Description=f"{number}; a description.",
+        ChamberCode="H",
+        LegislationTypeCode="B",
+        LegislationStatus=status,
+        SessionID=session_id,
+        SummaryVersion=version,
+        LegislationSummary=f"<p>{version}</p>",
+    )
+
+
 def service_with_types():
     return LISService(FakeClient())
 
@@ -196,11 +234,20 @@ class FakeClient:
         votes=None,
         members=None,
         member_votes=None,
+        sessions=None,
+        member_legislation=None,
+        bill_patrons=None,
     ):
         self.events = events if events is not None else []
         self.votes = votes if votes is not None else {}
         self.members = members if members is not None else [member(1), member(2), member(3)]
         self.member_votes = member_votes if member_votes is not None else []
+        self.sessions = (
+            sessions if sessions is not None else [session(59, "20261"), session(61, "20271")]
+        )
+        # Keyed by patron type: None holds the unfiltered rows.
+        self.member_legislation = member_legislation if member_legislation is not None else {}
+        self.bill_patrons = bill_patrons if bill_patrons is not None else []
         self.bills = bills if bills is not None else [bill_row()]
         self.detail = detail if detail is not None else bill_detail()
         self.texts = (
@@ -292,6 +339,20 @@ class FakeClient:
     def get_member_votes(self, member_id, session_code):
         self._count("get_member_votes")
         return list(self.member_votes)
+
+    def get_sessions(self, year=""):
+        self._count("get_sessions")
+        return list(self.sessions)
+
+    def get_member_legislation(self, member_id, session_id, patron_type_id=None):
+        self._count("get_member_legislation")
+        self.last_member_legislation_call = (member_id, session_id, patron_type_id)
+        return list(self.member_legislation.get(patron_type_id, []))
+
+    def get_bill_patrons(self, legislation_id):
+        self._count("get_bill_patrons")
+        self.last_patron_legislation_id = legislation_id
+        return list(self.bill_patrons)
 
     def get_legislation_statuses(self):
         self._count("get_legislation_statuses")
@@ -1163,3 +1224,194 @@ class MemberVoteTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SessionIdTest(unittest.TestCase):
+    def test_resolves_a_code_to_its_id(self):
+        service = LISService(FakeClient())
+
+        self.assertEqual(service.session_id(20261), 59)
+        self.assertEqual(service.session_id("20271"), 61)
+
+    def test_the_reference_is_fetched_once(self):
+        client = FakeClient()
+        service = LISService(client)
+
+        service.session_id(20261)
+        service.session_id(20271)
+
+        self.assertEqual(client.calls["get_sessions"], 1)
+
+    def test_an_unknown_code_refetches_once_then_raises(self):
+        client = FakeClient()
+        service = LISService(client)
+        service.session_id(20261)
+
+        with self.assertRaises(SessionNotFoundError):
+            service.session_id(19931)
+
+        self.assertEqual(client.calls["get_sessions"], 2)
+
+    def test_the_error_is_a_lookup_error(self):
+        with self.assertRaises(LookupError):
+            LISService(FakeClient()).session_id(19931)
+
+
+class MemberBillsTest(unittest.TestCase):
+    """The member-first bill axis: one row per summary version, collapsed."""
+
+    def rows(self):
+        return {
+            None: [
+                member_bill(98641, "HB18", "SUMMARY AS INTRODUCED", "Acts of Assembly Chapter"),
+                member_bill(98923, "HB64"),
+                member_bill(98641, "HB18", "SUMMARY AS PASSED CHAMBER", "Acts of Assembly Chapter"),
+                member_bill(98641, "HB18", "SUMMARY AS PASSED", "Acts of Assembly Chapter"),
+            ],
+            CHIEF_PATRON: [member_bill(100874, "HB1408")],
+        }
+
+    def test_collapses_summary_versions_to_the_newest(self):
+        service = LISService(FakeClient(member_legislation=self.rows()))
+
+        bills = service.member_bills(544, 20261)
+
+        self.assertEqual([b.LegislationNumber for b in bills], ["HB18", "HB64"])
+        self.assertEqual(bills[0].SummaryVersion, "SUMMARY AS PASSED")
+
+    def test_sends_the_session_id_not_the_code(self):
+        """The endpoint mis-caches session codes, so only the ID is safe."""
+        client = FakeClient(member_legislation=self.rows())
+
+        LISService(client).member_bills(544, 20261)
+
+        self.assertEqual(client.last_member_legislation_call, (544, 59, None))
+
+    def test_the_role_reaches_the_endpoint(self):
+        client = FakeClient(member_legislation=self.rows())
+
+        bills = LISService(client).member_bills(544, 20261, role=CHIEF_PATRON)
+
+        self.assertEqual([b.LegislationNumber for b in bills], ["HB1408"])
+        self.assertEqual(client.last_member_legislation_call, (544, 59, CHIEF_PATRON))
+
+    def test_caches_per_member_session_and_role(self):
+        client = FakeClient(member_legislation=self.rows())
+        service = LISService(client)
+
+        service.member_bills(544, 20261)
+        service.member_bills(544, 20261)
+        self.assertEqual(client.calls["get_member_legislation"], 1)
+
+        service.member_bills(544, 20261, role=CHIEF_PATRON)
+        self.assertEqual(client.calls["get_member_legislation"], 2)
+
+        service.member_bills(544, 20261, refresh=True)
+        self.assertEqual(client.calls["get_member_legislation"], 3)
+
+    def test_an_unknown_session_raises_before_any_fetch(self):
+        client = FakeClient(member_legislation=self.rows())
+
+        with self.assertRaises(SessionNotFoundError):
+            LISService(client).member_bills(544, 19931)
+
+        self.assertNotIn("get_member_legislation", client.calls)
+
+
+class FindMembersTest(unittest.TestCase):
+    def roster(self):
+        return [
+            member(1, "H0001", "Ada Lovelace"),
+            member(2, "H0002", "Grace Hopper"),
+            Member(
+                MemberID=544,
+                MemberNumber="H0402",
+                MemberDisplayName="Charlie Schmidt",
+                ListDisplayName="Schmidt, Charlie",
+                PatronDisplayName="Schmidt",
+            ),
+        ]
+
+    def test_matches_any_name_form_ignoring_case(self):
+        service = LISService(FakeClient(members=self.roster()))
+
+        for query in ("SCHMIDT", "  charlie   schmidt ", "Schmidt, C"):
+            with self.subTest(query=query):
+                self.assertEqual([m.MemberID for m in service.find_members(query, 20261)], [544])
+
+    def test_orders_by_list_name(self):
+        service = LISService(FakeClient(members=self.roster()))
+
+        names = [m.name for m in service.find_members("a", 20261)]
+
+        self.assertEqual(names, ["Ada Lovelace", "Grace Hopper", "Charlie Schmidt"])
+
+    def test_a_blank_query_finds_nobody_and_fetches_nothing(self):
+        client = FakeClient(members=self.roster())
+
+        self.assertEqual(LISService(client).find_members("   ", 20261), [])
+        self.assertNotIn("get_members", client.calls)
+
+
+class BillPatronsTest(unittest.TestCase):
+    def test_resolves_the_number_then_asks_by_id(self):
+        client = FakeClient(
+            bill_patrons=[
+                Patron(MemberID=544, PatronTypeID=1, Name="Chief Patron"),
+                Patron(MemberID=486, PatronTypeID=4, Name="Co-Patron"),
+            ]
+        )
+
+        patrons = LISService(client).bill_patrons("hb0001", 20261)
+
+        self.assertEqual(client.last_patron_legislation_id, 98525)
+        self.assertEqual([p.role for p in patrons], ["Chief Patron", "Co-Patron"])
+
+
+class PatronShapesTest(unittest.TestCase):
+    """The member-first list nests a patron with four fields missing."""
+
+    THIN = {
+        "MemberID": 81,
+        "PatronTypeID": 1,
+        "DisplayName": "(Chief Patron)",
+        "PatronDisplayName": "Cole, J.G.",
+        "LegislationNumber": None,
+        "Sequence": 0,
+        "IsIntroducing": None,
+        "ByRequest": None,
+    }
+
+    def test_the_thin_shape_validates_and_names_its_role(self):
+        thin = Patron.model_validate(self.THIN)
+
+        self.assertIsNone(thin.Name)
+        self.assertEqual(thin.role, "Chief Patron")
+
+    def test_role_prefers_the_name_lis_sent(self):
+        self.assertEqual(Patron(MemberID=544, PatronTypeID=4, Name="Co-Patron").role, "Co-Patron")
+
+    def test_role_names_an_unknown_type_by_number(self):
+        self.assertEqual(Patron(MemberID=1, PatronTypeID=9).role, "PatronTypeID 9")
+
+    def test_member_legislation_carries_the_summary_and_the_thin_patron(self):
+        row = MemberLegislation.model_validate(
+            {
+                "LegislationID": 98923,
+                "LegislationNumber": "HB64",
+                "Description": "A description.",
+                "ChamberCode": "H",
+                "LegislationTypeCode": "B",
+                "LegislationSummary": "<p>Text</p>",
+                "SummaryVersion": "SUMMARY AS PASSED",
+                "SessionName": "Regular Session",
+                "SessionID": 59,
+                "LegislationTextID": 0,
+                "SearchText": [],
+                "Patrons": [self.THIN],
+            }
+        )
+
+        self.assertEqual(row.SummaryVersion, "SUMMARY AS PASSED")
+        self.assertEqual(row.SessionID, 59)
+        self.assertEqual(row.Patrons[0].role, "Chief Patron")

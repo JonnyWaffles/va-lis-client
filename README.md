@@ -60,6 +60,7 @@ vocabularies, caching the large lists, and flattening bill text HTML.
 
 ```python
 from va_lis_client import LISClient, LISService, strip_html
+from va_lis_client.models import CHIEF_PATRON
 
 service = LISService(LISClient())   # or LISService() to build the client for you
 
@@ -83,6 +84,13 @@ for row in service.roll_call("HB1", 20261):
 for v in service.member_votes(503, 20261):
     print(v.bill_number, v.response, "BLOCK" if v.is_block else "")
 votes = service.member_votes_on(503, "hb0001", 20261)
+
+# Members by name, and the bills a member patrons, co-patronage included.
+schmidt = service.find_members("schmidt", 20261)[0]            # MemberID 544
+for b in service.member_bills(schmidt.MemberID, 20261):
+    print(b.LegislationNumber, b.LegislationStatus, b.SummaryVersion)
+chief = service.member_bills(schmidt.MemberID, 20261, role=CHIEF_PATRON)
+patrons = service.bill_patrons("HB1408", 20261)                # every role
 
 # Every vote including the ones no member can be credited with.
 for record in service.bill_votes("HB1", 20261):
@@ -131,10 +139,11 @@ itself, for its status, description, or chief patron.
 for id resolution. It runs to roughly 3 MB, so `LISService` caches it for 15
 minutes (tune with `bill_list_ttl=`). The member roster changes only when a
 member resigns or arrives, so it is cached for an hour (`roster_ttl=`), and a
-member's 1.9 MB vote history rides the same TTL, keyed per member. The
-static reference vocabularies are kept for the life of the instance. Caches
-live on the instance, so build one service and keep it. Instances are safe to
-share between threads.
+member's 1.9 MB vote history rides the same TTL, keyed per member. A member's
+bill list rides it too, keyed per member, session, and role. The static
+reference vocabularies, the session reference included, are kept for the life
+of the instance. Caches live on the instance, so build one service and keep
+it. Instances are safe to share between threads.
 
 **Errors.** Everything derives from `LISError`, so one `except` clause covers
 the package. The resolution errors also derive from the builtin that fits them.
@@ -145,6 +154,7 @@ the package. The resolution errors also derive from the builtin that fits them.
 | `InvalidBillNumberError` | `ValueError` | A string does not parse as a bill number |
 | `BillNotFoundError` | `LookupError` | A bill number is not in the session |
 | `TextVersionNotFoundError` | `LookupError` | No text version matches, or the version has no body |
+| `SessionNotFoundError` | `LookupError` | A session code is not in the session reference |
 
 ## Authentication
 
@@ -434,6 +444,22 @@ the only route to per-member votes. See [Votes](#votes-per-member-roll-calls).
 The member-first axis, where `/Vote` is bill-first. See
 [The member-first axis](#the-member-first-axis).
 
+#### LegislationByMember (`/LegislationByMember/api/`)
+- `get_member_legislation(member_id, session_id, patron_type_id=None)` → every bill a member patrons, in any role
+
+**Takes a `session_id`, not a session code**, because the endpoint caches
+session codes wrongly. See [Bills by member](#bills-by-member).
+
+#### LegislationPatron (`/LegislationPatron/api/`)
+- `get_bill_patrons(legislation_id)` → every patron of a bill, in every role
+- `get_patron_roles()` → 5 roles (1 Chief Patron, 2 Chief Co-Patron, 3 Incorporated Chief Co-Patron, 4 Co-Patron, 5 Offered)
+
+Not wired: `getlegislationpatronlistasync` serves chief patron relationships
+only (any other `patronType` answers 204) and unfiltered returns every chief
+patron in a chamber with their bills, 1.3 MB for the 2026 House;
+`getmemberpatrontypelistasync` lists the roles one member holds, including a
+`PatronTypeID` of `0` for budget amendment requests.
+
 ### Modeled but not yet wired to client methods
 
 #### Schedule (`/Schedule/api/`)
@@ -502,11 +528,9 @@ These services exist in the portal but haven't been investigated:
 - AdvancedLegislationSearch
 - CommunicationFileGeneration
 - Contact
-- LegislationByMember
 - LegislationCollections
 - LegislationCommunications
 - LegislationFileGeneration
-- LegislationPatron
 - LegislationSubject
 - MemberVoteSearch (only `getmembervotelistasync` is wired)
 - MembersByCommittee
@@ -632,6 +656,62 @@ so this client does not wire it.
 
 **A district labels itself `Title`; a member calls the same value
 `DistrictName`.** Both read `"71st"`.
+
+## Bills by member
+
+`/LegislationByMember` answers "what does this member patron", in every role.
+The bill-first list names only the chief patron, so this is the only route to
+co-patronage short of one detail call per bill. `find_members` turns a name
+into a `MemberID` first; it searches the cached roster, so it costs nothing
+after the first call for a session.
+
+```python
+schmidt = service.find_members("schmidt", 20261)[0]
+for b in service.member_bills(schmidt.MemberID, 20261):
+    print(b.LegislationNumber, b.LegislationStatus, b.SummaryVersion)
+chief = service.member_bills(schmidt.MemberID, 20261, role=CHIEF_PATRON)
+```
+
+Delegate Schmidt's 2026 list: 229 bills, 11 of them as chief patron.
+
+### Send `sessionID`, never `sessionCode`
+
+The endpoint accepts both, and `sessionCode` is a trap. Every response
+carries a `CacheKeyName`, and it reveals the server's cache key:
+
+| Call | Cache key |
+|---|---|
+| `memberID=544&sessionCode=20261` | `{MEMBERID=544}` |
+| `memberID=544&sessionID=59` | `{MEMBERID=544}{SESSIONID=59}` |
+
+A `sessionCode` call is honored on a cache miss, and the answer is then
+stored under the member alone. Every later `sessionCode` call for that
+member, from any partner, gets the first session's rows back. Member 186
+queried with `sessionCode=20251` and then `20271` returned the same 225 rows
+of session 57 both times, while `sessionID=61` returned 25 rows of session 61
+(verified 2026-09-11). `LISClient.get_member_legislation` therefore takes a
+`session_id`, and `LISService.session_id(session_code)` resolves the code
+from the session reference. Do not omit the session either: with no
+parameters at all the server tries to list every bill for every member, and
+the request hangs past 60 seconds.
+
+### One row per summary version
+
+A bill appears once per published summary. HB18 came back three times, as
+introduced, as passed chamber, and as passed, so 236 rows described 229
+bills. `member_bills` keeps the last row per `LegislationID`, which carries
+the newest summary, and preserves the order of first appearance.
+`LISClient.get_member_legislation` returns the rows as sent.
+
+### The nested patron is not the patron list
+
+`Patrons` on these rows is empty on 177 of 236 and holds one entry on the
+rest: the chief patron, in a thin shape with no `LegislationID`,
+`ChamberCode`, `MemberNumber`, or `Name`, and a `PatronDisplayName` of
+`"Cole, J.G."` rather than `"Cole"`. The member being listed never appears in
+it. Those four fields are therefore optional on `Patron`, and `Patron.role`
+names the role on every shape. For the real list call
+`bill_patrons("HB1408", 20261)`, which returns 12 rows for that bill.
 
 ## The member-first axis
 

@@ -4,17 +4,40 @@ from datetime import datetime
 
 from va_lis_client.models.common import LISModel
 
+# The patron role vocabulary from ``/LegislationPatron/api/getpatronroletypelistasync``
+# (five rows), plus the ``0`` that ``getmemberpatrontypelistasync`` returns for a
+# member's budget amendment requests.  ``Patron.role`` reads this when a row
+# arrives without its ``Name``.
+PATRON_ROLES: dict[int, str] = {
+    0: "Budget Amendment Requests",
+    1: "Chief Patron",
+    2: "Chief Co-Patron",
+    3: "Incorporated Chief Co-Patron",
+    4: "Co-Patron",
+    5: "Offered",
+}
+CHIEF_PATRON = 1
+CHIEF_CO_PATRON = 2
+CO_PATRON = 4
+
 
 class Patron(LISModel):
     """A bill patron (sponsor/co-sponsor).
 
-    ``PatronTypeID`` determines the role:
+    ``PatronTypeID`` determines the role; see :data:`PATRON_ROLES`:
     - 1 = Chief Patron (primary sponsor)
     - 2 = Chief Co-Patron
     - 4 = Co-Patron
 
     ``MemberNumber`` is the LIS member code: ``"H0173"`` (House member 173),
     ``"S0121"`` (Senate member 121).
+
+    **Two shapes arrive.**  Bill detail, ``/LegislationPatron``, calendars,
+    and dockets send every field.  The member-first bill list
+    (``/LegislationByMember``) nests a thinner patron with no
+    ``LegislationID``, ``ChamberCode``, ``MemberNumber``, or ``Name``, and its
+    ``PatronDisplayName`` reads ``"Cole, J.G."`` rather than ``"Cole"``.  Read
+    :attr:`role` for the role name; it works on both.
 
     Example::
 
@@ -24,12 +47,12 @@ class Patron(LISModel):
          "PatronDisplayName": "Ward"}
     """
 
-    LegislationID: int
-    ChamberCode: str  # "H" = House, "S" = Senate
+    LegislationID: int | None = None  # absent on the member-first list
+    ChamberCode: str | None = None  # "H" = House, "S" = Senate; absent on the member-first list
     MemberID: int  # surrogate PK for the member
-    MemberNumber: str  # e.g. "H0173", "S0121"
+    MemberNumber: str | None = None  # e.g. "H0173", "S0121"; absent on the member-first list
     PatronTypeID: int  # 1=Chief Patron, 2=Chief Co-Patron, 4=Co-Patron
-    Name: str  # role name, e.g. "Chief Patron", "Co-Patron"
+    Name: str | None = None  # role name, e.g. "Chief Patron"; absent on the member-first list
     DisplayName: str | None = None  # e.g. "(Chief Patron)"
     MemberDisplayName: str | None = None  # full name, e.g. "Jeion A. Ward"
     PatronDisplayName: str | None = None  # last name, e.g. "Ward"
@@ -38,6 +61,31 @@ class Patron(LISModel):
     IsIntroducing: bool | None = None
     ByRequest: bool | None = None  # True if introduced "by request"
     LegislationTextID: int | None = None
+
+    @property
+    def role(self) -> str:
+        """The role name, e.g. ``"Chief Patron"``, on every patron shape.
+
+        ``Name`` when LIS sent it, otherwise the vocabulary entry for
+        ``PatronTypeID``.
+        """
+        return self.Name or PATRON_ROLES.get(self.PatronTypeID, f"PatronTypeID {self.PatronTypeID}")
+
+
+class PatronRole(LISModel):
+    """A row of ``/LegislationPatron/api/getpatronroletypelistasync``.
+
+    Five rows: 1 Chief Patron, 2 Chief Co-Patron, 3 Incorporated Chief
+    Co-Patron, 4 Co-Patron, 5 Offered.  ``DisplayName`` is null on Co-Patron.
+
+    Example::
+
+        {"PatronTypeID": 1, "Name": "Chief Patron", "DisplayName": "(Chief Patron)"}
+    """
+
+    PatronTypeID: int
+    Name: str
+    DisplayName: str | None = None
 
 
 class LegislationSession(LISModel):
@@ -156,6 +204,45 @@ class Legislation(LISModel):
     IsComplete: bool = False
     Patrons: list[Patron] = []
     Sessions: list[LegislationSession] = []
+
+
+class MemberLegislation(Legislation):
+    """A bill as ``/LegislationByMember/api/getmemberlegislationlistasync`` lists it.
+
+    The detail shape plus the summary text, for every bill a member patrons
+    in a session.  Returned by :meth:`LISClient.get_member_legislation`.
+
+    **One row per summary version, not one per bill.**  HB18 appears three
+    times in Delegate Schmidt's 2026 list, once each as introduced, as passed
+    chamber, and as passed, so his 236 rows describe 229 bills.
+    :meth:`LISService.member_bills` collapses them to the newest version.
+
+    **``Patrons`` is not the bill's patron list.**  It is empty on 177 of
+    those 236 rows and holds exactly one entry on the rest, the chief patron
+    in the thin shape; the member being listed never appears in it.  Call
+    :meth:`LISClient.get_bill_patrons` for the real list.
+
+    ``SessionID`` is set on every row; ``SessionCode``, ``IntroductionDate``,
+    ``FullNumber``, and ``LegislationStatusID`` are null, and
+    ``LegislationTextID`` is ``0``.  ``Sessions`` is always empty, so this
+    row cannot show carry-over lineage.
+
+    Example (fields beyond :class:`Legislation`)::
+
+        {"LegislationSummary": "<p class=\\"sumtext\\"><b>Employee Child Care...",
+         "SummaryVersion": "SUMMARY AS INTRODUCED",
+         "SessionName": "Regular Session", "SessionID": 59,
+         "LegislationTextID": 0, "VersionDate": null, "CandidateDate": null,
+         "SearchText": []}
+    """
+
+    LegislationSummary: str | None = None  # HTML, one summary version per row
+    SummaryVersion: str | None = None  # e.g. "SUMMARY AS INTRODUCED", "SUMMARY AS PASSED"
+    SessionName: str | None = None  # e.g. "Regular Session", "Special Session I"
+    LegislationTextID: int | None = None  # 0 on every observed row
+    VersionDate: datetime | None = None
+    CandidateDate: datetime | None = None
+    SearchText: list = []  # empty on every observed row
 
 
 class LegislationStatus(LISModel):

@@ -7,8 +7,9 @@ Built from live API responses — the OpenAPI specs are unreliable
 Modules:
     common       — Heartbeat, Partner
     session      — SessionEvent, Session
-    legislation  — Patron, LegislationSession, LegislationSummaryItem,
-                   Legislation, LegislationStatus, LegislationVersion
+    legislation  — Patron, PatronRole, LegislationSession, LegislationSummaryItem,
+                   Legislation, MemberLegislation, LegislationStatus,
+                   LegislationVersion, PATRON_ROLES
     text         — TextFile, LegislationTextItem, LegislationTextDetail,
                    LegislationSummary
     committee    — CommitteeFile, Committee, CommitteeMember, CommitteeAction
@@ -57,12 +58,18 @@ from va_lis_client.models.event import (
     LegislationEventType,
 )
 from va_lis_client.models.legislation import (
+    CHIEF_CO_PATRON,
+    CHIEF_PATRON,
+    CO_PATRON,
+    PATRON_ROLES,
     Legislation,
     LegislationSession,
     LegislationStatus,
     LegislationSummaryItem,
     LegislationVersion,
+    MemberLegislation,
     Patron,
+    PatronRole,
 )
 from va_lis_client.models.member import District, Member, Party
 from va_lis_client.models.member_vote import MemberVoteResult
@@ -96,12 +103,18 @@ __all__ = [
     "Session",
     "SessionEvent",
     # legislation
+    "CHIEF_CO_PATRON",
+    "CHIEF_PATRON",
+    "CO_PATRON",
+    "PATRON_ROLES",
     "Legislation",
     "LegislationSession",
     "LegislationStatus",
     "LegislationSummaryItem",
     "LegislationVersion",
+    "MemberLegislation",
     "Patron",
+    "PatronRole",
     # text
     "LegislationSummary",
     "LegislationTextDetail",

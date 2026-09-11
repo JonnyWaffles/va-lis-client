@@ -26,3 +26,7 @@ class BillNotFoundError(LISError, LookupError):
 
 class TextVersionNotFoundError(LISError, LookupError):
     """Raised when a bill has no text version matching the requested code."""
+
+
+class SessionNotFoundError(LISError, LookupError):
+    """Raised when a session code does not appear in the session reference list."""

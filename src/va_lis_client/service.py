@@ -51,6 +51,7 @@ from va_lis_client.client import LISClient
 from va_lis_client.exceptions import (
     BillNotFoundError,
     InvalidBillNumberError,
+    SessionNotFoundError,
     TextVersionNotFoundError,
 )
 from va_lis_client.models import (
@@ -62,7 +63,9 @@ from va_lis_client.models import (
     LegislationTextDetail,
     LegislationTextItem,
     Member,
+    MemberLegislation,
     MemberVoteResult,
+    Patron,
     Vote,
     VoteMember,
     VoteStatement,
@@ -267,16 +270,21 @@ class LISService:
         self._bill_lists: dict[int, tuple[float, list[LegislationSummaryItem]]] = {}
         self._rosters: dict[int, tuple[float, dict[int, Member]]] = {}
         self._member_votes: dict[tuple[int, int], tuple[float, list[MemberVoteResult]]] = {}
+        self._member_bills: dict[
+            tuple[int, int, int | None], tuple[float, list[MemberLegislation]]
+        ] = {}
+        self._session_ids: dict[int, int] | None = None
         self._event_types: dict[str, list[LegislationEventType]] | None = None
         self._statuses_by_name: dict[str, LegislationStatus] | None = None
         self._statuses_by_id: dict[int, LegislationStatus] | None = None
 
         # One lock per session code, so a cold fetch for one session does not
         # block a fetch for another.  ``_guard`` protects the lock table
-        # itself; ``_reference_lock`` covers both static vocabularies.
+        # itself; ``_reference_lock`` covers the static vocabularies.
         self._bill_list_locks: dict[int, threading.Lock] = {}
         self._roster_locks: dict[int, threading.Lock] = {}
         self._member_vote_locks: dict[tuple[int, int], threading.Lock] = {}
+        self._member_bill_locks: dict[tuple[int, int, int | None], threading.Lock] = {}
         self._guard = threading.Lock()
         self._reference_lock = threading.Lock()
 
@@ -691,6 +699,125 @@ class LISService:
             self._rosters[session_code] = (time.monotonic(), roster)
             return roster
 
+    def find_members(self, name: str, session_code: int) -> list[Member]:
+        """Roster rows whose name contains ``name``, ignoring case.
+
+        The search runs over the display name, the list name (``"Schmidt,
+        Charlie"``), and the surname, so ``"schmidt"``, ``"Charlie Schmidt"``,
+        and ``"Schmidt, C"`` all find Delegate Schmidt.  Runs of whitespace
+        collapse before matching.  Results come back in list-name order.
+
+        This reads the cached roster; it costs nothing after the first call
+        for a session.  It includes members who left mid-session, like the
+        roster itself.
+
+        Args:
+            name: Any part of the name.  Blank returns nothing rather than
+                everyone.
+            session_code: e.g. ``20261``.
+        """
+        needle = " ".join(name.split()).lower()
+        if not needle:
+            return []
+
+        hits = []
+        for member in self.members_by_id(session_code).values():
+            names = (member.MemberDisplayName, member.ListDisplayName, member.PatronDisplayName)
+            haystack = " | ".join(n for n in names if n).lower()
+            if needle in haystack:
+                hits.append(member)
+
+        return sorted(hits, key=lambda m: (m.ListDisplayName or m.name).lower())
+
+    def member_bills(
+        self,
+        member_id: int,
+        session_code: int,
+        *,
+        role: int | None = None,
+        refresh: bool = False,
+    ) -> list[MemberLegislation]:
+        """Every bill a member patrons in a session, one entry per bill.
+
+        This is the member-first bill axis, the counterpart of
+        :meth:`member_votes`.  The bill-first list names only the chief
+        patron, so co-patronage is reachable only this way.
+
+        The endpoint returns one row per published summary version, so a bill
+        with three summaries arrives three times.  This keeps the last row
+        LIS sends for each ``LegislationID``, which carries the newest
+        summary, and preserves the order of first appearance.  Delegate
+        Schmidt's 236 rows for 20261 collapse to 229 bills.
+
+        The session code is resolved to a ``SessionID`` first, because the
+        endpoint mis-caches session codes; see
+        :meth:`LISClient.get_member_legislation`.  The response is cached for
+        ``roster_ttl`` per member, session, and role.
+
+        Args:
+            member_id: ``MemberID`` from the roster or :meth:`find_members`.
+            session_code: e.g. ``20261``.
+            role: Restrict to one ``PatronTypeID``: ``CHIEF_PATRON`` (1),
+                ``CHIEF_CO_PATRON`` (2), or ``CO_PATRON`` (4).  Omit for
+                every role.
+            refresh: Fetch again even when a fresh copy is cached.
+
+        Raises:
+            SessionNotFoundError: The code is not in the session reference.
+        """
+        rows = self._member_bill_rows(member_id, session_code, role, refresh=refresh)
+
+        collapsed: dict[int, MemberLegislation] = {}
+        for row in rows:
+            collapsed[row.LegislationID] = row
+
+        return list(collapsed.values())
+
+    def bill_patrons(self, bill_number: str, session_code: int) -> list[Patron]:
+        """Every patron of a bill, in every role, by bill number.
+
+        Args:
+            bill_number: Any case, padded or not.  ``hb0001`` resolves ``HB1``.
+            session_code: e.g. ``20261``.
+
+        Raises:
+            InvalidBillNumberError: The string does not parse as a bill number.
+            BillNotFoundError: The number is not in that session.
+        """
+        return self.client.get_bill_patrons(self.resolve_bill_id(bill_number, session_code))
+
+    def session_id(self, session_code: int) -> int:
+        """The ``SessionID`` behind a session code, e.g. ``59`` for ``20261``.
+
+        Most endpoints accept either form, but ``/LegislationByMember`` caches
+        by ``sessionID`` alone, so callers there must send the ID.  The
+        session reference is fetched once and kept; an unknown code triggers
+        one refetch, in case a session was added since.
+
+        Raises:
+            SessionNotFoundError: The code is absent even after a refetch.
+        """
+        code = int(session_code)
+
+        ids = self._session_ids
+        if ids is None or code not in ids:
+            with self._reference_lock:
+                if self._session_ids is None or code not in self._session_ids:
+                    self._session_ids = {
+                        int(s.SessionCode): s.SessionID for s in self.client.get_sessions()
+                    }
+                ids = self._session_ids
+
+        if code not in ids:
+            raise SessionNotFoundError(
+                f"Session code {code} is not in the LIS session reference. "
+                f"Known codes run from {min(ids)} to {max(ids)}."
+                if ids
+                else f"Session code {code} is not in the LIS session reference."
+            )
+
+        return ids[code]
+
     def event_types_by_code(self) -> dict[str, list[LegislationEventType]]:
         """The event type reference, grouped by ``EventCode``.
 
@@ -815,8 +942,10 @@ class LISService:
             self._bill_lists.clear()
             self._rosters.clear()
             self._member_votes.clear()
+            self._member_bills.clear()
 
         with self._reference_lock:
+            self._session_ids = None
             self._event_types = None
             self._statuses_by_name = None
             self._statuses_by_id = None
@@ -884,6 +1013,51 @@ class LISService:
     def _member_vote_lock(self, key: tuple[int, int]) -> threading.Lock:
         with self._guard:
             return self._member_vote_locks.setdefault(key, threading.Lock())
+
+    def _member_bill_rows(
+        self,
+        member_id: int,
+        session_code: int,
+        role: int | None,
+        *,
+        refresh: bool = False,
+    ) -> list[MemberLegislation]:
+        """The raw member bill rows, one per summary version, cached per role."""
+        key = (member_id, session_code, role)
+
+        if not refresh:
+            cached = self._read_member_bills(key)
+            if cached is not None:
+                return cached
+
+        with self._member_bill_lock(key):
+            # Another thread may have filled the slot while this one waited.
+            if not refresh:
+                cached = self._read_member_bills(key)
+                if cached is not None:
+                    return cached
+
+            rows = self.client.get_member_legislation(
+                member_id=member_id,
+                session_id=self.session_id(session_code),
+                patron_type_id=role,
+            )
+            self._member_bills[key] = (time.monotonic(), rows)
+            return rows
+
+    def _read_member_bills(
+        self, key: tuple[int, int, int | None]
+    ) -> list[MemberLegislation] | None:
+        cached = self._member_bills.get(key)
+
+        if cached is None or time.monotonic() - cached[0] >= self.roster_ttl:
+            return None
+
+        return cached[1]
+
+    def _member_bill_lock(self, key: tuple[int, int, int | None]) -> threading.Lock:
+        with self._guard:
+            return self._member_bill_locks.setdefault(key, threading.Lock())
 
     def _load_statuses(self) -> None:
         if self._statuses_by_name is not None:
