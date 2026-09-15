@@ -62,12 +62,12 @@ vocabularies, caching the large lists, and flattening bill text HTML.
 from va_lis_client import LISClient, LISService, strip_html
 from va_lis_client.models import CHIEF_PATRON
 
-service = LISService(LISClient())   # or LISService() to build the client for you
+service = LISService(LISClient())  # or LISService() to build the client for you
 
 # Bill numbers, not surrogate keys. Case and padding are normalized.
 bill = service.get_bill("hb0001", 20261)
 bill_id = service.resolve_bill_id("HB1", 20261)  # ~1.3 KB, via the text list
-item = service.resolve_bill("HB1", 20261)        # the session row; needs the 3 MB list
+item = service.resolve_bill("HB1", 20261)  # the session row; needs the 3 MB list
 
 # Text: the newest version by default, or name one by DocumentCode.
 item, detail = service.bill_text("HB1", 20261)
@@ -86,34 +86,38 @@ for v in service.member_votes(503, 20261):
 votes = service.member_votes_on(503, "hb0001", 20261)
 
 # Members by name, and the bills a member patrons, co-patronage included.
-schmidt = service.find_members("schmidt", 20261)[0]            # MemberID 544
+schmidt = service.find_members("schmidt", 20261)[0]  # MemberID 544
 for b in service.member_bills(schmidt.MemberID, 20261):
     print(b.LegislationNumber, b.LegislationStatus, b.SummaryVersion)
 chief = service.member_bills(schmidt.MemberID, 20261, role=CHIEF_PATRON)
-patrons = service.bill_patrons("HB1408", 20261)                # every role
+patrons = service.bill_patrons("HB1408", 20261)  # every role
 
 # Committees: who sits where, with party and district, and the reverse.
-courts = service.resolve_committee("Courts of Justice", "H")   # H08
+courts = service.resolve_committee("Courts of Justice", "H")  # H08
 for s in service.committee_members(courts.CommitteeID, 20261):
     print(s.name, s.role, s.party, s.district)
-seats = service.member_committees(schmidt.MemberID, 20261)     # 14 cached requests
+seats = service.member_committees(schmidt.MemberID, 20261)  # 14 cached requests
 
 # Senate dockets: every bill a committee has scheduled, with the date and room.
 for e in service.docket_entries("Courts of Justice", 20261):
     print(e.date, e.bill_number, e.room)
 
+# Keyword search, in two grains. Both drop the duplicate rows LIS emits.
+hits = service.search_bills(session_code=20261, keyword="firearm")  # one row per bill
+every = service.search_bill_summaries(session_code=20261, keyword="firearm")  # one row per summary
+
 # Every vote including the ones no member can be credited with.
 for record in service.bill_votes("HB1", 20261):
     notes = record.statements_by_member()
-    for code, members in record.responses().items():   # "Y" "N" "A" "X"
+    for code, members in record.responses().items():  # "Y" "N" "A" "X"
         for m in members:
             print(code, m.MemberNumber, m.name, notes.get(m.MemberID, []))
 
 # Reference joins. Events carry a null type ID and a null status ID, so these
 # index the vocabularies on the keys that events actually carry.
-types = service.event_types_by_code()          # EventCode -> [LegislationEventType]
-kind = service.event_type_for(event)           # the one row describing an event
-statuses = service.statuses_by_name()          # Name      -> LegislationStatus
+types = service.event_types_by_code()  # EventCode -> [LegislationEventType]
+kind = service.event_type_for(event)  # the one row describing an event
+statuses = service.statuses_by_name()  # Name      -> LegislationStatus
 label = service.bill_status_label(bill, item)  # best available status label
 ```
 
@@ -137,6 +141,16 @@ only 1,502 codes, and `H1405` alone returns four. Two of those four read
 in Labor and Commerce". `event_types_by_code` therefore returns **every** row
 per code, and `event_type_for` picks the one that describes a given event. See
 [Joining the event vocabulary](#joining-the-event-vocabulary).
+
+**Searching returns a bill more than once, twice over.** Advanced search
+emits one row per published summary version *and* a pile of exact duplicate
+rows, so 20261 comes back as 3,007 rows over 2,827 bills. The two grains are
+two methods: `search_bills` collapses to one row per bill by ranking the
+summary label, and `search_bill_summaries` keeps every version and drops only
+the exact duplicates. Both take `dedupe=False` to get LIS's own answer. The
+raw client never touches the rows. See
+[Searching bills](#searching-bills), which also covers why the endpoint
+cannot be paged.
 
 **Resolving an id cheaply.** The text list endpoint takes a bill number and
 returns rows carrying the `LegislationID`, so `resolve_bill_id` costs about
@@ -334,13 +348,13 @@ from `SkippedRecords` divided by `PageSize`:
 ```python
 page = client.get_session_bills(session_code=20271, page_size=5, skip=10)
 
-len(page)                      # 5. PagedList subclasses list.
-page[0].LegislationNumber      # "HB71"
-page.pagination.TotalCount     # 443
-page.pagination.HasNext        # True
+len(page)  # 5. PagedList subclasses list.
+page[0].LegislationNumber  # "HB71"
+page.pagination.TotalCount  # 443
+page.pagination.HasNext  # True
 
 # TotalCount without downloading the list: one row, about a kilobyte.
-client.get_session_bill_count(session_code=20271)   # 443
+client.get_session_bill_count(session_code=20271)  # 443
 ```
 
 `PagedList` is a real `list`, so code that iterates or indexes it needs no
@@ -355,6 +369,12 @@ Verified on `getlegislationsessionlistasync` only. It is **not** global
 middleware. The event type reference endpoint ignores the header and returns
 all 3,912 rows (2.19 MB) on every call, which is why the client caches that one
 instead.
+
+`AdvancedLegislationSearch` cannot be paged at all. It ignores `pageNumber`
+and `pageSize` on the query string, its request body has no paging fields, and
+the `X-Pagination` it sends back reports a `TotalCount` that matches neither
+the row count nor the unique bill count. See
+[Searching bills](#searching-bills).
 
 ## API services
 
@@ -509,25 +529,228 @@ Not wired: `getcalendaractionsreferenceasync` returns 4,952 rows and 2 MB, and
 `getcategorytypesreferenceasync` is unprobed. See
 [How meetings and dockets work](#how-meetings-and-dockets-work).
 
-### Not yet explored
+#### AdvancedLegislationSearch (`/AdvancedLegislationSearch/api/`)
+- `search_legislation(**criteria)` → bills by keyword, status, category, committee, chamber, patron, chapter number, or bill number; rows exactly as LIS sent them, chief patron only
+- `get_most_frequent_legislation(session_id)` → the 100 most viewed bills; `sessionID` only, no `sessionCode`
+- `get_legislative_numbers(session_code)` → 3,646 rows of bill number to `LegislationID` for 20261, 268 KB against roughly 3 MB for the bill list
+- `get_introduction_dates(session_code)` → the 91 distinct introduction dates in 20261
+- `get_legislation_categories()` → 30 categories, e.g. 1 `Introduced`
 
-These services exist in the portal but haven't been investigated, except
-where noted:
+This is the only keyword capable bill endpoint, and the only one that filters
+on status, category, committee, chapter number, and patron in one call. It
+has no paging and it repeats bills. Read
+[Searching bills](#searching-bills) before you use it.
 
-- AdvancedLegislationSearch (spec read 2026-09-11: a POST keyword search,
-  `getmostfrequentlegislationsasync`, introduction date lists; not wired)
+Not wired: `getstatusreferencesasync` returns the same 52 rows under the same
+`References` key as `get_legislation_statuses`, so use that one.
+`clearpubliccache` and `clearintroductiondatelistcacheasync` are cache
+management, not data.
+
+### Investigated and deliberately not wired
+
+Every service below was read from its OpenAPI spec and probed live on
+2026-09-15. Fetch any spec with
+`GET /ReportFileGeneration/api/getapidocumentationasync?ApiName=<Service>`.
+There is no per service `getapidocumentationasync`; that path returns 404 for
+every service. The `Documentation` field holds the OpenAPI document as a JSON
+string, so it needs a second parse.
+
+**Nothing to wire.** These publish only heartbeat paths, so they have no
+public data operation at all:
+
 - CommunicationFileGeneration
-- Contact
 - LegislationCollections
-- LegislationCommunications
 - LegislationFileGeneration
-- LegislationSubject (spec read 2026-09-11: `getsubjectreferencesasync`, a
-  subject vocabulary per session; not wired)
-- MemberVoteSearch (only `getmembervotelistasync` is wired)
-- MinutesBook
-- Organization
-- Person
-- Personnel
+
+**Documented but unreachable.** Person returns 404 on every path, including
+`/Person/api/getpersonlistasync` and `/Person/api/getpersonbyidasync/{id}`.
+Its spec omits the service prefix on every path, but that is not the cause:
+Personnel has the same spec defect and answers fine at `/Personnel/api/...`.
+
+**Already covered.** MemberVoteSearch holds only `getmembervotelistasync`,
+which `get_member_votes` already wires.
+
+**Vocabulary with nothing to search by.** LegislationSubject's
+`getsubjectreferencesasync` returns a 506 row subject index for 20261, but
+passing a `SubjectIndexID` to the advanced search answers 204 every time,
+with either session parameter. The vocabulary is real and unusable.
+
+### Worth wiring next
+
+Probed live on 2026-09-15 and confirmed to return real data. Ranked by value:
+
+1. **MinutesBook** — the daily record of chamber and committee floor
+   proceedings, 201 books for the 2026 House. `getminutesbookasync` nests
+   `MinutesCategories` → `MinutesEntries` → `MinutesActivities`, and each
+   activity carries `VoteID`, `VoteNumber`, `EventCode`, `VoteTally` and
+   `IsBlock`. It joins straight onto the vote layer already wired here.
+2. **LegislationCommunications** — messages between the chambers, 64 for the
+   2026 House, each linking blob files in HTML and JSON.
+3. **Personnel** — committee clerks and DLS staff, 54 clerks and 33
+   personnel. Small, stable, and it completes the committee picture.
+4. **Organization** (296 rows) and **Contact** (10 contact types) — reference
+   data only.
+
+## Searching bills
+
+`AdvancedLegislationSearch` is the only endpoint that searches bill text and
+summaries, and the only one that filters on status, category, committee,
+chapter number, and patron at once. Criteria ride a JSON body, not the query
+string. It is also the roughest endpoint in LIS, in four separate ways.
+
+Every count below comes from session 20261, measured 2026-09-15.
+
+### A bill arrives more than once, for two unrelated reasons
+
+An unfiltered search of 20261 returns **3,007 rows holding 2,827 unique
+`LegislationID` values**. 175 IDs repeat. Split those 175 groups and they
+fall cleanly in two:
+
+| Cause | Groups | What differs | Real? |
+|---|---|---|---|
+| One row per summary version | 52 | `SummaryVersion`, usually `LegislationSummary` | Yes, structural |
+| Exact duplicate rows | 123 | Nothing. Byte identical | No, bad data |
+
+**The summary version rows are structural.** A bill publishes a new summary
+as it advances, and every one of them comes back as its own row. Five labels
+exist: `SUMMARY AS INTRODUCED`, `SUMMARY AS PASSED HOUSE`, `SUMMARY AS PASSED
+SENATE`, `SUMMARY AS PASSED`, and `SUMMARY AS ENACTED WITH GOVERNOR'S
+RECOMMENDATION`. 47 bills arrived twice and 5 arrived three times. Note that
+17 of the 52 carry *identical* summary text under two different labels, so a
+version change does not promise a text change.
+
+**The exact duplicates are bad rows.** 123 bills came back twice with every
+field matching, so nothing in the response tells the copies apart. 121 of the
+123 held status `Continued` and the other two were HJ29 and HJ30 (`Passed`).
+It is not every continued bill: 444 bills hold that status and only 121
+doubled up. Carry over is the obvious suspect and it cannot be confirmed from
+this response, because the endpoint returns `Sessions: []` on every row.
+
+### Rank the summary label, never the arrival order
+
+LIS usually returns the versions in progression order. Twice in 20261 it did
+not: **HB1503 and SB605 both put `SUMMARY AS PASSED` ahead of the chamber
+passage row.** Keeping the last row LIS sends therefore picks the wrong
+summary about 4% of the time. `SUMMARY_VERSION_RANK` in
+`va_lis_client.models.search` ranks the labels instead, and a label missing
+from that table ranks below every known one on purpose.
+
+The same fault shows on `/LegislationByMember`, and on the same bill. See
+[Rank the label here too](#rank-the-label-here-too-and-mind-the-different-spelling),
+which also covers the one thing that differs: **the two services spell the
+chamber passage label differently.** Advanced search sends `SUMMARY AS PASSED
+HOUSE` and `SUMMARY AS PASSED SENATE`; the member list sends `SUMMARY AS
+PASSED CHAMBER` and never the other two. `SUMMARY_VERSION_RANK` carries all
+six spellings so either service ranks with one call.
+
+**LIS's own numbering agrees with the ranks.** A third service,
+`/LegislationText`'s summary endpoint, sends a numeric `SummaryVersionID`
+next to the label, and it lines up exactly:
+
+| `SummaryVersionID` | Label | Rank |
+|---|---|---|
+| 1 | `SUMMARY AS INTRODUCED` | 0 |
+| 2 | `SUMMARY AS PASSED HOUSE` / `SENATE` | 1 |
+| 3 | `SUMMARY AS PASSED` | 2 |
+
+Checked on HB1, HB18, HB220, HB1115, HB1503 and SB605 in 20261. Neither the
+search row nor the member row carries that ID, which is why the table has to
+work from the label. That endpoint also returns its rows newest first, the
+reverse of the other two.
+
+### The two grains are two methods
+
+The raw client hands the rows back untouched, so a caller who wants LIS's own
+answer can have it. The service layer picks a grain, and both methods take
+`dedupe=True` by default:
+
+```python
+service = LISService(LISClient())
+
+# One row per bill.  The furthest-along summary wins.
+bills = service.search_bills(session_code=20261, keyword="firearm")
+
+# One row per published summary version.  Only the exact duplicates go.
+versions = service.search_bill_summaries(session_code=20261, keyword="firearm")
+
+# Exactly what LIS sent, on either method.
+raw = service.search_bills(dedupe=False, session_code=20261, keyword="firearm")
+```
+
+`search_bills` groups on `LegislationID`, which absorbs both duplication
+causes at once, and keeps the order each bill first appeared in.
+`search_bill_summaries` keys on `(LegislationID, SummaryVersion)`, so it
+removes only the exact duplicates and never collapses two genuine versions.
+On 20261 unfiltered: 3,007 rows in, 2,827 out of `search_bills` and 2,884 out
+of `search_bill_summaries`.
+
+### There is no paging, and `TotalCount` matches nothing
+
+`pageNumber` and `pageSize` on the query string change nothing, and the body
+schema carries no paging fields. **Every search returns its whole result set
+in one response**, so a filter is the only way to bound it. An unfiltered
+20261 search is 5.7 MB.
+
+`X-Pagination.TotalCount` reported **2,836** against 3,007 rows and 2,827
+unique IDs. Every single field and field pair in the payload was checked for
+a distinct count equal to 2,836 and none matches. Count the rows yourself.
+
+### Criteria traps
+
+- **`Chambercode` has a lowercase `c`**, alone among the body keys. The
+  client spells it correctly; only a raw caller or the `extra=` escape hatch
+  can get it wrong.
+- **A common word finds nothing.** `KeywordExpression: "the"` returned 204
+  while `"firearm"` returned 50 bills. LIS drops stop words. This is not a
+  result cap.
+- **`SubjectIndexID` always returns 204**, with `SessionCode` or `SessionID`.
+  The `/LegislationSubject` vocabulary is not searchable.
+
+### Two body fields need their entries wrapped
+
+`LegislationNumbers` and `LegislationIDs` reject a flat list and answer 400.
+Each entry has to be its own object, and the key inside the ID wrapper is
+`LegislationId` with a lowercase `d`, unlike the `LegislationIDs` list that
+holds it. `PatronTypes` is a flat list of integers, so the rule is not
+uniform. `search_legislation` wraps the scalars for you:
+
+```python
+client.search_legislation(session_code=20261, legislation_numbers=["HB1", "SB2"])
+# body: {"LegislationNumbers": [{"LegislationNumber": "HB1"}, {"LegislationNumber": "SB2"}]}
+```
+
+A compound keyword search rides the `extra=` escape hatch. `Keywords` takes
+`{"Keyword": ..., "Operator": "AND" | "OR"}` objects, and an object may nest
+its own `Keywords` list to act as parentheses:
+
+```python
+client.search_legislation(
+    session_code=20261,
+    keyword_location="Summary",
+    extra={
+        "Keywords": [
+            {"Keyword": "firearm", "Operator": "AND"},
+            {"Keyword": "ammunition", "Operator": "AND"},
+        ]
+    },
+)  # 8 bills in 20261
+```
+
+### Seven fields are always null here
+
+`CandidateDate`, `VersionDate`, `IntroductionDate`, `HousePassageDate`,
+`SenatePassageDate`, `Sessions`, and `LegislationStatusID` were null on all
+3,007 rows. So a search result carries **no date at all** and no carry over
+lineage; fetch those from `/Legislation`. `LegislationTextID` is present but
+always `0`, and `CommitteeID` is `0` rather than null when no committee holds
+the bill.
+
+The row does carry things the session bill list does not: the summary HTML,
+the summary version, the chapter number, and the committee of reference.
+
+**It does not carry co-patrons.** `Patrons` holds exactly one entry, the
+chief patron, on all 3,007 rows, the same as the session bill list. Reach
+co-patronage through `get_bill_patrons` or `member_bills`.
 
 ## Members (the roster behind a roll call)
 
@@ -685,13 +908,42 @@ from the session reference. Do not omit the session either: with no
 parameters at all the server tries to list every bill for every member, and
 the request hangs past 60 seconds.
 
-### One row per summary version
+### One row per summary version, and exact duplicates too
 
 A bill appears once per published summary. HB18 came back three times, as
 introduced, as passed chamber, and as passed, so 236 rows described 229
-bills. `member_bills` keeps the last row per `LegislationID`, which carries
-the newest summary, and preserves the order of first appearance.
+bills. `member_bills` keeps the row whose `SummaryVersion` ranks furthest
+along and preserves the order of first appearance.
 `LISClient.get_member_legislation` returns the rows as sent.
+
+This endpoint repeats a bill for the same two reasons
+[advanced search does](#a-bill-arrives-more-than-once-for-two-unrelated-reasons).
+Across a 40-member sample of 20261, measured 2026-09-15:
+
+| | Count |
+|---|---|
+| Bills arriving on more than one row | 198 |
+| ...carrying more than one distinct summary version | 57 |
+| ...whose rows are byte identical, with nothing to tell them apart | 141 |
+
+So most of the repetition here is the bad-row defect, not the version split.
+Collapsing on `LegislationID` absorbs both.
+
+### Rank the label here too, and mind the different spelling
+
+**LIS does not reliably order the versions, and the same bill proves it on
+both services.** In the 40-member sample, 1 of the 57 multi-version groups
+arrived out of order: **HB1503 sent `SUMMARY AS PASSED` ahead of `SUMMARY AS
+PASSED CHAMBER`**, so taking the last row kept the older label. HB1503 is one
+of the two bills that breaks the ordering on advanced search as well. 35 of
+those 57 groups carry genuinely different summary text, so the pick matters.
+
+**`/LegislationByMember` spells the chamber summary its own way.** It sends
+four labels and uses `SUMMARY AS PASSED CHAMBER`. It never sends the
+`SUMMARY AS PASSED HOUSE` / `SUMMARY AS PASSED SENATE` pair that advanced
+search sends, and advanced search never sends `CHAMBER`. `SUMMARY_VERSION_RANK`
+in `va_lis_client.models.search` carries all six spellings, so one call to
+`summary_version_rank` ranks a row from either service.
 
 ### The nested patron is not the patron list
 
@@ -994,8 +1246,8 @@ The statement says `217`. That is Knight's **`MemberID`**, not his
 `VoteMemberID` of `10988439`.
 
 ```python
-statement.VoteMemberID == member.VoteMemberID   # WRONG — never matches
-statement.VoteMemberID == member.MemberID       # right
+statement.VoteMemberID == member.VoteMemberID  # WRONG — never matches
+statement.VoteMemberID == member.MemberID  # right
 ```
 
 The ranges do not overlap at all, so the wrong join fails silently for every
@@ -1293,6 +1545,7 @@ src/va_lis_client/
     ├── session.py      # Session, SessionEvent
     ├── legislation.py  # Patron, Legislation, LegislationStatus, ...
     ├── text.py         # LegislationTextItem, LegislationTextDetail, ...
+    ├── search.py       # LegislationSearchResult, SUMMARY_VERSION_RANK, ...
     ├── event.py        # LegislationEvent, LegislationEventType, ActorType
     ├── pagination.py   # Pagination, PagedList — the X-Pagination protocol
     ├── committee.py    # Committee, CommitteeMember, CommitteeAction

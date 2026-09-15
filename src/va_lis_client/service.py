@@ -23,6 +23,16 @@ questions the raw endpoints leave to every caller:
 - The member-first vote endpoint returns one row per (vote, bill) pair and
   omits the block flag, so the service derives it by counting the rows that
   share a ``VoteID``.
+- Advanced search returns a bill once per published summary version, and on
+  top of that emits exact duplicate rows.  The two grains are two methods:
+  ``search_bills`` collapses to one row per bill, ``search_bill_summaries``
+  keeps every version.  Both drop the exact duplicates.
+- The member-first bill endpoint repeats a bill the same two ways, and LIS
+  does not reliably send the versions in progression order.  So
+  ``member_bills`` and ``search_bills`` both rank the ``SummaryVersion``
+  label rather than trusting arrival order.  The two services spell the
+  chamber passage label differently, which is why the rank table carries
+  both spellings.
 
 Usage::
 
@@ -64,6 +74,7 @@ from va_lis_client.models import (
     Legislation,
     LegislationEvent,
     LegislationEventType,
+    LegislationSearchResult,
     LegislationStatus,
     LegislationSummaryItem,
     LegislationTextDetail,
@@ -75,6 +86,7 @@ from va_lis_client.models import (
     Vote,
     VoteMember,
     VoteStatement,
+    summary_version_rank,
 )
 
 DEFAULT_BILL_LIST_TTL = 15 * 60
@@ -826,10 +838,27 @@ class LISService:
         patron, so co-patronage is reachable only this way.
 
         The endpoint returns one row per published summary version, so a bill
-        with three summaries arrives three times.  This keeps the last row
-        LIS sends for each ``LegislationID``, which carries the newest
-        summary, and preserves the order of first appearance.  Delegate
-        Schmidt's 236 rows for 20261 collapse to 229 bills.
+        with three summaries arrives three times.  This keeps the row whose
+        ``SummaryVersion`` ranks furthest along, and preserves the order of
+        first appearance.  Delegate Schmidt's 236 rows for 20261 collapse to
+        229 bills.
+
+        **The rank decides, not the arrival order.**  LIS usually sends the
+        versions in progression order and sometimes does not: across a
+        40-member sample of 20261 (measured 2026-09-15), 57 groups held more
+        than one distinct version and HB1503 arrived with ``SUMMARY AS
+        PASSED`` ahead of ``SUMMARY AS PASSED CHAMBER``.  Taking the last row
+        kept the older label there.  35 of those 57 groups carry genuinely
+        different summary text, so the pick matters.
+
+        **This service spells the chamber summary its own way.**  It sends
+        ``SUMMARY AS PASSED CHAMBER`` and never the per-chamber spelling that
+        ``/AdvancedLegislationSearch`` sends; see
+        :data:`~va_lis_client.models.search.SUMMARY_VERSION_RANK`.
+
+        Rows also arrive as exact duplicates, the same defect the search
+        shows.  141 of 198 multi-row groups in that sample held two byte
+        identical rows.  Collapsing on ``LegislationID`` absorbs them.
 
         The session code is resolved to a ``SessionID`` first, because the
         endpoint mis-caches session codes; see
@@ -851,7 +880,10 @@ class LISService:
 
         collapsed: dict[int, MemberLegislation] = {}
         for row in rows:
-            collapsed[row.LegislationID] = row
+            current = collapsed.get(row.LegislationID)
+            rank = summary_version_rank(row.SummaryVersion)
+            if current is None or rank > summary_version_rank(current.SummaryVersion):
+                collapsed[row.LegislationID] = row
 
         return list(collapsed.values())
 
@@ -867,6 +899,108 @@ class LISService:
             BillNotFoundError: The number is not in that session.
         """
         return self.client.get_bill_patrons(self.resolve_bill_id(bill_number, session_code))
+
+    def search_bills(
+        self,
+        *,
+        dedupe: bool = True,
+        **criteria,
+    ) -> list[LegislationSearchResult]:
+        """Search bills, one row per bill.
+
+        This is the bill-grain half of the search.  LIS returns one row per
+        published summary version, so a bill that advanced arrives two or
+        three times; this keeps the row carrying the furthest-along summary.
+        Call :meth:`search_bill_summaries` when you want every version.
+
+        Ranking picks the winner, not arrival order.  LIS usually sends the
+        versions in progression order and sometimes does not: HB1503 and
+        SB605 in 20261 both put ``SUMMARY AS PASSED`` ahead of the chamber
+        passage row.  See :data:`SUMMARY_VERSION_RANK`.
+
+        Collapsing by ``LegislationID`` also absorbs the exact duplicate rows
+        LIS emits, which carry no distinguishing field at all.  Session 20261
+        with no filter returns 3,007 rows and collapses to 2,827 bills.
+
+        Rows keep the order in which each bill first appeared.
+
+        **Warning:** the endpoint has no paging, so an unfiltered search
+        fetches the whole session.  20261 measured 5.7 MB.  Send a filter.
+
+        Args:
+            dedupe: Collapse to one row per bill.  Set ``False`` to get the
+                rows exactly as LIS sent them, duplicates and all, which is
+                the same thing :meth:`LISClient.search_legislation` returns.
+            **criteria: Search criteria, forwarded unchanged to
+                :meth:`LISClient.search_legislation`.  That method's
+                docstring carries the full list and its traps.
+
+        Example::
+
+            hits = service.search_bills(session_code=20261, keyword="firearm")
+        """
+        rows = self.client.search_legislation(**criteria)
+        if not dedupe:
+            return rows
+
+        best: dict[int, LegislationSearchResult] = {}
+        for row in rows:
+            current = best.get(row.LegislationID)
+            if current is None or row.summary_rank > current.summary_rank:
+                best[row.LegislationID] = row
+
+        return list(best.values())
+
+    def search_bill_summaries(
+        self,
+        *,
+        dedupe: bool = True,
+        **criteria,
+    ) -> list[LegislationSearchResult]:
+        """Search bills, one row per published summary version.
+
+        This is the summary-grain half of the search, and the right call when
+        you want to read how a bill's summary changed as it advanced.  A bill
+        with three summaries stays three rows.  Call :meth:`search_bills` for
+        one row per bill.
+
+        Deduplication here removes only the exact duplicate rows LIS emits,
+        by keying on ``(LegislationID, SummaryVersion)``.  It never collapses
+        two genuine versions.  Session 20261 with no filter returns 3,007
+        rows and settles to 2,884.
+
+        Note that 17 of the 52 multi-version bills in 20261 carry *identical*
+        summary text under two different version labels, so a version change
+        does not promise a text change.
+
+        Rows keep the order LIS sent them.
+
+        **Warning:** the endpoint has no paging, so an unfiltered search
+        fetches the whole session.  20261 measured 5.7 MB.  Send a filter.
+
+        Args:
+            dedupe: Drop exact duplicate rows.  Set ``False`` to get the rows
+                exactly as LIS sent them, which is the same thing
+                :meth:`LISClient.search_legislation` returns.
+            **criteria: Search criteria, forwarded unchanged to
+                :meth:`LISClient.search_legislation`.  That method's
+                docstring carries the full list and its traps.
+        """
+        rows = self.client.search_legislation(**criteria)
+        if not dedupe:
+            return rows
+
+        seen: set[tuple[int, str | None]] = set()
+        kept: list[LegislationSearchResult] = []
+        for row in rows:
+            key = (row.LegislationID, row.SummaryVersion)
+            if key in seen:
+                continue
+
+            seen.add(key)
+            kept.append(row)
+
+        return kept
 
     def committees(
         self,

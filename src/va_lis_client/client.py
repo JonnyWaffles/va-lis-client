@@ -75,9 +75,13 @@ from va_lis_client.models import (
     DocketDetail,
     DocketListItem,
     Heartbeat,
+    IntroductionDate,
     Legislation,
+    LegislationCategory,
     LegislationEvent,
     LegislationEventType,
+    LegislationNumberEntry,
+    LegislationSearchResult,
     LegislationStatus,
     LegislationSummary,
     LegislationSummaryItem,
@@ -1414,6 +1418,294 @@ class LISClient:
             return []
         return [
             CalendarCategoryType.model_validate(t) for t in data.get("CalendarCategoryTypes", [])
+        ]
+
+    # ------------------------------------------------------------------
+    # Advanced legislation search (the only keyword-capable bill endpoint)
+    # ------------------------------------------------------------------
+
+    def search_legislation(
+        self,
+        *,
+        session_code: int | None = None,
+        session_id: int | None = None,
+        keyword: str | None = None,
+        keyword_location: str | None = None,
+        keyword_all_sessions: bool | None = None,
+        chamber_code: str | None = None,
+        status_id: int | None = None,
+        category_id: int | None = None,
+        committee_id: int | None = None,
+        member_id: int | None = None,
+        patron_types: list[int] | None = None,
+        subject_index_id: int | None = None,
+        chapter_number: str | None = None,
+        legislation_numbers: list[str] | None = None,
+        legislation_ids: list[int] | None = None,
+        start_date: str | date | datetime | None = None,
+        end_date: str | date | datetime | None = None,
+        exclude_failed: bool | None = None,
+        current_status: bool | None = None,
+        summary_length: int | None = None,
+        extra: dict | None = None,
+    ) -> list[LegislationSearchResult]:
+        """Search bills by keyword and filters.  Rows arrive exactly as sent.
+
+        This is the only LIS endpoint that searches bill text and summaries,
+        and the only one that filters on status, category, committee, chapter
+        number, and patron at once.  Criteria ride a JSON body, not the query
+        string.
+
+        **Warning: there is no paging.**  ``pageNumber`` and ``pageSize`` on
+        the query string change nothing, and the body carries no paging
+        fields, so every search returns its whole result set in one response.
+        A whole-session search (``session_code`` alone) measured 3,007 rows
+        and 5.7 MB for 20261.  Send a filter.
+
+        **Warning: a bill can arrive more than once.**  The endpoint returns
+        one row per summary version *and* emits exact duplicate rows.  This
+        method does not touch them, because deciding which row wins is
+        interpretation.  Call ``LISService.search_bills`` for one row per
+        bill, or ``LISService.search_bill_summaries`` for one row per summary
+        version; see :class:`LegislationSearchResult` for the measurements.
+
+        **Do not trust ``X-Pagination.TotalCount`` here.**  It reported 2,836
+        against 3,007 rows holding 2,827 unique IDs, and matches no count
+        derivable from the payload.  Count the rows yourself.
+
+        Two traps in the criteria themselves:
+
+        - ``subject_index_id`` returns HTTP 204 every time, with either
+          session parameter.  The subject vocabulary from
+          ``/LegislationSubject`` is therefore not searchable.  The parameter
+          is wired so the behavior is discoverable, not because it works.
+        - A common word finds nothing.  ``keyword="the"`` returned 204 while
+          ``keyword="firearm"`` returned 50 bills, so LIS drops stop words.
+
+        Args:
+            session_code: e.g. ``20261``.
+            session_id: e.g. ``59``.  Send one session parameter or the other.
+            keyword: A keyword expression.  Supports ``AND``, ``OR``, and
+                parentheses.
+            keyword_location: Where to search, ``"Summary"`` or
+                ``"Bill Text"``.
+            keyword_all_sessions: Search every session, not just this one.
+            chamber_code: ``"H"`` or ``"S"``.  Sent as the body key
+                ``Chambercode`` — lowercase ``c``, unlike every other key.
+            status_id: ``LegislationStatusID`` from
+                :meth:`get_legislation_statuses`.
+            category_id: ``LegislationCategoryID`` from
+                :meth:`get_legislation_categories`.
+            committee_id: Restrict to bills before one committee.
+            member_id: Restrict to one patron.  A second route to the data
+                :meth:`get_member_legislation` returns.
+            patron_types: ``PatronTypeID`` values, e.g. ``[1]`` for chief
+                patron only.  A flat list of integers, unlike the two below.
+            subject_index_id: Always yields 204; see above.
+            chapter_number: e.g. ``"CHAP0350"``.
+            legislation_numbers: Unpadded numbers, e.g. ``["HB1", "SB2"]``.
+                LIS wants each entry wrapped as
+                ``{"LegislationNumber": "HB1"}`` and answers 400 to a flat
+                list of strings; this method wraps them for you.
+            legislation_ids: ``LegislationID`` values, e.g. ``[98525]``.
+                Wrapped the same way, as ``{"LegislationId": 98525}`` —
+                lowercase ``d``, unlike the ``LegislationIDs`` list holding
+                it.
+            start_date: Lower bound on the status date.
+            end_date: Upper bound on the status date.
+            exclude_failed: Drop bills that failed.
+            current_status: Match only the bill's current status.
+            summary_length: Truncate the summary HTML to this many characters.
+            extra: Body keys merged last, for a field this signature omits.
+
+        A compound keyword search rides ``extra``.  ``Keywords`` takes a list
+        of ``{"Keyword": ..., "Operator": "AND" | "OR"}`` objects, and an
+        object may nest its own ``Keywords`` list to act as parentheses::
+
+            client.search_legislation(
+                session_code=20261,
+                keyword_location="Summary",
+                extra={"Keywords": [
+                    {"Keyword": "firearm", "Operator": "AND"},
+                    {"Keyword": "ammunition", "Operator": "AND"},
+                ]},
+            )
+
+        Envelope key: ``Legislations``.
+        """
+        body: dict = {}
+        if session_code is not None:
+            body["SessionCode"] = session_code
+        if session_id is not None:
+            body["SessionID"] = session_id
+        if keyword is not None:
+            body["KeywordExpression"] = keyword
+        if keyword_location is not None:
+            body["KeywordLocation"] = keyword_location
+        if keyword_all_sessions is not None:
+            body["KeywordUseGlobalSessionSearch"] = keyword_all_sessions
+        if chamber_code is not None:
+            body["Chambercode"] = chamber_code  # lowercase "c" — LIS spells it this way
+        if status_id is not None:
+            body["LegislationStatusID"] = status_id
+        if category_id is not None:
+            body["LegislationCategoryID"] = category_id
+        if committee_id is not None:
+            body["CommitteeID"] = committee_id
+        if member_id is not None:
+            body["MemberID"] = member_id
+        if patron_types:
+            body["PatronTypes"] = patron_types
+        if subject_index_id is not None:
+            body["SubjectIndexID"] = subject_index_id
+        if chapter_number is not None:
+            body["ChapterNumber"] = chapter_number
+        if legislation_numbers:
+            # LIS rejects a flat list of strings with 400; each entry has to
+            # be its own object.  Accept either shape and wrap the scalars.
+            body["LegislationNumbers"] = [
+                n if isinstance(n, dict) else {"LegislationNumber": n} for n in legislation_numbers
+            ]
+        if legislation_ids:
+            # Same wrapper, and the key inside is "LegislationId" — lowercase
+            # "d", unlike the "LegislationIDs" that holds it.
+            body["LegislationIDs"] = [
+                i if isinstance(i, dict) else {"LegislationId": i} for i in legislation_ids
+            ]
+        if start_date is not None:
+            body["StartDate"] = _date_param(start_date)
+        if end_date is not None:
+            body["EndDate"] = _date_param(end_date)
+        if exclude_failed is not None:
+            body["ExcludeFailed"] = exclude_failed
+        if current_status is not None:
+            body["CurrentStatus"] = current_status
+        if summary_length is not None:
+            body["SummaryLength"] = summary_length
+
+        if extra:
+            body.update(extra)
+
+        data = self._post("/AdvancedLegislationSearch/api/getlegislationlistasync", json=body)
+        if data is None:
+            return []
+
+        return [LegislationSearchResult.model_validate(row) for row in data.get("Legislations", [])]
+
+    def get_most_frequent_legislation(self, session_id: int) -> list[LegislationSearchResult]:
+        """The 100 most frequently viewed bills in a session.
+
+        Rows match :meth:`search_legislation`, so the duplicate-row warning on
+        :class:`LegislationSearchResult` applies here too.
+
+        This endpoint takes ``sessionID`` only.  It has no ``sessionCode``
+        parameter, so resolve the code first with
+        ``LISService.session_id(session_code)``.
+
+        Args:
+            session_id: e.g. ``59`` for the 2026 Regular Session.
+
+        Envelope key: ``Legislations``.
+        """
+        data = self._get(
+            "/AdvancedLegislationSearch/api/getmostfrequentlegislationsasync",
+            params={"sessionID": session_id},
+        )
+        if data is None:
+            return []
+
+        return [LegislationSearchResult.model_validate(row) for row in data.get("Legislations", [])]
+
+    def get_legislative_numbers(
+        self,
+        session_code: int | None = None,
+        session_id: int | None = None,
+    ) -> list[LegislationNumberEntry]:
+        """Every bill number in a session paired with its ``LegislationID``.
+
+        The cheapest number-to-ID map LIS offers: 3,646 rows and 268 KB for
+        20261, against roughly 3 MB for :meth:`get_session_bills`.  Reach for
+        it when you resolve numbers in bulk and want nothing else.
+
+        **The spec's ``startDate`` and ``endDate`` do nothing.**  LIS accepts
+        them and stores them in the cache key, then returns the full list
+        anyway: a 1990 range still returned all 3,646 rows for 20261
+        (measured 2026-09-15).  They are left off this signature on purpose.
+
+        A session parameter is required; sending dates alone returns 400.
+
+        Args:
+            session_code: e.g. ``20261``.
+            session_id: e.g. ``59``.
+
+        Envelope key: ``LegislationNumbersList``.
+        """
+        params: dict = {}
+        if session_code is not None:
+            params["sessionCode"] = session_code
+        if session_id is not None:
+            params["sessionID"] = session_id
+
+        data = self._get("/AdvancedLegislationSearch/api/getlegislativenumbersasync", params=params)
+        if data is None:
+            return []
+
+        return [
+            LegislationNumberEntry.model_validate(row)
+            for row in data.get("LegislationNumbersList", [])
+        ]
+
+    def get_introduction_dates(
+        self,
+        session_code: int | None = None,
+        session_id: int | None = None,
+    ) -> list[IntroductionDate]:
+        """The distinct dates bills were introduced on, 91 rows for 20261.
+
+        The list carries dates and nothing else.  Note that the search result
+        rows themselves always return ``IntroductionDate`` null, so this
+        endpoint is the only place the dates surface.
+
+        Args:
+            session_code: e.g. ``20261``.
+            session_id: e.g. ``59``.
+
+        Envelope key: ``LegislationDatesList``.
+        """
+        params: dict = {}
+        if session_code is not None:
+            params["sessionCode"] = session_code
+        if session_id is not None:
+            params["sessionID"] = session_id
+
+        data = self._get(
+            "/AdvancedLegislationSearch/api/getintroductiondatelistasync", params=params
+        )
+        if data is None:
+            return []
+
+        return [
+            IntroductionDate.model_validate(row) for row in data.get("LegislationDatesList", [])
+        ]
+
+    def get_legislation_categories(self) -> list[LegislationCategory]:
+        """Reference list of 30 legislation categories, e.g. 1 ``Introduced``.
+
+        The vocabulary behind :meth:`search_legislation`'s ``category_id``.
+
+        The sibling ``getstatusreferencesasync`` is not wired: it returns the
+        same 52 rows under the same ``References`` key as
+        :meth:`get_legislation_statuses`.  Use that one.
+
+        Envelope key: ``LegislationCategoriesList``.
+        """
+        data = self._get("/AdvancedLegislationSearch/api/getlegislationcategoryreferencesasync")
+        if data is None:
+            return []
+
+        return [
+            LegislationCategory.model_validate(row)
+            for row in data.get("LegislationCategoriesList", [])
         ]
 
 

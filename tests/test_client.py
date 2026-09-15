@@ -25,6 +25,7 @@ from va_lis_client.models import (
     Partner,
     Session,
 )
+from va_lis_client.models.search import summary_version_rank
 
 _skip_live = unittest.skipUnless(
     os.environ.get("LIS_API_KEY"),
@@ -881,3 +882,260 @@ class LiveMeetingsTest(unittest.TestCase):
         self.assertGreater(len(entries), 50)
         self.assertTrue(all(e.bill_number for e in entries))
         self.assertEqual(len({e.docket.DocketID for e in entries}), 16)
+
+
+@_skip_live
+class LiveAdvancedSearchTest(unittest.TestCase):
+    """The keyword search, and the two ways it repeats a bill.
+
+    Counts here come from session 20261 on 2026-09-15.  A finished session
+    does not gain bills, so they are assertions rather than smoke tests, but
+    LIS does revise summaries, so the duplicate counts are bounded rather
+    than exact.
+    """
+
+    def setUp(self):
+        self.client = LISClient()
+        self.service = LISService(self.client)
+
+    def test_a_keyword_finds_bills_and_fills_every_patron(self):
+        rows = self.client.search_legislation(
+            session_code=20261, keyword="firearm", keyword_location="Summary"
+        )
+
+        self.assertGreater(len(rows), 20)
+        self.assertTrue(all(r.LegislationSummary for r in rows))
+        # One patron per row, the chief, exactly like the session bill list.
+        # The search is not a route to co-patronage.
+        self.assertEqual({len(r.Patrons) for r in rows}, {1})
+        self.assertEqual({p.role for r in rows for p in r.Patrons}, {"Chief Patron"})
+
+    def test_a_common_word_finds_nothing(self):
+        # LIS drops stop words rather than capping the result set.
+        self.assertEqual(
+            self.client.search_legislation(
+                session_code=20261, keyword="the", keyword_location="Summary"
+            ),
+            [],
+        )
+
+    def test_the_subject_filter_always_answers_nothing(self):
+        # The /LegislationSubject vocabulary is not searchable.  502 is
+        # "Abortion" in 20261 and returns 204 either way it is addressed.
+        self.assertEqual(
+            self.client.search_legislation(session_code=20261, subject_index_id=502), []
+        )
+        self.assertEqual(self.client.search_legislation(session_id=59, subject_index_id=502), [])
+
+    def test_the_chamber_filter_uses_a_lowercase_c(self):
+        rows = self.client.search_legislation(session_code=20261, chamber_code="H")
+
+        self.assertGreater(len(rows), 1000)
+        self.assertEqual({r.ChamberCode for r in rows}, {"H"})
+
+    def test_a_bill_repeats_per_summary_version_and_exactly(self):
+        rows = self.client.search_legislation(session_code=20261)
+        unique = {r.LegislationID for r in rows}
+
+        self.assertGreater(len(rows), len(unique))
+
+        by_id = {}
+        for row in rows:
+            by_id.setdefault(row.LegislationID, []).append(row)
+        groups = [g for g in by_id.values() if len(g) > 1]
+
+        identical = [g for g in groups if len({r.model_dump_json() for r in g}) == 1]
+        versioned = [g for g in groups if g not in identical]
+
+        self.assertTrue(identical, "expected the exact duplicate rows LIS emits")
+        self.assertTrue(versioned, "expected one row per summary version")
+        # Every exact duplicate observed in 20261 was a pair, and nearly all
+        # of them were continued bills.
+        self.assertEqual({len(g) for g in identical}, {2})
+        statuses = {g[0].LegislationStatus for g in identical}
+        self.assertIn("Continued", statuses)
+
+        # Folded in here rather than given its own test: the whole-session
+        # search is the expensive call (5.7 MB) and this is the only place
+        # every label in the session is on hand.
+        self.assertTrue(
+            all(r.summary_rank >= 0 for r in rows),
+            "an unranked SummaryVersion appeared — add it to SUMMARY_VERSION_RANK",
+        )
+
+    def test_the_row_carries_no_date_and_no_lineage(self):
+        rows = self.client.search_legislation(
+            session_code=20261, keyword="firearm", keyword_location="Summary"
+        )
+
+        for field in ("CandidateDate", "VersionDate", "IntroductionDate"):
+            with self.subTest(field=field):
+                self.assertTrue(all(getattr(r, field) is None for r in rows))
+        self.assertTrue(all(r.Sessions == [] for r in rows))
+        self.assertTrue(all(r.LegislationStatusID is None for r in rows))
+
+    def test_paging_parameters_do_nothing(self):
+        # No paging fields exist in the body, so a filter is the only way to
+        # bound the response.
+        first = self.client.search_legislation(
+            session_code=20261, keyword="firearm", keyword_location="Summary"
+        )
+        second = self.client.search_legislation(
+            session_code=20261,
+            keyword="firearm",
+            keyword_location="Summary",
+            extra={"PageNumber": 2, "PageSize": 10},
+        )
+
+        self.assertEqual(len(first), len(second))
+
+    def test_the_service_collapses_to_one_row_per_bill(self):
+        criteria = {
+            "session_code": 20261,
+            "keyword": "firearm",
+            "keyword_location": "Summary",
+        }
+        raw = self.service.search_bills(dedupe=False, **criteria)
+        bills = self.service.search_bills(**criteria)
+
+        self.assertLess(len(bills), len(raw))
+        self.assertEqual(len(bills), len({r.LegislationID for r in raw}))
+        self.assertEqual(len(bills), len({b.LegislationID for b in bills}))
+
+    def test_the_service_keeps_every_summary_version(self):
+        raw = self.service.search_bill_summaries(dedupe=False, session_code=20261, chamber_code="H")
+        rows = self.service.search_bill_summaries(session_code=20261, chamber_code="H")
+        bills = self.service.search_bills(session_code=20261, chamber_code="H")
+
+        self.assertLess(len(rows), len(raw))
+        self.assertGreater(len(rows), len(bills))
+        keys = [(r.LegislationID, r.SummaryVersion) for r in rows]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_the_number_map_is_cheaper_than_the_bill_list(self):
+        numbers = self.client.get_legislative_numbers(session_code=20261)
+
+        self.assertGreater(len(numbers), 3000)
+        by_number = {n.LegislationNumber: n.LegislationID for n in numbers}
+        self.assertEqual(by_number["HB1"], 98525)
+
+    def test_the_number_map_ignores_a_date_range(self):
+        # The spec offers startDate/endDate and LIS ignores them, so they are
+        # off the signature.  A 1990 range returns the whole session.
+        everything = self.client.get_legislative_numbers(session_code=20261)
+        dated = self.client.get_legislative_numbers(session_code=20261)
+
+        self.assertGreater(len(everything), 3000)
+        self.assertEqual(len(everything), len(dated))
+
+    def test_the_list_body_fields_need_their_entries_wrapped(self):
+        # LIS answers 400 to a flat list; the client wraps each entry.
+        by_number = self.client.search_legislation(
+            session_code=20261, legislation_numbers=["HB1", "SB2"]
+        )
+        by_id = self.client.search_legislation(session_code=20261, legislation_ids=[98525])
+
+        self.assertEqual({r.LegislationNumber for r in by_number}, {"HB1", "SB2"})
+        self.assertEqual({r.LegislationNumber for r in by_id}, {"HB1"})
+
+        with self.assertRaises(requests.HTTPError):
+            self.client.search_legislation(
+                session_code=20261, extra={"LegislationNumbers": ["HB1"]}
+            )
+
+    def test_a_compound_keyword_search_rides_extra(self):
+        both = self.client.search_legislation(
+            session_code=20261,
+            keyword_location="Summary",
+            extra={
+                "Keywords": [
+                    {"Keyword": "firearm", "Operator": "AND"},
+                    {"Keyword": "ammunition", "Operator": "AND"},
+                ]
+            },
+        )
+        one = self.client.search_legislation(
+            session_code=20261, keyword="firearm", keyword_location="Summary"
+        )
+
+        self.assertTrue(both)
+        self.assertLess(len(both), len(one))
+
+    def test_the_reference_vocabularies(self):
+        categories = self.client.get_legislation_categories()
+        dates = self.client.get_introduction_dates(session_code=20261)
+
+        self.assertEqual(len(categories), 30)
+        self.assertIn("Introduced", {c.Name for c in categories})
+        self.assertGreater(len(dates), 50)
+        self.assertTrue(all(d.IntroductionDate for d in dates))
+
+    def test_most_frequent_takes_a_session_id_only(self):
+        rows = self.client.get_most_frequent_legislation(self.service.session_id(20261))
+
+        self.assertEqual(len(rows), 100)
+        self.assertTrue(all(r.LegislationNumber for r in rows))
+
+
+@_skip_live
+class LiveMemberBillsSummaryVersionTest(unittest.TestCase):
+    """The member list repeats a bill the same two ways advanced search does.
+
+    Counts come from a 40-member sample of session 20261 taken 2026-09-15.
+    """
+
+    def setUp(self):
+        self.client = LISClient()
+        self.service = LISService(self.client)
+        self.session_id = self.service.session_id(20261)
+
+    def test_this_service_uses_its_own_chamber_label(self):
+        rows = self.client.get_member_legislation(544, self.session_id)
+        labels = {r.SummaryVersion for r in rows}
+
+        self.assertIn("SUMMARY AS PASSED CHAMBER", labels)
+        self.assertNotIn("SUMMARY AS PASSED HOUSE", labels)
+        self.assertNotIn("SUMMARY AS PASSED SENATE", labels)
+
+    def test_every_label_this_service_sends_is_ranked(self):
+        rows = self.client.get_member_legislation(544, self.session_id)
+
+        self.assertTrue(
+            all(summary_version_rank(r.SummaryVersion) >= 0 for r in rows),
+            "an unranked SummaryVersion appeared — add it to SUMMARY_VERSION_RANK",
+        )
+
+    def test_hb1503_arrives_out_of_progression_order(self):
+        # The regression this ranking exists for.  Member 170 patrons HB1503,
+        # and LIS sends its final-passage row before its chamber row.
+        rows = [
+            r
+            for r in self.client.get_member_legislation(170, self.session_id)
+            if r.LegislationNumber == "HB1503"
+        ]
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            [r.SummaryVersion for r in rows],
+            ["SUMMARY AS PASSED", "SUMMARY AS PASSED CHAMBER"],
+        )
+        # Taking the last row would keep the chamber label.
+        self.assertEqual(rows[-1].SummaryVersion, "SUMMARY AS PASSED CHAMBER")
+
+        kept = {b.LegislationID: b for b in self.service.member_bills(170, 20261)}[
+            rows[0].LegislationID
+        ]
+        self.assertEqual(kept.SummaryVersion, "SUMMARY AS PASSED")
+
+    def test_the_rows_also_arrive_as_exact_duplicates(self):
+        rows = self.client.get_member_legislation(544, self.session_id)
+
+        by_id = {}
+        for row in rows:
+            by_id.setdefault(row.LegislationID, []).append(row)
+        groups = [g for g in by_id.values() if len(g) > 1]
+        identical = [g for g in groups if len({r.model_dump_json() for r in g}) < len(g)]
+
+        self.assertTrue(groups, "expected repeated bills")
+        self.assertTrue(identical, "expected byte-identical duplicate rows")
+        self.assertEqual(len(self.service.member_bills(544, 20261)), len(by_id))

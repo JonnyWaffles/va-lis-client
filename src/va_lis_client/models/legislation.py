@@ -217,6 +217,18 @@ class MemberLegislation(Legislation):
     chamber, and as passed, so his 236 rows describe 229 bills.
     :meth:`LISService.member_bills` collapses them to the newest version.
 
+    **This service has its own summary vocabulary.**  It sends four labels,
+    and its chamber passage label is ``SUMMARY AS PASSED CHAMBER``.  It never
+    sends the ``SUMMARY AS PASSED HOUSE`` / ``SUMMARY AS PASSED SENATE`` pair
+    that ``/AdvancedLegislationSearch`` sends, and the search never sends
+    ``CHAMBER``.  Rank either spelling with
+    :func:`~va_lis_client.models.search.summary_version_rank`.
+
+    **Rows also arrive as exact duplicates**, the same defect the search
+    shows: 141 of 198 multi-row groups across a 40-member sample of 20261
+    held two byte identical rows (measured 2026-09-15).  Nothing in the row
+    tells the copies apart, so de-duplicate on ``LegislationID``.
+
     **``Patrons`` is not the bill's patron list.**  It is empty on 177 of
     those 236 rows and holds exactly one entry on the rest, the chief patron
     in the thin shape; the member being listed never appears in it.  Call
