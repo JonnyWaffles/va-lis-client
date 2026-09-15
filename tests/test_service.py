@@ -30,6 +30,7 @@ from va_lis_client.models import (
     Legislation,
     LegislationEvent,
     LegislationEventType,
+    LegislationSearchResult,
     LegislationStatus,
     LegislationSummaryItem,
     LegislationTextDetail,
@@ -42,6 +43,7 @@ from va_lis_client.models import (
     Session,
     Vote,
 )
+from va_lis_client.models.search import UNKNOWN_SUMMARY_RANK, summary_version_rank
 from va_lis_client.service import (
     BillVote,
     LISService,
@@ -281,6 +283,18 @@ def service_with_types():
     return LISService(FakeClient())
 
 
+def search_row(legislation_id, number, summary_version, status="Continued"):
+    """One advanced-search row, trimmed to the fields the grain logic reads."""
+    return LegislationSearchResult(
+        LegislationID=legislation_id,
+        LegislationNumber=number,
+        SummaryVersion=summary_version,
+        LegislationStatus=status,
+        ChamberCode="H",
+        Description="Minimum wage; increases incrementally.",
+    )
+
+
 class FakeClient:
     """A stand-in for LISClient that serves fixtures and counts calls."""
 
@@ -301,6 +315,7 @@ class FakeClient:
         committee_members=None,
         dockets=None,
         docket_details=None,
+        search_results=None,
     ):
         self.events = events if events is not None else []
         self.votes = votes if votes is not None else {}
@@ -345,6 +360,8 @@ class FakeClient:
                 text_detail(266240, "HB1ER"),
             ]
         )
+        self.search_results = search_results if search_results is not None else []
+        self.last_criteria = None
         self.calls = {}
 
     def _count(self, name):
@@ -473,6 +490,165 @@ class FakeClient:
                 DisplayName="Awaiting Governor's Action",
             ),
         ]
+
+    def search_legislation(self, **criteria):
+        self._count("search_legislation")
+        self.last_criteria = criteria
+        return list(self.search_results)
+
+
+class SearchDedupeTest(unittest.TestCase):
+    """The two grains of the advanced search, and the rows LIS doubles up.
+
+    Both duplication causes measured in session 20261 are represented here:
+    one row per summary version, and exact duplicate rows that carry no
+    distinguishing field.
+    """
+
+    def rows(self):
+        return [
+            # A bill that advanced: three rows, one per summary version.  The
+            # chamber row arrives before final passage, as LIS usually sends it.
+            search_row(98641, "HB18", "SUMMARY AS INTRODUCED"),
+            search_row(98641, "HB18", "SUMMARY AS PASSED HOUSE"),
+            search_row(98641, "HB18", "SUMMARY AS PASSED"),
+            # A single-version bill.
+            search_row(98525, "HB1", "SUMMARY AS PASSED"),
+            # An exact duplicate pair, the shape 121 continued bills arrived in.
+            search_row(98671, "HB49", "SUMMARY AS PASSED HOUSE"),
+            search_row(98671, "HB49", "SUMMARY AS PASSED HOUSE"),
+        ]
+
+    def service(self):
+        return LISService(FakeClient(search_results=self.rows()))
+
+    def test_search_bills_returns_one_row_per_bill(self):
+        bills = self.service().search_bills(session_code=20261)
+
+        self.assertEqual([b.LegislationNumber for b in bills], ["HB18", "HB1", "HB49"])
+
+    def test_search_bills_keeps_the_furthest_along_summary(self):
+        bills = {b.LegislationID: b for b in self.service().search_bills(session_code=20261)}
+
+        self.assertEqual(bills[98641].SummaryVersion, "SUMMARY AS PASSED")
+
+    def test_search_bills_ranks_the_label_rather_than_arrival_order(self):
+        # HB1503 and SB605 really arrive this way in 20261: final passage
+        # first, chamber passage second.  Keeping the last row would lose.
+        client = FakeClient(
+            search_results=[
+                search_row(99000, "HB1503", "SUMMARY AS PASSED"),
+                search_row(99000, "HB1503", "SUMMARY AS PASSED HOUSE"),
+            ]
+        )
+        bills = LISService(client).search_bills(session_code=20261)
+
+        self.assertEqual(len(bills), 1)
+        self.assertEqual(bills[0].SummaryVersion, "SUMMARY AS PASSED")
+
+    def test_an_unknown_summary_label_loses_to_a_known_one(self):
+        client = FakeClient(
+            search_results=[
+                search_row(99001, "HB2", "SUMMARY AS PASSED"),
+                search_row(99001, "HB2", "SUMMARY AS SOMETHING LIS ADDED"),
+            ]
+        )
+        bills = LISService(client).search_bills(session_code=20261)
+
+        self.assertEqual(bills[0].SummaryVersion, "SUMMARY AS PASSED")
+
+    def test_search_bill_summaries_keeps_every_version(self):
+        rows = self.service().search_bill_summaries(session_code=20261)
+
+        self.assertEqual(
+            [(r.LegislationNumber, r.SummaryVersion) for r in rows],
+            [
+                ("HB18", "SUMMARY AS INTRODUCED"),
+                ("HB18", "SUMMARY AS PASSED HOUSE"),
+                ("HB18", "SUMMARY AS PASSED"),
+                ("HB1", "SUMMARY AS PASSED"),
+                ("HB49", "SUMMARY AS PASSED HOUSE"),
+            ],
+        )
+
+    def test_search_bill_summaries_drops_only_the_exact_duplicates(self):
+        rows = self.service().search_bill_summaries(session_code=20261)
+
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(sum(1 for r in rows if r.LegislationID == 98671), 1)
+
+    def test_dedupe_false_hands_back_every_row_on_both_methods(self):
+        service = self.service()
+
+        self.assertEqual(len(service.search_bills(dedupe=False, session_code=20261)), 6)
+        self.assertEqual(len(service.search_bill_summaries(dedupe=False, session_code=20261)), 6)
+
+    def test_criteria_reach_the_client_untouched(self):
+        client = FakeClient(search_results=self.rows())
+        LISService(client).search_bills(session_code=20261, keyword="firearm", chamber_code="H")
+
+        self.assertEqual(
+            client.last_criteria,
+            {"session_code": 20261, "keyword": "firearm", "chamber_code": "H"},
+        )
+
+    def test_neither_method_caches(self):
+        # The criteria vary per call, so a cache would serve the wrong rows.
+        client = FakeClient(search_results=self.rows())
+        service = LISService(client)
+        service.search_bills(session_code=20261)
+        service.search_bills(session_code=20261)
+
+        self.assertEqual(client.calls["search_legislation"], 2)
+
+    def test_an_empty_result_stays_empty(self):
+        service = LISService(FakeClient(search_results=[]))
+
+        self.assertEqual(service.search_bills(session_code=20261), [])
+        self.assertEqual(service.search_bill_summaries(session_code=20261), [])
+
+
+class SummaryVersionRankTest(unittest.TestCase):
+    def test_the_progression_orders_lowest_first(self):
+        self.assertLess(
+            summary_version_rank("SUMMARY AS INTRODUCED"),
+            summary_version_rank("SUMMARY AS PASSED HOUSE"),
+        )
+        self.assertLess(
+            summary_version_rank("SUMMARY AS PASSED HOUSE"),
+            summary_version_rank("SUMMARY AS PASSED"),
+        )
+        self.assertLess(
+            summary_version_rank("SUMMARY AS PASSED"),
+            summary_version_rank("SUMMARY AS ENACTED WITH GOVERNOR'S RECOMMENDATION"),
+        )
+
+    def test_the_three_chamber_spellings_tie(self):
+        # Advanced search says HOUSE/SENATE, /LegislationByMember says
+        # CHAMBER, and neither service ever sends the other's spelling.
+        self.assertEqual(
+            summary_version_rank("SUMMARY AS PASSED HOUSE"),
+            summary_version_rank("SUMMARY AS PASSED SENATE"),
+        )
+        self.assertEqual(
+            summary_version_rank("SUMMARY AS PASSED HOUSE"),
+            summary_version_rank("SUMMARY AS PASSED CHAMBER"),
+        )
+
+    def test_the_member_list_chamber_label_sits_between_introduced_and_passed(self):
+        self.assertLess(
+            summary_version_rank("SUMMARY AS INTRODUCED"),
+            summary_version_rank("SUMMARY AS PASSED CHAMBER"),
+        )
+        self.assertLess(
+            summary_version_rank("SUMMARY AS PASSED CHAMBER"),
+            summary_version_rank("SUMMARY AS PASSED"),
+        )
+
+    def test_an_unknown_or_missing_label_sorts_below_every_known_one(self):
+        self.assertEqual(summary_version_rank("SUMMARY AS SOMETHING NEW"), UNKNOWN_SUMMARY_RANK)
+        self.assertEqual(summary_version_rank(None), UNKNOWN_SUMMARY_RANK)
+        self.assertLess(summary_version_rank(None), summary_version_rank("SUMMARY AS INTRODUCED"))
 
 
 class NormalizeBillNumberTest(unittest.TestCase):
@@ -1387,6 +1563,54 @@ class MemberBillsTest(unittest.TestCase):
 
         self.assertEqual([b.LegislationNumber for b in bills], ["HB18", "HB64"])
         self.assertEqual(bills[0].SummaryVersion, "SUMMARY AS PASSED")
+
+    def test_the_rank_beats_the_arrival_order(self):
+        # HB1503 really arrives this way for member 170 in 20261: final
+        # passage first, chamber passage second.  Keeping the last row kept
+        # the older label.
+        client = FakeClient(
+            member_legislation={
+                None: [
+                    member_bill(99500, "HB1503", "SUMMARY AS PASSED"),
+                    member_bill(99500, "HB1503", "SUMMARY AS PASSED CHAMBER"),
+                ]
+            }
+        )
+        bills = LISService(client).member_bills(170, 20261)
+
+        self.assertEqual(len(bills), 1)
+        self.assertEqual(bills[0].SummaryVersion, "SUMMARY AS PASSED")
+
+    def test_this_services_chamber_label_is_ranked(self):
+        # /LegislationByMember says "PASSED CHAMBER" where the search says
+        # "PASSED HOUSE".  An unranked label here would keep introduction.
+        client = FakeClient(
+            member_legislation={
+                None: [
+                    member_bill(98641, "HB18", "SUMMARY AS INTRODUCED"),
+                    member_bill(98641, "HB18", "SUMMARY AS PASSED CHAMBER"),
+                ]
+            }
+        )
+        bills = LISService(client).member_bills(544, 20261)
+
+        self.assertEqual(bills[0].SummaryVersion, "SUMMARY AS PASSED CHAMBER")
+
+    def test_exact_duplicate_rows_collapse(self):
+        # 141 of 198 multi-row groups in a 40-member sample of 20261 were
+        # byte-identical pairs, not version splits.
+        client = FakeClient(
+            member_legislation={
+                None: [
+                    member_bill(98800, "HB334", "SUMMARY AS INTRODUCED"),
+                    member_bill(98800, "HB334", "SUMMARY AS INTRODUCED"),
+                ]
+            }
+        )
+        bills = LISService(client).member_bills(544, 20261)
+
+        self.assertEqual(len(bills), 1)
+        self.assertEqual(bills[0].SummaryVersion, "SUMMARY AS INTRODUCED")
 
     def test_sends_the_session_id_not_the_code(self):
         """The endpoint mis-caches session codes, so only the ID is safe."""

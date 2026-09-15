@@ -15,6 +15,9 @@ Modules:
     committee    — CommitteeFile, Committee, CommitteeMember, CommitteeRole,
                    CommitteeAction
     schedule     — Schedule, ScheduleFile, ScheduleType, MeetingRoom
+    search       — LegislationSearchResult, SearchTextMatch, LegislationCategory,
+                   LegislationNumberEntry, IntroductionDate,
+                   SUMMARY_VERSION_RANK, summary_version_rank
     calendar     — CalendarFile, CalendarComment, CalendarItem,
                    AgendaItem, Agenda, CalendarCategory, Staff, CalendarDetail,
                    CalendarType, CalendarCategoryType
@@ -84,6 +87,16 @@ from va_lis_client.models.pagination import (
     page_request_header,
 )
 from va_lis_client.models.schedule import MeetingRoom, Schedule, ScheduleFile, ScheduleType
+from va_lis_client.models.search import (
+    SUMMARY_VERSION_RANK,
+    UNKNOWN_SUMMARY_RANK,
+    IntroductionDate,
+    LegislationCategory,
+    LegislationNumberEntry,
+    LegislationSearchResult,
+    SearchTextMatch,
+    summary_version_rank,
+)
 from va_lis_client.models.session import Session, SessionEvent
 from va_lis_client.models.text import (
     LegislationSummary,
@@ -125,6 +138,15 @@ __all__ = [
     "LegislationTextDetail",
     "LegislationTextItem",
     "TextFile",
+    # search
+    "SUMMARY_VERSION_RANK",
+    "UNKNOWN_SUMMARY_RANK",
+    "IntroductionDate",
+    "LegislationCategory",
+    "LegislationNumberEntry",
+    "LegislationSearchResult",
+    "SearchTextMatch",
+    "summary_version_rank",
     # committee
     "Committee",
     "CommitteeAction",
