@@ -1521,3 +1521,206 @@ class LiveMemberBillsSummaryVersionTest(unittest.TestCase):
         self.assertTrue(groups, "expected repeated bills")
         self.assertTrue(identical, "expected byte-identical duplicate rows")
         self.assertEqual(len(self.service.member_bills(544, 20261)), len(by_id))
+
+
+@_skip_live
+class LiveStatisticsTest(unittest.TestCase):
+    """Session counts, checked against the bill number lists LIS also publishes.
+
+    Exact counts are pinned only for 20241 and 20251, which are settled.
+    """
+
+    def setUp(self):
+        self.client = LISClient()
+
+    def counted(self, session_code):
+        numbers = self.client.get_legislative_numbers(session_code=session_code)
+        return Counter(n.LegislationNumber[:2] for n in numbers)
+
+    def test_a_settled_session_has_a_row_per_chamber_and_type(self):
+        rows = self.client.get_chamber_statistics(session_code=20251)
+
+        self.assertEqual(
+            {r.ChamberCode + r.LegislationTypeCode for r in rows},
+            {"HB", "HJ", "HR", "SB", "SJ", "SR"},
+        )
+
+    def test_either_session_form_answers_the_same(self):
+        by_code = self.client.get_chamber_statistics(session_code=20261)
+        by_id = self.client.get_chamber_statistics(session_id=59)
+
+        self.assertEqual(by_code, by_id)
+
+    def test_a_session_is_required(self):
+        with self.assertRaises(requests.HTTPError):
+            self.client.get_chamber_statistics()
+
+    def test_20251_totals_match_its_bill_number_list(self):
+        rows = self.client.get_chamber_statistics(session_code=20251)
+
+        totals = {r.ChamberCode + r.LegislationTypeCode: r.total for r in rows}
+        self.assertEqual(totals, dict(self.counted(20251)))
+        self.assertEqual(sum(totals.values()), 3512)
+
+    def test_20251_outcomes_partition_the_total(self):
+        """Failed includes the carried over bills that died."""
+        for r in self.client.get_chamber_statistics(session_code=20251):
+            self.assertEqual(r.Passed + r.Failed + r.Incorporated, r.total, r)
+
+    def test_20241_miscounts_house_resolutions_by_one(self):
+        rows = {
+            r.ChamberCode + r.LegislationTypeCode: r
+            for r in self.client.get_chamber_statistics(session_code=20241)
+        }
+        counted = self.counted(20241)
+
+        self.assertEqual(rows["HR"].total, 452)
+        self.assertEqual(counted["HR"], 453)
+        self.assertEqual(rows["HB"].total, counted["HB"])
+        self.assertEqual({r.Incorporated for r in rows.values()}, {0})
+
+    def test_committee_rows_are_standing_committees_only(self):
+        house = self.client.get_committee_statistics("H", session_code=20261)
+        senate = self.client.get_committee_statistics("S", session_code=20261)
+
+        self.assertEqual(len(house), 14)
+        self.assertEqual(len(senate), 11)
+        self.assertTrue(all(r.CommitteeNumber.startswith("H") for r in house))
+
+    def test_the_committee_ids_are_honest(self):
+        committees = {c.CommitteeID: c for c in self.client.get_committees()}
+
+        for r in self.client.get_committee_statistics("S", session_code=20261):
+            self.assertEqual(committees[r.CommitteeID].CommitteeNumber, r.CommitteeNumber)
+            self.assertEqual(committees[r.CommitteeID].Name, r.CommitteeName)
+
+    def test_20251_lacks_two_house_committees(self):
+        rows = self.client.get_committee_statistics("H", session_code=20251)
+
+        numbers = {r.CommitteeNumber for r in rows}
+        self.assertEqual(len(numbers), 12)
+        self.assertFalse(numbers & {"H18", "H24"})
+
+    def test_the_committee_call_needs_a_chamber(self):
+        with self.assertRaises(requests.HTTPError):
+            self.client._get("/Statistics/api/getcommitteestatisticsasync", {"sessionCode": 20261})
+
+    def test_an_unknown_chamber_answers_nothing(self):
+        self.assertEqual(self.client.get_committee_statistics("X", session_code=20261), [])
+
+
+@_skip_live
+class LiveBillVersionTest(unittest.TestCase):
+    """One bill's published versions, and the bulk form by id.
+
+    HB1 and HB1503 of 20261 are chaptered, and HB1013 is the settled 2024 to
+    2025 carry over, so their versions are fixed.
+    """
+
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_hb1_ends_in_its_chapter(self):
+        rows = self.client.get_bill_versions("HB1", session_code=20261)
+
+        self.assertEqual([r.Version for r in rows], ["Introduced", "Enrolled", "Chaptered"])
+        self.assertEqual([r.DocumentCode for r in rows], ["HB1", "HB1ER", "CHAP0350"])
+        self.assertEqual({r.LegislationID for r in rows}, {98525})
+
+    def test_the_rows_are_the_text_lists_records(self):
+        versions = self.client.get_bill_versions("HB1503", session_code=20261)
+        texts = self.client.get_bill_texts(legislation_number="HB1503", session_code=20261)
+
+        self.assertEqual(len(versions), 6)
+        self.assertEqual(
+            {v.LegislationTextID for v in versions},
+            {t.LegislationTextID for t in texts},
+        )
+
+    def test_the_version_type_join_holds(self):
+        vocabulary = {
+            v.LegislationVersionID: v.Name for v in self.client.get_legislation_versions()
+        }
+
+        for r in self.client.get_bill_versions("HB1503", session_code=20261):
+            self.assertEqual(vocabulary[r.LegislationVersionID], r.Version)
+
+    def test_substitute_codes_ignore_the_vocabulary_suffix(self):
+        rows = self.client.get_bill_versions("HB1503", session_code=20261)
+
+        substitutes = [r.DocumentCode for r in rows if r.Version == "Substitute"]
+        self.assertEqual(substitutes, ["HB1503HC1", "HB1503HC2", "HB1503H1"])
+
+    def test_either_session_form_and_any_case_answer_the_same(self):
+        by_code = self.client.get_bill_versions("hb1", session_code=20261)
+        by_id = self.client.get_bill_versions("HB1", session_id=59)
+
+        self.assertEqual(by_code, by_id)
+
+    def test_a_padded_number_answers_nothing(self):
+        self.assertEqual(self.client.get_bill_versions("HB0001", session_code=20261), [])
+
+    def test_a_session_is_required(self):
+        with self.assertRaises(requests.HTTPError):
+            self.client.get_bill_versions("HB1")
+
+    def test_a_carried_bill_answers_with_its_even_year_rows(self):
+        odd = self.client.get_bill_versions("HB1013", session_code=20251)
+        even = self.client.get_bill_versions("HB1013", session_code=20241)
+
+        self.assertEqual(odd, even)
+        self.assertEqual({r.SessionID for r in odd}, {55})
+
+    def test_only_the_single_id_request_returns_files(self):
+        by_id = self.client.get_bill_versions_by_id(98525)
+        by_number = self.client.get_bill_versions("HB1", session_code=20261)
+        bulk = self.client.get_bill_versions_by_id(legislation_ids=[98525, 101040])
+
+        self.assertEqual(
+            [v.LegislationTextID for v in by_id],
+            [v.LegislationTextID for v in by_number],
+        )
+        self.assertEqual([len(v.PdfFile) for v in by_id], [1, 1, 1])
+        self.assertEqual(by_id[0].HtmlFile[0].TextFormat, "HTML")
+        self.assertTrue(all(v.PdfFile == [] and v.HtmlFile == [] for v in by_number + bulk))
+
+    def test_the_service_fetches_files_when_asked(self):
+        grouped = LISService(self.client).bill_versions(["HB1"], 20261, with_files=True)
+
+        self.assertTrue(all(v.PdfFile for v in grouped["HB1"]))
+
+    def test_the_bulk_form_interleaves_bills_by_date(self):
+        rows = self.client.get_bill_versions_by_id(legislation_ids=[101040, 98525])
+
+        self.assertEqual(
+            [r.LegislationID for r in rows],
+            [98525, 101040, 101040, 101040, 101040, 98525, 101040, 98525, 101040],
+        )
+        dates = [r.DraftDate for r in rows]
+        self.assertEqual(dates, sorted(dates))
+
+    def test_the_service_regroups_the_bulk_rows(self):
+        grouped = LISService(self.client).bill_versions(["HB1503", "hb1"], 20261)
+
+        self.assertEqual(list(grouped), ["HB1503", "HB1"])
+        self.assertEqual([r.LegislationTextID for r in grouped["HB1"]], [257719, 266240, 268485])
+        self.assertEqual(len(grouped["HB1503"]), 6)
+
+    def test_is_active_does_not_pick_one_version(self):
+        two = self.client.get_bill_versions("SB633", session_code=20241)
+        none = self.client.get_bill_versions("HB241", session_code=20241)
+
+        self.assertEqual(sum(r.IsActive for r in two), 2)
+        self.assertEqual(sum(r.IsActive for r in none), 0)
+
+    def test_chamber_code_names_the_chamber_that_made_the_version(self):
+        rows = self.client.get_bill_versions("HB145", session_code=20261)
+
+        senate = [r for r in rows if r.ChamberCode == "S"]
+        self.assertEqual([r.DocumentCode for r in senate], ["HB145S1"])
+
+    def test_2024_rows_are_padded_and_omit_the_disposition(self):
+        rows = self.client.get_bill_versions("HB1", session_code=20241)
+
+        self.assertEqual({r.DocumentCode for r in rows}, {"HB1", "HB1ER", "HB1AG"})
+        self.assertTrue(all(r.TextDisposition is None for r in rows))

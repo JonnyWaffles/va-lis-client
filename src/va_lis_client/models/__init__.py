@@ -13,6 +13,9 @@ Modules:
                    PATRON_ROLES
     text         — TextFile, LegislationTextItem, LegislationTextDetail,
                    LegislationSummary
+    bill_version — BillVersion (one bill's versions; not LegislationVersion,
+                   which is the version type vocabulary)
+    statistics   — ChamberStatistic, CommitteeStatistic
     committee    — CommitteeFile, Committee, CommitteeMember, CommitteeRole,
                    CommitteeAction
     communication — CommunicationFile, CommunicationLegislation,
@@ -43,6 +46,7 @@ Modules:
     pagination   — Pagination, PagedList, page_request_header
 """
 
+from va_lis_client.models.bill_version import BillVersion
 from va_lis_client.models.calendar import (
     Agenda,
     AgendaItem,
@@ -141,6 +145,7 @@ from va_lis_client.models.search import (
     summary_version_rank,
 )
 from va_lis_client.models.session import Session, SessionEvent
+from va_lis_client.models.statistics import ChamberStatistic, CommitteeStatistic
 from va_lis_client.models.text import (
     LegislationSummary,
     LegislationTextDetail,
@@ -183,6 +188,11 @@ __all__ = [
     "LegislationTextDetail",
     "LegislationTextItem",
     "TextFile",
+    # bill_version
+    "BillVersion",
+    # statistics
+    "ChamberStatistic",
+    "CommitteeStatistic",
     # search
     "SUMMARY_VERSION_RANK",
     "UNKNOWN_SUMMARY_RANK",
