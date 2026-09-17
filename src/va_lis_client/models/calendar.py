@@ -308,3 +308,66 @@ class CalendarCategoryType(LISModel):
     DisplayType: bool = False
     OnDemand: bool = False
     ClerksCopy: bool = False
+
+
+class CategoryType(LISModel):
+    """The 8 coarse category types, from ``getcategorytypesreferenceasync``.
+
+    The vocabulary behind ``CategoryTypeID`` on
+    :class:`~va_lis_client.models.minutes.MinutesCategory` and on
+    :class:`CalendarCategoryType`.  Not to be confused with
+    :class:`CalendarCategoryType`, which is the 98-row *code* vocabulary.
+
+    Example::
+
+        {"CategoryTypeID": 1, "Name": "Order"}
+        {"CategoryTypeID": 3, "Name": "Uncontested Calendar"}
+    """
+
+    CategoryTypeID: int
+    Name: str | None = None  # e.g. "Order", "Regular Calendar"
+
+
+class CalendarAction(LISModel):
+    """The action vocabulary behind a calendar, docket, or minutes activity.
+
+    This is what resolves
+    :attr:`~va_lis_client.models.minutes.MinutesActivity.CalendarActionID`.
+    Checked against Senate minutes book 3861 on 2026-09-15: 204 of its 205
+    activities resolved here, and the ``EventCode`` agreed on all 204.
+
+    **4,952 rows hold only 490 distinct ``CalendarActionID``.**  The repeats
+    are one row per calendar category the action can appear under, so
+    ``CalendarActionID`` 1016 arrives 84 times, identical except for
+    :attr:`CategoryCode` and :attr:`CalendarCategoryTypeID`, all 84 carrying
+    ``EventCode`` ``"H4000"``.  Index it as id to *list of rows*, the same
+    way :meth:`~va_lis_client.service.LISService.event_types_by_code` handles
+    the repeated event codes.
+
+    :attr:`Description` is the clean label.  A minutes activity's own
+    ``ActionDescription`` is the filled-in version of it, so action 3675
+    reads ``"Call to Order"`` here and ``"Called to Order at 12 m. by Lt.
+    Governor Ghazala F. Hashmi"`` in the book.
+
+    Example::
+
+        {"CalendarActionID": 2, "EventCode": "C6019",
+         "Description": "Conferees cannot agree",
+         "JournalDescription": "Conferees cannot agree ",
+         "IsPassed": true, "CategoryCode": "HOUBRC",
+         "CalendarCategoryTypeID": 5, "LegislationChamberCode": "H",
+         "ActionReferences": []}
+    """
+
+    CalendarActionID: int  # NOT unique across rows — see the class docstring
+    EventCode: str | None = None  # joins the event vocabulary, e.g. "H4000"
+    Description: str | None = None  # the clean label
+    JournalDescription: str | None = None  # LIS pads this; LISModel strips it
+    VoteDescription: str | None = None
+    CategoryCode: str | None = None  # why the row repeats
+    CalendarCategoryTypeID: int | None = None  # why the row repeats
+    ChamberCode: str | None = None  # null in practice
+    LegislationChamberCode: str | None = None
+    IsPassed: bool | None = None
+    InPreview: bool | None = None
+    ActionReferences: list[dict] = []

@@ -22,6 +22,7 @@ from va_lis_client.exceptions import (
 )
 from va_lis_client.models import (
     CHIEF_PATRON,
+    CalendarAction,
     CalendarDetail,
     Committee,
     CommitteeMember,
@@ -38,6 +39,11 @@ from va_lis_client.models import (
     Member,
     MemberLegislation,
     MemberVoteResult,
+    MinutesActivity,
+    MinutesBook,
+    MinutesBookListItem,
+    MinutesEntry,
+    MinutesSummary,
     Patron,
     Schedule,
     Session,
@@ -279,6 +285,82 @@ def docket_detail(docket_id=21123, bills=("HB128", "HB148"), extras=0, room="Sen
     )
 
 
+def minutes_row(book_id=3861, committee_id=None, chamber="S", when="2026-04-22T00:00:00"):
+    """One shallow book row.  A floor book omits ``CommitteeID`` entirely."""
+    fields = {
+        "MinutesBookID": book_id,
+        "ChamberCode": chamber,
+        "MinutesDate": when,
+        "MinutesStatus": "Closed",
+        "IsCommittee": False,
+        "MinutesFiles": [
+            {"MinutesFileID": 1, "FileURL": "https://x/1.HTML", "TextFormatID": 2},
+            {"MinutesFileID": 2, "FileURL": "https://x/2.JSON", "TextFormatID": 5},
+        ],
+    }
+    if committee_id is not None:
+        fields["CommitteeID"] = committee_id
+        fields["CommitteeName"] = "Courts of Justice"
+
+    return MinutesBookListItem(**fields)
+
+
+def minutes_detail(
+    book_id=3861,
+    bills=("SB2", "SB24"),
+    extras=0,
+    block_vote=False,
+    committee_id=None,
+):
+    """A book whose bill entries each carry one voting activity.
+
+    Leave ``committee_id`` unset for a floor book, which is the shape that
+    omits the committee fields entirely.
+    """
+    entries = [
+        {
+            "MinutesEntryID": 31000 + i,
+            "LegislationID": 98000 + i,
+            "LegislationNumber": number,
+            "LegislationDescription": f"{number}; a description.",
+            "MinutesActivities": [
+                {
+                    "MinutesActivityID": 36000 + i,
+                    "Description": f"Senate agreed to {number}",
+                    "EventCode": "S7300",
+                    "VoteID": 302317 if block_vote else 302000 + i,
+                    "VoteNumber": "SV1526" if block_vote else f"SV{1500 + i}",
+                    "VoteTally": "block vote (21-Y 18-N 0-A)" if block_vote else "(21-Y 18-N 0-A)",
+                    "IsBlock": block_vote,
+                }
+            ],
+        }
+        for i, number in enumerate(bills, start=1)
+    ]
+    entries += [
+        {
+            "MinutesEntryID": 31900 + i,
+            "EntryText": "Recess",
+            "MinutesActivities": [{"MinutesActivityID": 36900 + i, "Description": "Recess"}],
+        }
+        for i in range(extras)
+    ]
+
+    fields = {
+        "MinutesBookID": book_id,
+        "ChamberCode": "S",
+        "MinutesDate": "2026-04-22T00:00:00",
+        "MinutesCategories": [
+            {"MinutesCategoryID": 3056, "CategoryType": "General", "MinutesEntries": entries}
+        ],
+    }
+    if committee_id is not None:
+        fields["CommitteeID"] = committee_id
+        fields["CommitteeName"] = "Courts of Justice"
+
+    return MinutesBook(**fields)
+
+
 def service_with_types():
     return LISService(FakeClient())
 
@@ -315,6 +397,9 @@ class FakeClient:
         committee_members=None,
         dockets=None,
         docket_details=None,
+        minutes_books=None,
+        minutes_details=None,
+        calendar_actions=None,
         search_results=None,
     ):
         self.events = events if events is not None else []
@@ -342,6 +427,11 @@ class FakeClient:
         # Keyed by CommitteeID, then by DocketID.
         self.dockets = dockets if dockets is not None else {}
         self.docket_details = docket_details if docket_details is not None else {}
+        self.minutes_books = minutes_books if minutes_books is not None else []
+        # Keyed by MinutesBookID.
+        self.minutes_details = minutes_details if minutes_details is not None else {}
+        self.last_minutes_filters = None
+        self.calendar_actions = calendar_actions if calendar_actions is not None else []
         self.bills = bills if bills is not None else [bill_row()]
         self.detail = detail if detail is not None else bill_detail()
         self.texts = (
@@ -479,6 +569,37 @@ class FakeClient:
     def get_docket(self, docket_id):
         self._count("get_docket")
         return self.docket_details.get(docket_id)
+
+    def get_minutes_books(
+        self,
+        *,
+        session_code=None,
+        session_id=None,
+        committee_id=None,
+        chamber_code=None,
+        start_date=None,
+        end_date=None,
+    ):
+        self._count("get_minutes_books")
+        self.last_minutes_filters = {
+            "session_code": session_code,
+            "committee_id": committee_id,
+            "chamber_code": chamber_code,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        if committee_id is not None:
+            return [b for b in self.minutes_books if b.CommitteeID == committee_id]
+
+        return list(self.minutes_books)
+
+    def get_minutes_book(self, minutes_book_id=None, calendar_id=None):
+        self._count("get_minutes_book")
+        return self.minutes_details.get(minutes_book_id)
+
+    def get_calendar_actions(self):
+        self._count("get_calendar_actions")
+        return list(self.calendar_actions)
 
     def get_legislation_statuses(self):
         self._count("get_legislation_statuses")
@@ -1936,6 +2057,209 @@ class DocketEntriesTest(unittest.TestCase):
         entries = LISService(client).docket_entries(202, 20261)
 
         self.assertEqual([e.bill_number for e in entries], ["HB128", "HB148"])
+
+
+class MinutesRecordsTest(unittest.TestCase):
+    """The day's proceedings, flattened to one row per action."""
+
+    def client(self):
+        return FakeClient(
+            minutes_books=[minutes_row(3861), minutes_row(3858, committee_id=202)],
+            minutes_details={
+                3861: minutes_detail(3861, ("SB2", "SB24"), extras=2),
+                3858: minutes_detail(3858, ("HJ116",), committee_id=202),
+            },
+        )
+
+    def test_flattens_every_activity_on_every_bill_entry(self):
+        records = LISService(self.client()).minutes_records(3861)
+
+        self.assertEqual([r.bill_number for r in records], ["SB2", "SB24"])
+        self.assertEqual(records[0].event_code, "S7300")
+        self.assertEqual(records[0].tally, "(21-Y 18-N 0-A)")
+        self.assertEqual(records[0].vote_id, 302001)
+        self.assertEqual(records[0].date.isoformat(), "2026-04-22T00:00:00")
+
+    def test_procedural_entries_come_back_only_when_asked(self):
+        service = LISService(self.client())
+
+        self.assertEqual(len(service.minutes_records(3861)), 2)
+        self.assertEqual(len(service.minutes_records(3861, bills_only=False)), 4)
+
+    def test_body_names_the_committee_or_falls_back_to_the_chamber(self):
+        service = LISService(self.client())
+
+        self.assertEqual(service.minutes_records(3861)[0].body, "S")
+        self.assertEqual(service.minutes_records(3858)[0].body, "Courts of Justice")
+
+    def test_a_block_vote_is_flagged_on_every_bill_it_disposed_of(self):
+        client = self.client()
+        client.minutes_details[3861] = minutes_detail(3861, ("SB2", "SB24"), block_vote=True)
+
+        records = LISService(client).minutes_records(3861)
+
+        self.assertTrue(all(r.is_block for r in records))
+        self.assertEqual({r.vote_id for r in records}, {302317})
+        self.assertTrue(all(r.tally.startswith("block vote") for r in records))
+
+    def test_caches_the_book_between_calls(self):
+        client = self.client()
+        service = LISService(client)
+
+        service.minutes_records(3861)
+        service.minutes_records(3861, bills_only=False)
+
+        self.assertEqual(client.calls["get_minutes_book"], 1)
+
+    def test_refresh_refetches_the_book(self):
+        client = self.client()
+        service = LISService(client)
+
+        service.minutes_records(3861)
+        service.minutes_records(3861, refresh=True)
+
+        self.assertEqual(client.calls["get_minutes_book"], 2)
+
+    def test_a_book_that_answers_nothing_is_empty_not_an_error(self):
+        self.assertEqual(LISService(self.client()).minutes_records(9999), [])
+
+    def test_lists_resolve_a_committee_name_to_an_id(self):
+        client = self.client()
+        service = LISService(client)
+
+        books = service.minutes_books(20261, committee="Courts of Justice", chamber_code="S")
+
+        self.assertEqual([b.MinutesBookID for b in books], [3858])
+        self.assertEqual(client.last_minutes_filters["committee_id"], 202)
+
+    def test_list_filters_pass_straight_through(self):
+        client = self.client()
+
+        LISService(client).minutes_books(
+            20261, chamber_code="S", start_date=date(2026, 1, 14), end_date="2026-01-31"
+        )
+
+        self.assertEqual(
+            client.last_minutes_filters,
+            {
+                "session_code": 20261,
+                "committee_id": None,
+                "chamber_code": "S",
+                "start_date": date(2026, 1, 14),
+                "end_date": "2026-01-31",
+            },
+        )
+
+
+class CalendarActionLookupTest(unittest.TestCase):
+    """One CalendarActionID maps to many rows, so EventCode breaks the tie."""
+
+    def client(self):
+        return FakeClient(
+            calendar_actions=[
+                CalendarAction(CalendarActionID=1016, EventCode="H4000", CategoryCode="AHA"),
+                CalendarAction(CalendarActionID=1016, EventCode="H4000", CategoryCode="BC"),
+                CalendarAction(
+                    CalendarActionID=2485, EventCode="00026", Description="ROLL CALL OF MEMBERS:"
+                ),
+                CalendarAction(CalendarActionID=2485, EventCode="S9999", Description="Other"),
+            ]
+        )
+
+    def test_indexes_every_row_under_its_id(self):
+        index = LISService(self.client()).calendar_actions_by_id()
+
+        self.assertEqual(sorted(index), [1016, 2485])
+        self.assertEqual(len(index[1016]), 2)
+
+    def test_fetches_the_vocabulary_once(self):
+        client = self.client()
+        service = LISService(client)
+
+        service.calendar_actions_by_id()
+        service.calendar_actions_by_id()
+
+        self.assertEqual(client.calls["get_calendar_actions"], 1)
+
+    def test_the_event_code_picks_the_right_row(self):
+        service = LISService(self.client())
+
+        row = service.action_for(MinutesActivity(CalendarActionID=2485, EventCode="00026"))
+
+        self.assertEqual(row.Description, "ROLL CALL OF MEMBERS:")
+
+    def test_falls_back_to_the_first_row_when_the_code_does_not_match(self):
+        service = LISService(self.client())
+
+        row = service.action_for(MinutesActivity(CalendarActionID=2485, EventCode="NOPE"))
+
+        self.assertEqual(row.Description, "ROLL CALL OF MEMBERS:")
+
+    def test_an_activity_with_no_action_resolves_to_nothing(self):
+        service = LISService(self.client())
+
+        self.assertIsNone(service.action_for(MinutesActivity()))
+        self.assertIsNone(service.action_for(MinutesActivity(CalendarActionID=999999)))
+
+
+class MinutesShapesTest(unittest.TestCase):
+    """The model-level traps LIS sets in a minutes payload."""
+
+    def test_a_floor_book_is_the_one_with_no_committee(self):
+        """``IsCommittee`` is False on every row, so ``CommitteeID`` decides."""
+        floor = minutes_row(3861)
+        committee = minutes_row(3858, committee_id=202)
+
+        self.assertTrue(floor.is_floor)
+        self.assertFalse(committee.is_floor)
+        self.assertFalse(committee.IsCommittee)
+
+    def test_the_generated_files_split_by_format_id(self):
+        book = minutes_row(3861)
+
+        self.assertEqual(book.html_file.FileURL, "https://x/1.HTML")
+        self.assertEqual(book.json_file.FileURL, "https://x/2.JSON")
+        self.assertIsNone(MinutesBookListItem(MinutesBookID=1).html_file)
+
+    def test_a_book_flattens_its_categories_and_keeps_bill_entries_apart(self):
+        book = minutes_detail(bills=("SB2", "SB24"), extras=3)
+
+        self.assertEqual(len(book.entries), 5)
+        self.assertEqual([e.LegislationNumber for e in book.bill_entries], ["SB2", "SB24"])
+        self.assertEqual(len(book.activities), 5)
+
+    def test_an_entry_with_no_bill_number_is_procedural(self):
+        book = minutes_detail(bills=("SB2",), extras=1)
+
+        self.assertTrue(book.entries[0].is_bill)
+        self.assertFalse(book.entries[1].is_bill)
+
+    def test_a_voice_vote_is_read_off_the_tally_string(self):
+        recorded = MinutesActivity(VoteID=1, VoteTally="(21-Y 18-N 0-A)")
+        voice = MinutesActivity(VoteID=2, VoteTally="(Voice Vote)")
+
+        self.assertFalse(recorded.is_voice)
+        self.assertTrue(voice.is_voice)
+        self.assertFalse(MinutesActivity().is_voice)
+
+    def test_a_summary_is_aliased_off_the_colliding_payload_key(self):
+        summary = MinutesSummary.model_validate(
+            {"MinutesEntryID": 31341, "MinutesSummary": "<p>The Senate recessed.</p>"}
+        )
+
+        self.assertEqual(summary.summary, "<p>The Senate recessed.</p>")
+
+    def test_the_nulls_lis_sends_on_booleans_do_not_break_validation(self):
+        """``PendingChange``, ``IsOOB`` and ``ReleaseToPreview`` arrive null."""
+        book = MinutesBookListItem.model_validate(
+            {"MinutesBookID": 3861, "PendingChange": None, "Status": None, "SessionCode": None}
+        )
+        entry = MinutesEntry.model_validate(
+            {"MinutesEntryID": 1, "IsOOB": None, "ReleaseToPreview": None}
+        )
+
+        self.assertIsNone(book.PendingChange)
+        self.assertIsNone(entry.IsOOB)
 
 
 class MeetingShapesTest(unittest.TestCase):

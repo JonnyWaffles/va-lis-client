@@ -2,6 +2,8 @@
 
 from datetime import datetime
 
+from pydantic import Field
+
 from va_lis_client.models.common import LISModel
 
 # The patron role vocabulary from ``/LegislationPatron/api/getpatronroletypelistasync``
@@ -298,3 +300,50 @@ class LegislationVersion(LISModel):
     LegislationStatusID: int | None = None  # always null in observed data
     Suffix: str | None = None  # appended to bill number -> DocumentCode
     AuthoringLabel: str | None = None  # e.g. "Enrollment Ready"
+
+
+class PatronBill(Legislation):
+    """A bill under a member in the chamber-wide chief patron index.
+
+    The :class:`Legislation` shape plus two fields that only this endpoint
+    sends.  Unlike :class:`MemberLegislation` it carries no summary, so
+    there is **one row per bill**, not one per summary version.
+
+    Example (fields beyond :class:`Legislation`)::
+
+        {"IsPrefile": true, "SessionName": "Regular Session"}
+    """
+
+    IsPrefile: bool | None = None
+    SessionName: str | None = None  # e.g. "Regular Session"
+
+
+class PatronLegislation(Patron):
+    """One member's bills from ``getlegislationpatronlistasync``.
+
+    The :class:`Patron` shape with the member's bills hung off it.  One row
+    per member per patron type, and the whole chamber arrives in a single
+    request: 102 rows and 2,342 bills for the 20261 House, 42 rows and 1,304
+    bills for its Senate.
+
+    **It is chief patron only.**  Every row of both chambers came back as
+    ``Chief Patron`` (``PatronTypeID`` 1) on 2026-09-15, and the row count
+    equals the distinct member count, so there is exactly one row per member.
+    This endpoint is a cheap chamber-wide index, not a route to co-patronage.
+    Call :meth:`~va_lis_client.client.LISClient.get_bill_patrons` for a
+    bill's full patron list, or
+    :meth:`~va_lis_client.service.LISService.member_bills` for one member's
+    co-patronage.
+
+    The payload key for the bills is ``Legislation``, which collides with the
+    :class:`Legislation` model, so the field is aliased to :attr:`bills`.
+
+    Example (truncated)::
+
+        {"MemberID": 527, "MemberNumber": "H0386", "PatronTypeID": 1,
+         "Name": "Chief Patron", "MemberDisplayName": " Jessica L. Anderson",
+         "Legislation": [{"LegislationID": 98991, "LegislationNumber": "HB288",
+                          "LegislationStatus": "Acts of Assembly Chapter"}]}
+    """
+
+    bills: list[PatronBill] = Field(default=[], alias="Legislation")

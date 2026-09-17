@@ -102,6 +102,16 @@ seats = service.member_committees(schmidt.MemberID, 20261)  # 14 cached requests
 for e in service.docket_entries("Courts of Justice", 20261):
     print(e.date, e.bill_number, e.room)
 
+# Minutes: a day's proceedings, flattened. The vote id here really is the
+# bill's, which is not true of a bill event.
+day = service.minutes_books(20261, chamber_code="S")[0]
+for r in service.minutes_records(day.MinutesBookID):
+    print(r.bill_number, r.event_code, r.tally, r.vote_id)
+
+# Who clerks a committee, and where to write to a member.
+staff = service.committee_staff("Courts of Justice", chamber_code="H")
+office = service.member_office(503)  # the district address; None for many members
+
 # Keyword search, in two grains. Both drop the duplicate rows LIS emits.
 hits = service.search_bills(session_code=20261, keyword="firearm")  # one row per bill
 every = service.search_bill_summaries(session_code=20261, keyword="firearm")  # one row per summary
@@ -134,6 +144,13 @@ second lookup against the session roster, cached for an hour. `roll_call`
 returns only the attributable votes, since naming a member on a block or voice
 vote misstates the record. HB1 gives 214 named ballots across its six roll
 calls. Each entry carries its own `vote`, because one bill has many.
+
+**Minutes are the reliable way into a roll call.** `minutes_records` flattens
+one day's book into a row per action, each carrying the bill, the event code,
+the tally, and the `VoteID`. That vote id belongs to the bill beside it,
+which is not true of a bill event's vote id, so it needs no repair. The
+tally string also keeps a presiding officer's tiebreak that the Vote service
+drops. See [Minutes books](#minutes-books).
 
 **`EventCode` is not unique.** The event-type vocabulary holds 3,912 rows under
 only 1,502 codes, and `H1405` alone returns four. Two of those four read
@@ -210,6 +227,10 @@ PartnerAuthentication service.
 - **Votes reach back to 1994** — much further than bills. `voteID=1` is a
   January 1994 committee vote. Do not assume a vote ID belongs to a recent
   session.
+- **Minutes books start at 20241 and are thin at the edges.** 20241 holds 45
+  books, all of them Senate floor; 20251 holds 599 and 20261 holds 388;
+  20271 answered 204 on 2026-09-15. Floor books are Senate only in every
+  session. See [Minutes books](#minutes-books).
 - Older session data is available as `legacylis.virginia.gov` CSV downloads.
 - **No rate limit is enforced, but usage is tracked per key.** DLAS said in
   September 2026 that they do not rate limit, that they watch per key usage,
@@ -230,6 +251,9 @@ several overlapping identifiers:
 | `DocumentCode` | `"HB1ER"` | Bill number + version suffix |
 | `LegislationTextID` | `257719` | PK for one immutable text snapshot — follows the bill across carry-over (see below) |
 | `CommitteeID` | `14` | Surrogate PK for a committee |
+| `MinutesBookID` | `3861` | Surrogate PK for one body's proceedings on one day |
+| `CommunicationID` | `4519` | Surrogate PK for one message between the chambers |
+| `AffiliationID` | `8` | On a personnel row this **is** a `CommitteeID` |
 | `CommitteeNumber` | `"H14"` | Chamber prefix + number, e.g. `H14`, `S02` |
 | `CalendarID` | `21146` | PK for a House floor calendar |
 | `DocketID` | `21114` | PK for a Senate committee docket |
@@ -316,6 +340,21 @@ The docs say `ListItems` everywhere. Reality:
 | Legislation events | `ListItems` | `LegislationEvents` |
 | Schedule types | `ListItems` | `ScheduleTypes` |
 | Meeting rooms | `ListItems` | `MeetingRooms` |
+| Minutes book list | `ListItems` | `Minutes` |
+| Minutes book detail | `ListItems` | `MinutesBooks` |
+| Action reference types | `ListItems` | `ActionReferenceTypeList` |
+| Calendar actions | `ListItems` | `CalendarActions` |
+| Communication list | `ListItems` | `CommunicationsList` |
+| Communication detail | `ListItems` | `CommunicationResponse` |
+| Communication files | `ListItems` | `CommunicationFileResponse` |
+| Personnel | `ListItems` | `Personnels` |
+| Contacts | `ListItems` | `Contacts` |
+| Agencies | `ListItems` | `Agencies` |
+| Category types | `ListItems` | `CategoryTypes` |
+| Chamber patron index | `ListItems` | `PatronLegislation` |
+
+MinutesBook and LegislationCommunications each answer a list and a detail
+under *different* keys, so the spec is wrong twice for both.
 
 ## Pagination (undocumented)
 
@@ -485,11 +524,18 @@ session codes wrongly. See [Bills by member](#bills-by-member).
 - `get_bill_patrons(legislation_id)` → every patron of a bill, in every role
 - `get_patron_roles()` → 5 roles (1 Chief Patron, 2 Chief Co-Patron, 3 Incorporated Chief Co-Patron, 4 Co-Patron, 5 Offered)
 
-Not wired: `getlegislationpatronlistasync` serves chief patron relationships
-only (any other `patronType` answers 204) and unfiltered returns every chief
-patron in a chamber with their bills, 1.3 MB for the 2026 House;
-`getmemberpatrontypelistasync` lists the roles one member holds, including a
-`PatronTypeID` of `0` for budget amendment requests.
+- `get_patron_legislation(session_code, chamber_code)` → every chief patron in a chamber with their bills, in one request
+
+**`get_patron_legislation` is chief patron only, despite the name.** Every
+row of both chambers came back as `Chief Patron` on 2026-09-15, and the row
+count equals the distinct member count: 102 rows over 2,342 bills for the
+20261 House, 42 rows over 1,304 bills for its Senate. It is a cheap
+chamber-wide index, not a route to co-patronage. Both arguments are
+required; without the chamber LIS answers 400 with "The chamberCode field is
+required."
+
+Not wired: `getmemberpatrontypelistasync` lists the roles one member holds,
+including a `PatronTypeID` of `0` for budget amendment requests.
 
 #### Committee (`/Committee/api/`)
 - `get_committees(chamber_code=None, include_subcommittees=False)` → 14 House and 11 Senate standing committees; 67 House rows with subcommittees
@@ -514,7 +560,11 @@ committee. The action vocabulary is its only data operation.
 - `get_schedule_types()` → 6 types (1 Committee, 2 Chamber, 3 Conference, 4 Caucus, 5 Other, 6 Docket)
 - `get_meeting_rooms(chamber_code=None)` → room reference, 18 for the House
 
-Not wired: `previewvcalfileasync`, a vCal export.
+Not wired yet: `previewvcalfileasync`, an iCalendar export of the schedule.
+It answers `text/calendar`, not JSON. Its filters are `scheduleIDs`
+(plural), `ownerID`, `scheduleTypeID`, `voteRoomID`, `startDate` and
+`endDate`; an unknown parameter such as `scheduleID` is silently ignored and
+returns a default feed.
 
 #### Calendar (`/Calendar/api/`)
 - `get_calendars(chamber_code, session_code)` → a chamber's floor calendars, 56 for the 2026 House
@@ -524,10 +574,69 @@ Not wired: `previewvcalfileasync`, a vCal export.
 - `get_docket(docket_id)` → one docket with its bills, members, staff, and linked schedule
 - `get_calendar_types()` → 2 types (1 Chamber, 2 Committee)
 - `get_calendar_category_types(chamber_code=None)` → 98 category codes, e.g. `CSGEN` = Senate Bill in Committee
+- `get_category_types()` → the 8 coarse types behind `CategoryTypeID`, e.g. 1 `Order`, 5 `General`
+- `get_calendar_actions()` → the 4,952 row action vocabulary that resolves a minutes activity; 2 MB, no filter
 
-Not wired: `getcalendaractionsreferenceasync` returns 4,952 rows and 2 MB, and
-`getcategorytypesreferenceasync` is unprobed. See
-[How meetings and dockets work](#how-meetings-and-dockets-work).
+`get_calendar_actions` is large and its id repeats, so reach for
+`LISService.calendar_actions_by_id()` and `action_for()`, which fetch it once
+and index it. See [How meetings and dockets work](#how-meetings-and-dockets-work)
+and [Minutes books](#minutes-books).
+
+#### LegislationCommunications (`/LegislationCommunications/api/`)
+- `get_communications(session_code=None, session_id=None, chamber_code=None)` → floor communications, 131 for 20261; **pass a session or you get all 4,383**
+- `get_communication(communication_id)` → one message with its categories, bills, and patrons
+- `get_communication_files(communication_id)` → the HTML and JSON blobs
+- `get_communication_category_types(chamber_code=None)` → 231 clerk sentences, 87 House and 144 Senate
+
+This is what one chamber formally told the other. It resolves to bills and
+members and **not at all to votes**. Read
+[Communications](#communications-between-the-chambers).
+
+#### Personnel (`/Personnel/api/`)
+- `get_personnel(staff_role_type_id=None, affiliation_id=None, effective_begin_date=None)` → clerks and staff; **filter, or four fields are omitted**
+- `get_staff_role_types()` → 7 roles (1 Committee Clerk, 2 staff, and five more)
+
+`AffiliationID` is a `CommitteeID`, so this is the only route to "who clerks
+this committee". Not session scoped. See
+[Clerks, offices, and agencies](#clerks-offices-and-agencies).
+
+Not wired: `getclerkpersonnellistasync` is byte-identical to
+`staff_role_type_id=1`, and `getreferencesasync` is byte-identical to the
+unfiltered call.
+
+#### Contact (`/Contact/api/`)
+- `get_contacts(owner_id=None, owner_type_id=None)` → contact records for one owner, or every contact with neither; for a member pass `owner_type_id=3`
+- `get_contact_types()` → 10 types, each with its owner type
+- `get_owner_types()` → 6 owner types (3 is Member)
+
+A member's row is their district office address and phone, which LIS
+publishes nowhere else. Not session scoped.
+
+Not wired: `getcontactlistasync` answers **401** with a public key.
+`getcontactsbystatusasync`, `getcontactbyidasync`, and
+`getcontactsbycontacttypeidasync` all answer **404** for every argument
+tried. See [Clerks, offices, and agencies](#clerks-offices-and-agencies).
+
+#### Organization (`/Organization/api/`)
+- `get_agencies()` → 295 state budget agencies, grouped by branch
+
+Executive budget reference data that joins to nothing legislative. Wired for
+completeness.
+
+Not wired: `getorganizationlistasync` returns the same 295 identities with
+only a `Name` equal to `AgencyName`, plus one extra row for the General
+Assembly. `getorganizationbyidasync` answers 204 with an empty body for an
+unknown id rather than 404.
+
+#### MinutesBook (`/MinutesBook/api/`)
+- `get_minutes_books(session_code=..., committee_id=None, chamber_code=None, start_date=None, end_date=None)` → the published books for a session, 388 for 20261; a session is mandatory
+- `get_minutes_book(minutes_book_id=None, calendar_id=None)` → one book with its categories, entries, activities, and votes
+- `get_minutes_book_interactive(...)` → the same book shaped for the web calendar, and lossy; prefer the plain call
+- `get_action_reference_types()` → 15 reference kinds, and the service that resolves each
+
+This is the daily record of what a chamber or committee did, and its
+activities carry the one `VoteID` in LIS that reliably belongs to the bill
+beside it. Read [Minutes books](#minutes-books).
 
 #### AdvancedLegislationSearch (`/AdvancedLegislationSearch/api/`)
 - `search_legislation(**criteria)` → bills by keyword, status, category, committee, chamber, patron, chapter number, or bill number; rows exactly as LIS sent them, chief patron only
@@ -542,7 +651,8 @@ has no paging and it repeats bills. Read
 [Searching bills](#searching-bills) before you use it.
 
 Not wired: `getstatusreferencesasync` returns the same 52 rows under the same
-`References` key as `get_legislation_statuses`, so use that one.
+`References` key as `get_legislation_statuses` (re-checked 2026-09-15), so use
+that one.
 `clearpubliccache` and `clearintroductiondatelistcacheasync` are cache
 management, not data.
 
@@ -575,21 +685,39 @@ which `get_member_votes` already wires.
 passing a `SubjectIndexID` to the advanced search answers 204 every time,
 with either session parameter. The vocabulary is real and unusable.
 
-### Worth wiring next
+**Privileged.** `Contact`'s `getcontactlistasync` answers **401** with an
+empty body for a public key, bare and filtered. Everything else in that
+service is reachable.
 
-Probed live on 2026-09-15 and confirmed to return real data. Ranked by value:
+**Out of scope: anything a public API key cannot use on its own.** This
+client covers only what a holder of a public `WebAPIKey` can call. So it
+does not wire:
 
-1. **MinutesBook** — the daily record of chamber and committee floor
-   proceedings, 201 books for the 2026 House. `getminutesbookasync` nests
-   `MinutesCategories` → `MinutesEntries` → `MinutesActivities`, and each
-   activity carries `VoteID`, `VoteNumber`, `EventCode`, `VoteTally` and
-   `IsBlock`. It joins straight onto the vote layer already wired here.
-2. **LegislationCommunications** — messages between the chambers, 64 for the
-   2026 House, each linking blob files in HTML and JSON.
-3. **Personnel** — committee clerks and DLS staff, 54 clerks and 33
-   personnel. Small, stable, and it completes the committee picture.
-4. **Organization** (296 rows) and **Contact** (10 contact types) — reference
-   data only.
+- **Authentication** and **User**. These manage LIS website accounts: log
+  in, create an account, change or reset a password. They need a user's
+  password, not an API key.
+- **PartnerAuthentication** registration (`registerpartnerasync`,
+  `completepartnerregistrationasync`). This is the key signup flow. Only
+  `checkpartnerkeyasync` is wired, as `check_api_key`.
+- **Services with no published spec.** `GetApiListAsync?IsPartner=true`
+  names Groups, GroupsRoles, Notification, PrintDocuments,
+  CalendarFileGeneration and ReportFileGeneration, and the LIS web app also
+  calls JournalFileGeneration, MinuteEntries, SenateVote and
+  VoteFileGeneration. Every one of them answers 400 when you ask for its
+  spec. The web app sends a signed-in user's bearer token with its calls to
+  at least three: CalendarFileGeneration, JournalFileGeneration and
+  ReportFileGeneration.
+
+ReportFileGeneration does have two public paths, and they are how you
+survey the API: `GetApiListAsync?IsPartner=false` returns the 31 public
+service names, and `getapidocumentationasync?ApiName=<Service>` returns one
+service's OpenAPI document.
+
+Not wired yet: **Statistics** (`getchamberstatisticsasync`,
+`getcommitteestatisticsasync`) and **LegislationVersion**
+(`getlegislationversionbybillnumberasync`,
+`getlegislationversionbylegislationidasync`). Both answer with data for a
+public key.
 
 ## Searching bills
 
@@ -1323,6 +1451,345 @@ the committee's web page.
 **The `calendarDate` filter answers 204.** `get_calendars` fetches the whole
 list, which is small, and leaves the date filter to you.
 
+## Minutes books
+
+A minutes book is one body's proceedings on one day. It is the record a
+clerk keeps, and it nests four levels deep:
+
+```
+MinutesBook            the body and the day
+└── MinutesCategory    a section of business, e.g. "Senate Bills Vetoed by Governor"
+    └── MinutesEntry   one bill, or one procedural note
+        └── MinutesActivity   what happened, and the vote that decided it
+            └── ActivityReference   a citation hanging off the activity
+```
+
+The bill sits on the **entry**. What happened to it sits on the
+**activity**. `minutes_records` joins the three levels that carry meaning
+and hands back one row per action:
+
+```python
+books = service.minutes_books(20261, chamber_code="S")
+day = next(b for b in books if b.is_floor and b.MinutesStatus == "Closed")
+
+for record in service.minutes_records(day.MinutesBookID):
+    print(record.bill_number, record.event_code, record.tally, record.vote_id)
+# SB2   S7300  (21-Y 18-N 0-A)  302328
+# SB24  S7300  (38-Y 1-N 0-A)   302330
+```
+
+### This is the one `VoteID` in LIS you can trust
+
+`LegislationEvent.VoteID` often points at a vote that disposed of some other
+bill. That trap has its own section below,
+[A VoteID on a bill event is often not that bill's roll call](#a-voteid-on-a-bill-event-is-often-not-that-bills-roll-call),
+and the client works around it by matching on the vote's own legislation
+list.
+
+**The minutes activity does not have that problem.** Sampled live on
+2026-09-15 against Senate book 3861 — 3 recorded roll calls, 2 block votes
+and 2 voice votes — every `VoteID` resolved to a vote whose
+`VoteLegislation` listed the entry's own bill, and every `VoteNumber` matched
+the vote record exactly. So a minutes record is a safe way in to a roll call:
+
+```python
+record = service.minutes_records(day.MinutesBookID)[0]
+roll = service.roll_call(record.bill_number, 20261, vote_id=record.vote_id)
+```
+
+### The minutes tally keeps a tiebreak the vote record drops
+
+The two services spell the same vote differently, and the minutes hold more.
+Against the same book:
+
+| Activity `VoteTally`                 | Vote service `VoteTally` |
+| ------------------------------------ | ------------------------ |
+| `(18-Y 18-N 0-A, Chair votes Yea)`   | `(18-Y 18-N 0-A)`        |
+| `block vote (21-Y 18-N 0-A)`         | `(21-Y 18-N 0-A)`        |
+| `(Voice Vote)`                       | `(Voice Vote)`           |
+
+The presiding officer's tiebreaking vote survives in the minutes and nowhere
+else. Read the activity for the human record, and the Vote service for the
+counts and the members.
+
+### `IsCommittee` is false on every row, and `SessionCode` is null
+
+Two fields on the book list are dead. `IsCommittee` was `False` on all 388
+rows of 20261, including the 342 that name a committee. `SessionCode` was
+null on all 388, even though the request filtered by it.
+
+The real discriminator is `CommitteeID`, which LIS **omits entirely** on a
+floor book rather than sending null. `MinutesBookListItem.is_floor` tests
+that, so use it instead of the flag:
+
+```python
+floor = [b for b in books if b.is_floor]
+```
+
+### Only the Senate publishes floor books
+
+Both chambers publish committee books. Floor books are Senate only in every
+session checked:
+
+| Session | Books | Floor | Floor chambers | House | Senate |
+| ------- | ----- | ----- | -------------- | ----- | ------ |
+| 20241   | 45    | 45    | S              | 0     | 45     |
+| 20251   | 599   | 33    | S              | 467   | 132    |
+| 20261   | 388   | 46    | S              | 201   | 187    |
+| 20271   | 204   | —     | —              | —     | —      |
+
+20241 is the odd one: it holds Senate floor books and nothing else. 20271
+answered 204 on 2026-09-15, so the upcoming session has no books yet. For
+House floor proceedings, read the chamber's calendar and the bill's events
+instead.
+
+### A session is mandatory, and every other filter needs one
+
+`get_minutes_books` answers 400 with "Must provide either a valid Session ID
+or Session Code" when you pass no session, and it does the same for
+`committeeID` or `minutesBookID` on their own. `sessionCode` and `sessionID`
+agree: both returned the same 388 rows for 20261.
+
+`startDate` and `endDate` do work, taking `YYYY-MM-DD`, and a `committeeID`
+narrows to that committee's books — which excludes every floor book, since a
+floor book has no committee.
+
+### The interactive view is lossy
+
+`getminutesbookinteractivecalendarasync` returns the same book shaped for the
+LIS web calendar. Against Senate book 3861 it returned **168 entries against
+195**, 8 categories against 11, and it dropped `EventCode`, `IsBlock` and
+**all 171** `VoteTally` strings. It gains only narrative summaries, 39
+against 18. It is wired as `get_minutes_book_interactive` for the prose.
+Never reach for it when you want the votes.
+
+### Three more shapes worth knowing
+
+- **Two envelope keys for one service.** The list answers under `Minutes`
+  and the detail under `MinutesBooks`. The OpenAPI spec says `ListItems` for
+  both and is wrong twice. The reference list answers under
+  `ActionReferenceTypeList`.
+- **LIS omits keys rather than nulling them.** The 195 entries of book 3861
+  arrived in 4 different key sets; `AgendaID` is absent on procedural rows,
+  and the communication fields appear only on the 2 rows that carry one.
+  Every field on every minutes model is optional for this reason.
+- **`CategoryCode` is null on every category**, unlike its docket and
+  calendar cousins. Read `CategoryType` (`General`, `Order`,
+  `Communication`, `Miscellaneous`) and `CategoryDescription`, and order by
+  `Sequence` — book 3861 described 3 of its 11 categories as "Order of
+  Business".
+
+### Resolving an activity to its action label
+
+Every activity carries a `CalendarActionID` into the Calendar service's
+action vocabulary. `action_for` resolves it:
+
+```python
+book = service.minutes_book(3861)
+for activity in book.activities[:3]:
+    print(activity.CalendarActionID, service.action_for(activity).Description)
+# 3675 Call to Order
+# 3678 Generic Comment
+# 2485 ROLL CALL OF MEMBERS:
+```
+
+204 of book 3861's 205 activities resolve, and the `EventCode` agrees on
+every one of the 204.
+
+**The vocabulary repeats its own key.** `get_calendar_actions()` returns
+4,952 rows holding only **490** distinct `CalendarActionID`, because LIS
+emits one row per calendar category the action can appear under. Id 1016
+arrives 84 times, identical except for `CategoryCode` and
+`CalendarCategoryTypeID`, all 84 carrying `EventCode` `H4000`. This is the
+same one to many shape as the event vocabulary, so
+`calendar_actions_by_id()` maps an id to a **list**, and `action_for` breaks
+the tie on `EventCode`.
+
+It is also a 2 MB download with no filter, so fetch it through the service,
+which keeps it for the life of the instance.
+
+The activity's own `ActionDescription` is the filled-in version of the
+vocabulary's clean `Description`. Action 3675 reads `"Call to Order"` in the
+vocabulary and `"Called to Order at 12 m. by Lt. Governor Ghazala F.
+Hashmi"` in the book.
+
+A minutes category's `CategoryTypeID` resolves too, against the 8 rows of
+`get_category_types()`. All 11 categories of book 3861 matched their own
+`CategoryType` string.
+
+### The reference vocabulary names the service that resolves a citation
+
+`get_action_reference_types()` returns 15 rows, and `ObjectName` is the
+useful column: it names the entity `ActivityReference.ReferenceID` points
+at, so it tells you which service resolves the citation. A null `ObjectName`
+means the reference is self-contained prose, which is most of them — 80 of
+the 89 references in book 3861 were plain text. The ids run 1-9 and 11-16;
+there is no 10.
+
+## Communications between the chambers
+
+A communication is a message the clerk of one chamber sends to the other.
+"The House of Delegates has passed the following Senate bills." It nests
+three levels: the communication holds categories, a category holds bills,
+and a bill holds patrons.
+
+```python
+rows = client.get_communications(session_code=20261)     # 131, shallow
+detail = client.get_communication(rows[0].CommunicationID)
+
+for category in detail.categories:
+    print(category.label)
+    for bill in category.bills:
+        print("   ", bill.LegislationNumber, bill.LegislationDescription)
+```
+
+### Pass a session, or you download everything
+
+Every filter is optional and the endpoint has no paging. With no arguments
+it streams all **4,383** communications LIS holds, about 2 MB, reaching back
+to 1994-01-13. `session_code` and `session_id` agree; both gave the same 131
+rows for 20261. An unknown `chamber_code` answers 204 rather than 400.
+
+### The two description fields disagree
+
+A category carries `CategoryDescription` always and `Description` only
+sometimes. On all 13 rows that carried both (of 56 checked), they
+contradicted each other, and `MinutesSummary` was built from the wrong one.
+Communication 4520, category code `HN2300`:
+
+| Field | Value |
+| --- | --- |
+| `CategoryDescription` | THE HOUSE OF DELEGATES HAS STRICKEN FROM ITS CALENDAR THE FOLLOWING SENATE BILL: |
+| `Description` | THE HOUSE OF DELEGATES HAS PASSED BY FOR THE DAY THE FOLLOWING SENATE BILL: |
+
+Striking a bill from the calendar and passing it by for the day are
+different acts. `CommunicationCategory.label` prefers `Description` when LIS
+sends it, so read that rather than either field.
+
+### There is no vote join here
+
+`VoteNumber` is null on all 440 legislation rows checked, `EventCode` and
+`CommitteeReferredName` likewise, and the `VoteID` the spec promises is
+never sent. The `voteID` and `voteNumber` query parameters both answer 204
+for every value tried. The bill and text ids **are** honest: `LegislationID`
+98536 resolves to SB2 in 20261, and `LegislationTextID` 267622 to that
+bill's Enrolled text with `DocumentCode` `SB2ER`.
+
+### Structured content starts in May 2024
+
+Ask for an older communication and `CommunicationCategories` comes back
+empty with a single HTML file attached. Verified on communication 3625
+(20191) and 4192 to 4194 (20241). Before SessionID 56, the file is the
+record and the API will not parse it for you.
+
+### Three more shapes
+
+- **Three fields are constant.** `IsPublic` is `True`,
+  `CommunicationTypeID` is `1`, and `CommunicationType` is `"Floor"` on all
+  4,383 rows. There is no second type, which is also why the documented
+  `communicationType` filter does nothing. The `textFormat` filter on the
+  blob endpoint is ignored the same way, so neither is exposed.
+- **`ReferenceNumber` repeats across sessions.** It is unique within one,
+  but `SN10422` appears in three. Key on `(SessionID, ReferenceNumber)`.
+- **A category type repeats within one communication**, so the type id is
+  not the identity. Communication 4519 carried type 1467 four times and 4520
+  carried type 1823 seven times. Key on `CommunicationCategoryID`.
+
+## Clerks, offices, and agencies
+
+Three small services, none of them session scoped. No session parameter
+exists on any of them, and `sessionCode` is silently ignored, so the client
+treats them as static reference data.
+
+### Personnel is the only route to a committee's clerk
+
+`AffiliationID` on a personnel row **is** a `CommitteeID`. All 34 distinct
+values resolve, and ten of them are subcommittees that
+`get_committees()` does not return, because that list holds only the 25
+standing committees.
+
+```python
+for person in service.committee_staff("Courts of Justice", chamber_code="H"):
+    print(person.FullName, person.StaffRoleTypeID)
+# Annie Johnson 1
+# Britt Olwine 2
+```
+
+**Filter, or you lose the link.** An unfiltered call returns 33 rows that
+omit `StaffID`, `AffiliationID`, `StaffRoleTypeID` and `EffectiveBeginDate`
+*entirely*, so it cannot tell you who clerks what. Any parameter at all
+makes LIS send all 11 fields. `staff_role_type_id=1` gives 54 committee
+clerks and `2` gives 59 DLS staff; the two sets share no `StaffID`.
+
+The grain is one row per assignment, not per person: `StaffID` is the row
+and `IdentityID` the person, and identity 679 serves two committees.
+`PhoneNumber` and `EmailAddress` are null on all 146 rows, and
+`EffectiveEndDate` is in the spec and never sent.
+
+**The unprefixed path is a trap.** Personnel's spec omits the service
+prefix, and `/api/getpersonnellistasync` answers **200 with the LIS web
+app's HTML**, not a 404. It will fail as a parse error rather than an HTTP
+error. Always use `/Personnel/api/...`.
+
+### A member's district office
+
+```python
+office = service.member_office(503)
+print(office.Address1, office.City, office.StateCode, office.PhoneNumber)
+# P.O. Box 1853 Norfolk VA (757) 204-5492
+```
+
+A `Member` already carries `GABEmailAddress` and `GABPhoneNumber`, and the
+contact's email agrees on 115 of 124 rows. The **postal address and district
+phone** are what this adds, and they live nowhere else in LIS.
+
+**Many members have no row.** 390 member contacts exist against the 148
+members sitting in 20261, so the set is part historical and part incomplete.
+Member 503 answers and member 527 does not; `member_office` returns `None`
+rather than raising.
+
+**`OwnerTypeID` is declared required and never sent.** No contact row
+carries it, so `get_contact_types()` is the only way to learn that contact
+type 9 belongs to owner type 3.
+
+### An unfiltered contact call returns everything, in three populations
+
+`getcontactsbyownerasync` takes `ownerID` and `ownerTypeID` **together or
+not at all**. One alone gives 400, "OwnerID and OwnerTypeID must be used in
+conjunction with each other". Neither returns every contact LIS holds in one
+response with no paging: 6,882 rows on 2026-09-16, and growing, because most
+of them are website accounts.
+
+```python
+contacts = client.get_contacts()
+offices = [c for c in contacts if c.ContactTypeID == 9]  # 390 member offices
+```
+
+| `ContactTypeID` | Type | Rows | What it is |
+| --- | --- | --- | --- |
+| 9 | Mailing | 390 | Member district offices. `OwnerID` is a `MemberID`; 384 carry an address, 367 a phone |
+| 10 | Main | 2 | The two General Assembly buildings |
+| 3 | User | 6,490 | LIS website accounts. An email address and nothing else |
+
+**`OwnerID` on a type 3 row joins to nothing.** Its range covers every
+member and personnel identity, so a join on it succeeds and returns nonsense.
+It is a separate account namespace: matched against member identities, 0 of
+145 emails carried the member's surname. Filter to type 9 before you join
+`OwnerID` to a member.
+
+The 390 member rows outnumber the 148 sitting members because the set holds
+former members too, and some sitting members have no row at all. The bulk
+call is still the cheap way to get every office at once: one request instead
+of one per member.
+
+### Organization is budget data
+
+`get_agencies()` returns the 295 executive budget agencies grouped by branch
+(Education, Public Safety, Central Appropriations, and 16 more). Its
+`IdentityID` shares **no value** with a `MemberID`, a `CommitteeID`, or a
+personnel identity. It is wired for completeness, and it will not join to
+anything you are working on.
+
 ## How a bill becomes law (Virginia)
 
 A bill's lifecycle through the General Assembly, mapped to LIS status IDs.
@@ -1439,6 +1906,43 @@ must pass both chambers in identical form before going to the Governor.
 | 35 | Enrolled | Enrolled-House | Final enrolled text prepared (House origin) |
 | 44 | Enrolled | Enrolled-Senate | Final enrolled text prepared (Senate origin) |
 
+#### Which event carries a chamber's final vote
+
+A chamber's final vote on the text that goes to the Governor is a status
+question, not an event code question. Measured 2026-09-16 over the 1,156
+HB and SB bills of 20261 that reached status 6 or 39:
+
+| Route to enrollment | Bills | The final vote event | `Status` on it |
+|---|---|---|---|
+| The second chamber passed the text unchanged | 551 | each chamber's own passage, `H5000`/`H5100`/`S5000`/`S5100` | `Passed House` / `Passed Senate` |
+| The second chamber amended or substituted, the first agreed | 449 | the second chamber's "Passed Senate with substitute" (`S5022`, status `Passed Senate`), then "Senate substitute agreed to by House" (`H5430`–`H5434`) | `Passed Both` on the concurrence |
+| Conference | 152 | "Conference report agreed to by House" and "… by Senate" (`H6015`/`S6015`) in each chamber | `Conference Report Agreed` (display name In Conference) |
+| The amending chamber receded | 4 | "Senate receded from substitute (22-Y 18-N 0-A)" (`S5700`–`S5740`, `H5720`) | `Passed Both` |
+
+The event's `ActorType` names the chamber that voted, and `Passed Both`
+and `Conference Report Agreed` name none, so read both. Three traps:
+
+- **The same code carries opposite outcomes.** `H5432` is "Senate
+  substitute agreed to by House" (status `Passed Both`) and "Senate
+  substitute rejected by House" (no status). `H6015` is the report agreed
+  to (`Conference Report Agreed`) and rejected (`Conference Report
+  Rejected`). The status tells them apart; the code does not.
+- **`IsPassage` on the vocabulary misses half the final votes.** It marks
+  the chamber passages and the recessions, marks `H5430` and
+  `H5432`–`H5434` but not `H5431`, and marks no conference report row.
+- **`Passed Both` is also stamped on a text event.** "Reenrolled bill text
+  (HB77ER2)" (`H5602`/`S5602`), published after the reconvened session,
+  carries `Passed Both` and no tally. A reader that wants the vote must
+  require a `VoteTally`. That test also absorbs a duplicate: SB661's
+  final "Conference report agreed to by Senate" arrived twice on the same
+  day, once with `(23-Y 15-N 0-A)` and a `VoteID`, once with the status
+  alone and neither.
+
+The reconvened session's "House concurred in Governor's recommendation"
+(`H7300`/`S7300`) and a chamber "insisting" on its own text (`H5500`
+family) carry a tally and no status. `Legislation.HousePassageDate` is
+the first `Passed House` event, never the final vote.
+
 **Governor pipeline:**
 
 | ID | DisplayName | Internal Name | What happened |
@@ -1554,7 +2058,10 @@ src/va_lis_client/
     ├── vote.py         # Vote, VoteMember, VoteLegislation, VoteStatement
     ├── member.py       # Member, Party, District
     ├── member_vote.py  # MemberVoteResult — the member-first axis
-    └── docket.py       # DocketDetail, DocketItem, DocketCategory, ...
+    ├── docket.py       # DocketDetail, DocketItem, DocketCategory, ...
+    ├── minutes.py      # MinutesBook, MinutesEntry, MinutesActivity, ...
+    ├── communication.py # Communication, CommunicationCategory, ...
+    └── directory.py    # Personnel, Contact, Agency, StaffRoleType, ...
 ```
 
 ## License

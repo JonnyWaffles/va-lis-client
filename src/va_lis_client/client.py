@@ -36,7 +36,8 @@ Gotchas discovered by hitting the live API:
   ``ListItems`` everywhere, but the real keys are ``Sessions``,
   ``Legislations``, ``LegislationTextList``, ``TextsList``,
   ``LegislationSummaries``, ``References``, ``LegislationVersionList``,
-  ``PartnerList``.
+  ``PartnerList``.  MinutesBook answers its list under ``Minutes`` and its
+  detail under ``MinutesBooks``, so the spec is wrong twice for one service.
 - **Carry-over reuses** ``LegislationID`` (confirmed live 2026-08-12): a
   bill continued from an even-year session keeps its ID in the following
   odd-year session, so the same ID appears in *both* sessions' bill lists
@@ -62,15 +63,25 @@ import requests as _requests
 from va_lis_client.exceptions import LISClientError
 from va_lis_client.http import requests_session
 from va_lis_client.models import (
+    ActionReferenceType,
     ActorType,
+    Agency,
+    CalendarAction,
     CalendarCategoryType,
     CalendarDetail,
     CalendarItem,
     CalendarType,
+    CategoryType,
     Committee,
     CommitteeAction,
     CommitteeMember,
     CommitteeRole,
+    Communication,
+    CommunicationCategoryType,
+    CommunicationFile,
+    CommunicationListItem,
+    Contact,
+    ContactType,
     District,
     DocketDetail,
     DocketListItem,
@@ -92,15 +103,21 @@ from va_lis_client.models import (
     Member,
     MemberLegislation,
     MemberVoteResult,
+    MinutesBook,
+    MinutesBookListItem,
+    OwnerType,
     PagedList,
     Pagination,
     Partner,
     Party,
     Patron,
+    PatronLegislation,
     PatronRole,
+    Personnel,
     Schedule,
     ScheduleType,
     Session,
+    StaffRoleType,
     Vote,
     VoteType,
     page_request_header,
@@ -1003,6 +1020,43 @@ class LISClient:
             return []
         return [Patron.model_validate(p) for p in data.get("Patrons", [])]
 
+    def get_patron_legislation(
+        self,
+        session_code: int,
+        chamber_code: str,
+    ) -> list[PatronLegislation]:
+        """Every chief patron in one chamber, with their bills, in one request.
+
+        A cheap chamber-wide index: 102 rows and 2,342 bills for the 20261
+        House, 42 rows and 1,304 bills for its Senate. One row per member,
+        with the bills nested under :attr:`PatronLegislation.bills`.
+
+        **It is chief patron only**, despite the name. Every row of both
+        chambers came back as ``Chief Patron`` on 2026-09-15, and the row
+        count equals the distinct member count. Use
+        :meth:`get_bill_patrons` for a bill's full list and
+        :meth:`~va_lis_client.service.LISService.member_bills` for one
+        member's co-patronage.
+
+        Both arguments are required. LIS answers 400 with "The chamberCode
+        field is required." without the chamber, and "Must provide either a
+        valid Session ID or Session Code" without the session. 20271
+        answered 204 on 2026-09-15.
+
+        Args:
+            session_code: e.g. ``20261``.
+            chamber_code: ``"H"`` or ``"S"``.
+
+        Envelope key: ``PatronLegislation``.
+        """
+        data = self._get(
+            "/LegislationPatron/api/getlegislationpatronlistasync",
+            params={"sessionCode": session_code, "chamberCode": chamber_code},
+        )
+        if data is None:
+            return []
+        return [PatronLegislation.model_validate(p) for p in data.get("PatronLegislation", [])]
+
     def get_patron_roles(self) -> list[PatronRole]:
         """Reference list of 5 patron roles.
 
@@ -1418,6 +1472,536 @@ class LISClient:
             return []
         return [
             CalendarCategoryType.model_validate(t) for t in data.get("CalendarCategoryTypes", [])
+        ]
+
+    def get_category_types(self) -> list[CategoryType]:
+        """Reference list of the 8 coarse category types.
+
+        The vocabulary behind ``CategoryTypeID`` on a minutes category and on
+        a calendar category type: 1 Order, 2 Regular Calendar, 3 Uncontested
+        Calendar, 4 Miscellaneous, and four more. Takes no parameters.
+
+        Envelope key: ``CategoryTypes``.
+        """
+        data = self._get("/Calendar/api/getcategorytypesreferenceasync")
+        if data is None:
+            return []
+        return [CategoryType.model_validate(t) for t in data.get("CategoryTypes", [])]
+
+    def get_calendar_actions(self) -> list[CalendarAction]:
+        """The action vocabulary that resolves a minutes activity.
+
+        **This is a 2 MB download of 4,952 rows, and it takes no filter.**
+        Fetch it once and keep it;
+        :meth:`~va_lis_client.service.LISService.calendar_actions_by_id`
+        does that for you and indexes it.
+
+        The 4,952 rows hold only 490 distinct ``CalendarActionID``, because
+        LIS emits one row per calendar category the action can appear under.
+        Treat the id as one-to-many, never one-to-one.
+
+        Envelope key: ``CalendarActions``.
+        """
+        data = self._get("/Calendar/api/getcalendaractionsreferenceasync")
+        if data is None:
+            return []
+        return [CalendarAction.model_validate(a) for a in data.get("CalendarActions", [])]
+
+    # ------------------------------------------------------------------
+    # Directory (committee clerks, member offices, budget agencies)
+    # ------------------------------------------------------------------
+
+    def get_personnel(
+        self,
+        *,
+        staff_role_type_id: int | None = None,
+        affiliation_id: int | None = None,
+        effective_begin_date: str | date | datetime | None = None,
+    ) -> list[Personnel]:
+        """Committee clerks and DLS staff, with the committee they serve.
+
+        **Pass a filter.** An unfiltered call returns 33 rows that omit
+        ``StaffID``, ``AffiliationID``, ``StaffRoleTypeID`` and
+        ``EffectiveBeginDate`` entirely, so it cannot tell you who clerks
+        what. Any parameter at all makes LIS send all 11 fields.
+        ``staff_role_type_id=1`` gives the 54 committee clerks and ``2`` the
+        59 DLS staff.
+
+        Not session scoped. There is no session parameter, and ``sessionCode``
+        and ``chamberCode`` are both silently ignored.
+        ``effective_begin_date`` is the only real time filter and it works:
+        ``"2026-01-01"`` cut the clerk list from 54 to 44.
+
+        Two sibling paths are redundant and are not wired.
+        ``getclerkpersonnellistasync`` is byte-identical to this call with
+        ``staff_role_type_id=1``, and ``getreferencesasync`` is
+        byte-identical to the unfiltered call.
+
+        Args:
+            staff_role_type_id: ``1`` clerks, ``2`` staff. See
+                :meth:`get_staff_role_types`.
+            affiliation_id: A ``CommitteeID``, to get one committee's clerks.
+            effective_begin_date: Keep only assignments starting on or after
+                this date.
+
+        Envelope key: ``Personnels``.
+        """
+        params: dict = {}
+        if staff_role_type_id is not None:
+            params["staffRoleTypeID"] = staff_role_type_id
+
+        if affiliation_id is not None:
+            params["affiliationID"] = affiliation_id
+
+        if effective_begin_date is not None:
+            params["effectiveBeginDate"] = _date_param(effective_begin_date)
+
+        data = self._get("/Personnel/api/getpersonnellistasync", params=params or None)
+        if data is None:
+            return []
+        return [Personnel.model_validate(p) for p in data.get("Personnels", [])]
+
+    def get_staff_role_types(self) -> list[StaffRoleType]:
+        """Reference list of the 7 staff roles.
+
+        The vocabulary behind ``StaffRoleTypeID``.
+
+        Envelope key: ``StaffRoleTypes``.
+        """
+        data = self._get("/Personnel/api/getstaffroletypesasync")
+        if data is None:
+            return []
+        return [StaffRoleType.model_validate(t) for t in data.get("StaffRoleTypes", [])]
+
+    def get_contacts(
+        self,
+        owner_id: int | None = None,
+        owner_type_id: int | None = None,
+    ) -> list[Contact]:
+        """Contact records for one owner, or every contact LIS holds.
+
+        For a member pass ``owner_type_id=3``; the row that comes back is the
+        district office, ``ContactTypeID`` 9. Not every member has one, so a
+        204 and an empty list are normal — member 503 has a row and member
+        527 does not.
+
+        **Pass both arguments or neither.** One alone gives 400 with
+        "OwnerID and OwnerTypeID must be used in conjunction with each
+        other".
+
+        **With neither, LIS returns every contact**, 6,882 rows on
+        2026-09-16 in one response with no paging. The total grows as people
+        register on the LIS website. Three populations, told apart by
+        ``ContactTypeID``:
+
+        ==  ========  =====  ==============================================
+        ID  Type      Rows   What it is
+        ==  ========  =====  ==============================================
+        9   Mailing     390  Member district offices; ``OwnerID`` is a
+                             ``MemberID``.  384 carry an address.
+        10  Main          2  The two General Assembly buildings.
+        3   User      6,490  LIS website accounts: an email and nothing
+                             else.  No address or phone on any row.
+        ==  ========  =====  ==============================================
+
+        **``OwnerID`` on a type 3 row joins to nothing.** Its range covers
+        every member and personnel identity, so it looks joinable, but it is
+        a separate account namespace: matched against member identities, 0
+        of 145 emails carried the member's surname. Filter to type 9 before
+        you join ``OwnerID`` to a member.
+
+        Not session scoped; ``sessionCode`` is silently ignored.
+
+        Args:
+            owner_id: A ``MemberID`` when ``owner_type_id`` is ``3``.
+            owner_type_id: See :meth:`get_owner_types`.
+
+        Envelope key: ``Contacts``.
+        """
+        params: dict = {}
+        if owner_id is not None:
+            params["ownerID"] = owner_id
+
+        if owner_type_id is not None:
+            params["ownerTypeID"] = owner_type_id
+
+        data = self._get("/Contact/api/getcontactsbyownerasync", params=params or None)
+        if data is None:
+            return []
+        return [Contact.model_validate(c) for c in data.get("Contacts", [])]
+
+    def get_contact_types(self) -> list[ContactType]:
+        """Reference list of the 10 contact types, each with its owner type.
+
+        The only way to read a contact's owner type, since a
+        :class:`Contact` row never carries ``OwnerTypeID``.
+
+        Envelope key: ``ContactTypeReferences``.
+        """
+        data = self._get("/Contact/api/getcontacttypereferencesasync")
+        if data is None:
+            return []
+        return [ContactType.model_validate(t) for t in data.get("ContactTypeReferences", [])]
+
+    def get_owner_types(self) -> list[OwnerType]:
+        """Reference list of the 6 contact owner types.
+
+        1 Person, 2 User, 3 Member, 4 Chamber, 5 District, 6 Organization.
+
+        Envelope key: ``OwnerTypeReferences``.
+        """
+        data = self._get("/Contact/api/getownertypereferencesasync")
+        if data is None:
+            return []
+        return [OwnerType.model_validate(t) for t in data.get("OwnerTypeReferences", [])]
+
+    def get_agencies(self) -> list[Agency]:
+        """The 295 state budget agencies, grouped by branch.
+
+        Executive budget reference data. It joins to nothing legislative —
+        its ``IdentityID`` shares no value with a ``MemberID``, a
+        ``CommitteeID``, or a personnel identity. Wired for completeness.
+
+        This supersedes ``getorganizationlistasync``, which is not wired: it
+        returns the same 295 identities with only a ``Name`` equal to
+        ``AgencyName``, plus one extra row for the General Assembly itself.
+        ``getorganizationbyidasync`` is not wired either; it answers 204 with
+        an empty body for an unknown id rather than 404.
+
+        Envelope key: ``Agencies``.
+        """
+        data = self._get("/Organization/api/getagencyreferencesasync")
+        if data is None:
+            return []
+        return [Agency.model_validate(a) for a in data.get("Agencies", [])]
+
+    # ------------------------------------------------------------------
+    # Communications (what one chamber formally told the other)
+    # ------------------------------------------------------------------
+
+    def get_communications(
+        self,
+        *,
+        session_code: int | None = None,
+        session_id: int | None = None,
+        chamber_code: str | None = None,
+    ) -> list[CommunicationListItem]:
+        """Floor communications, newest business last.
+
+        **Every filter is optional, and that is a trap.** With no arguments
+        LIS streams all 4,383 communications it holds, about 2 MB, reaching
+        back to 1994-01-13. It has no paging. Always pass a session unless
+        you want the lot.
+
+        ``session_code`` and ``session_id`` agree: both returned the same 131
+        rows for 20261. An unknown ``chamber_code`` answers 204 rather than
+        400.
+
+        The rows are shallow and name no bills. Call
+        :meth:`get_communication` for those.
+
+        Args:
+            session_code: e.g. ``20261``.
+            session_id: e.g. ``59``. An alternative to ``session_code``.
+            chamber_code: ``"H"`` or ``"S"``. Omit for both.
+
+        Envelope key: ``CommunicationsList``.
+        """
+        params: dict = {}
+        if session_code is not None:
+            params["sessionCode"] = session_code
+
+        if session_id is not None:
+            params["sessionID"] = session_id
+
+        if chamber_code:
+            params["chamberCode"] = chamber_code
+
+        data = self._get(
+            "/LegislationCommunications/api/getlegislationcommunicationslistasync",
+            params=params,
+        )
+        if data is None:
+            return []
+        return [CommunicationListItem.model_validate(c) for c in data.get("CommunicationsList", [])]
+
+    def get_communication(
+        self,
+        communication_id: int | None = None,
+        *,
+        session_code: int | None = None,
+        session_id: int | None = None,
+        chamber_code: str | None = None,
+        communication_type_id: int | None = None,
+        communication_date: str | date | datetime | None = None,
+        communication_number: int | None = None,
+        reference_number: str | None = None,
+    ) -> Communication | None:
+        """One communication with its categories, bills, and patrons.
+
+        ``communication_id`` alone is enough. The alternative is the full
+        tuple of session, chamber, type id, date, and number; a partial tuple
+        answers 400 with "Must have Vote Id or Vote # combined with Session
+        Id or Session Code or Session Id or Session Code Combined with
+        Chamber Code, Communication Type ID, Communication Date and
+        Communication Number".
+
+        **The ``voteID`` and ``voteNumber`` selectors are dead.** Both answer
+        204 for every value tried, and no row carries a vote id. Do not reach
+        here for votes.
+
+        Ask for a communication older than May 2024 and the categories come
+        back empty; see :class:`Communication`.
+
+        Args:
+            communication_id: ``CommunicationID`` from
+                :meth:`get_communications`. The easy way in.
+
+        Returns:
+            The :class:`Communication`, or ``None`` when LIS answers 204.
+
+        Envelope key: ``CommunicationResponse`` — note the *list* endpoint
+        answers under ``CommunicationsList`` instead.
+        """
+        params: dict = {}
+        if communication_id is not None:
+            params["communicationID"] = communication_id
+
+        if session_code is not None:
+            params["sessionCode"] = session_code
+
+        if session_id is not None:
+            params["sessionID"] = session_id
+
+        if chamber_code:
+            params["chamberCode"] = chamber_code
+
+        if communication_type_id is not None:
+            params["communicationTypeID"] = communication_type_id
+
+        if communication_date is not None:
+            params["communicationDate"] = _date_param(communication_date)
+
+        if communication_number is not None:
+            params["communicationNumber"] = communication_number
+
+        if reference_number is not None:
+            params["referenceNumber"] = reference_number
+
+        data = self._get(
+            "/LegislationCommunications/api/getlegislationcommunicationsbyidasync",
+            params=params,
+        )
+        if data is None:
+            return None
+
+        rows = data.get("CommunicationResponse", [])
+        return Communication.model_validate(rows[0]) if rows else None
+
+    def get_communication_files(self, communication_id: int) -> list[CommunicationFile]:
+        """The generated files for one communication, HTML and JSON.
+
+        The same pair the list row already carries, so reach for this only
+        when you hold an id and not the row.
+
+        The documented ``textFormat`` parameter is **silently ignored** —
+        ``HTML``, ``JSON`` and ``PDF`` all returned both files — so it is not
+        exposed.
+
+        Envelope key: ``CommunicationFileResponse``.
+        """
+        data = self._get(
+            "/LegislationCommunications/api/getlegislationcommunicationsbloburlasync",
+            params={"communicationID": communication_id},
+        )
+        if data is None:
+            return []
+        return [
+            CommunicationFile.model_validate(f) for f in data.get("CommunicationFileResponse", [])
+        ]
+
+    def get_communication_category_types(
+        self,
+        chamber_code: str | None = None,
+    ) -> list[CommunicationCategoryType]:
+        """Reference list of 231 communication sentences, 87 House and 144 Senate.
+
+        The vocabulary behind ``CommunicationCategoryTypeID``, holding the
+        singular and plural form of each clerk's sentence.
+
+        Args:
+            chamber_code: ``"H"`` or ``"S"``. Omit for both.
+
+        Envelope key: ``CommunicationCategoryTypesReference``.
+        """
+        params = {"chamberCode": chamber_code} if chamber_code else None
+        data = self._get(
+            "/LegislationCommunications/api/getcommunicationcategoryreferencesasync",
+            params=params,
+        )
+        if data is None:
+            return []
+        return [
+            CommunicationCategoryType.model_validate(t)
+            for t in data.get("CommunicationCategoryTypesReference", [])
+        ]
+
+    # ------------------------------------------------------------------
+    # Minutes books (what a body actually did, with the votes attached)
+    # ------------------------------------------------------------------
+
+    def get_minutes_books(
+        self,
+        *,
+        session_code: int | None = None,
+        session_id: int | None = None,
+        committee_id: int | None = None,
+        chamber_code: str | None = None,
+        start_date: str | date | datetime | None = None,
+        end_date: str | date | datetime | None = None,
+    ) -> list[MinutesBookListItem]:
+        """Published minutes books for a session, newest business last.
+
+        **One of ``session_code`` or ``session_id`` is required.**  Every
+        other filter needs a session alongside it; LIS answers 400 with
+        "Must provide either a valid Session ID or Session Code" otherwise —
+        including for ``committee_id`` on its own.  The two session forms
+        agree: both returned the same 388 rows for 20261 (checked
+        2026-09-15).
+
+        The rows are shallow and name no bills.  Call
+        :meth:`get_minutes_book` for the categories, entries, and votes.
+
+        Args:
+            session_code: e.g. ``20261``.
+            session_id: e.g. ``59``.  An alternative to ``session_code``.
+            committee_id: ``CommitteeID`` from :meth:`get_committees`.
+                Committee books only, so it excludes every floor book.
+            chamber_code: ``"H"`` or ``"S"``.  Omit for both.
+            start_date: Inclusive lower bound on ``MinutesDate``.
+            end_date: Inclusive upper bound on ``MinutesDate``.
+
+        Envelope key: ``Minutes`` — note the *detail* call answers under
+        ``MinutesBooks`` instead, and the OpenAPI spec says ``ListItems`` for
+        both and is wrong twice.
+        """
+        params: dict = {}
+        if session_code is not None:
+            params["sessionCode"] = session_code
+
+        if session_id is not None:
+            params["sessionID"] = session_id
+
+        if committee_id is not None:
+            params["committeeID"] = committee_id
+
+        if chamber_code:
+            params["chamberCode"] = chamber_code
+
+        if start_date is not None:
+            params["startDate"] = _date_param(start_date)
+
+        if end_date is not None:
+            params["endDate"] = _date_param(end_date)
+
+        data = self._get("/MinutesBook/api/getpublishedminutesbooklistasync", params=params)
+        if data is None:
+            return []
+        return [MinutesBookListItem.model_validate(b) for b in data.get("Minutes", [])]
+
+    def get_minutes_book(
+        self,
+        minutes_book_id: int | None = None,
+        calendar_id: int | None = None,
+    ) -> MinutesBook | None:
+        """One book with its categories, entries, activities, and votes.
+
+        Address it by either key.  Passing neither returns 400
+        ("minutesBookID should be supplied if no calendarID is supplied").
+        A floor book's ``CalendarID`` comes off
+        :attr:`~va_lis_client.models.minutes.MinutesBookListItem.MinutesCalendars`.
+
+        Senate book 3861 (2026-04-22) carries 11 categories, 195 entries, 181
+        of them on a bill, and 205 activities of which 171 name a vote.
+
+        Args:
+            minutes_book_id: ``MinutesBookID`` from :meth:`get_minutes_books`.
+            calendar_id: ``CalendarID`` of the book's floor calendar.
+
+        Returns:
+            The :class:`MinutesBook`, or ``None`` when LIS answers 204.
+
+        Envelope key: ``MinutesBooks`` — a list holding one book.
+        """
+        params: dict = {}
+        if minutes_book_id is not None:
+            params["minutesBookID"] = minutes_book_id
+
+        if calendar_id is not None:
+            params["calendarID"] = calendar_id
+
+        data = self._get("/MinutesBook/api/getminutesbookasync", params=params)
+        if data is None:
+            return None
+
+        rows = data.get("MinutesBooks", [])
+        return MinutesBook.model_validate(rows[0]) if rows else None
+
+    def get_minutes_book_interactive(
+        self,
+        minutes_book_id: int | None = None,
+        calendar_id: int | None = None,
+        reference_number: str | None = None,
+        session_code: int | None = None,
+    ) -> MinutesBook | None:
+        """The same book shaped for the LIS web calendar.  Prefer the plain call.
+
+        **This view is lossy.**  Against Senate book 3861 it returned 168
+        entries where :meth:`get_minutes_book` returned 195, 8 categories
+        against 11, and it dropped ``EventCode``, ``IsBlock`` and every one
+        of the 171 ``VoteTally`` strings (checked 2026-09-15).  It gains only
+        narrative summaries: 39 against 18.  Reach for it when you want the
+        prose, never when you want the votes.
+
+        ``reference_number`` and ``session_code`` must travel together; LIS
+        answers 400 for either alone.
+
+        Envelope key: ``MinutesBooks``.
+        """
+        params: dict = {}
+        if minutes_book_id is not None:
+            params["minutesBookID"] = minutes_book_id
+
+        if calendar_id is not None:
+            params["calendarID"] = calendar_id
+
+        if reference_number is not None:
+            params["referenceNumber"] = reference_number
+
+        if session_code is not None:
+            params["sessionCode"] = session_code
+
+        data = self._get("/MinutesBook/api/getminutesbookinteractivecalendarasync", params=params)
+        if data is None:
+            return None
+
+        rows = data.get("MinutesBooks", [])
+        return MinutesBook.model_validate(rows[0]) if rows else None
+
+    def get_action_reference_types(self) -> list[ActionReferenceType]:
+        """Reference list of 15 activity-reference kinds.
+
+        ``ObjectName`` names the entity a reference points at, so it says
+        which service resolves ``ActivityReference.ReferenceID``.  The ids
+        run 1-9 and 11-16; there is no 10.
+
+        Envelope key: ``ActionReferenceTypeList``.
+        """
+        data = self._get("/MinutesBook/api/getactionreferencetypelistasync")
+        if data is None:
+            return []
+        return [
+            ActionReferenceType.model_validate(t) for t in data.get("ActionReferenceTypeList", [])
         ]
 
     # ------------------------------------------------------------------

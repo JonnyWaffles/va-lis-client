@@ -55,7 +55,7 @@ import threading
 import time
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from html.parser import HTMLParser
 
 from va_lis_client.client import LISClient
@@ -67,8 +67,10 @@ from va_lis_client.exceptions import (
     TextVersionNotFoundError,
 )
 from va_lis_client.models import (
+    CalendarAction,
     Committee,
     CommitteeMember,
+    Contact,
     DocketDetail,
     DocketItem,
     Legislation,
@@ -82,7 +84,12 @@ from va_lis_client.models import (
     Member,
     MemberLegislation,
     MemberVoteResult,
+    MinutesActivity,
+    MinutesBook,
+    MinutesBookListItem,
+    MinutesEntry,
     Patron,
+    Personnel,
     Vote,
     VoteMember,
     VoteStatement,
@@ -91,6 +98,12 @@ from va_lis_client.models import (
 
 DEFAULT_BILL_LIST_TTL = 15 * 60
 DEFAULT_ROSTER_TTL = 60 * 60
+
+# A contact hangs off an owner type, and a member is type 3.  Its mailing
+# address is contact type 9.  Both come from the Contact reference lists,
+# which a Contact row cannot tell you itself: it never sends OwnerTypeID.
+_MEMBER_OWNER_TYPE = 3
+_MEMBER_MAILING = 9
 
 _BILL_NUMBER_RE = re.compile(r"([A-Z]+)(\d+)")
 
@@ -326,6 +339,71 @@ class DocketEntry:
         return schedule.RoomDescription if schedule else None
 
 
+@dataclass(frozen=True)
+class MinutesRecord:
+    """One action in one minutes book, flattened to a single row.
+
+    :meth:`LISService.minutes_records` returns these.  A minutes book nests
+    book to category to entry to activity; this is the join of the three
+    levels that carry meaning, one record per activity.  ``book`` repeats
+    across every record from the same day.
+
+    Unlike a bill event, :attr:`vote_id` here is the roll call for
+    :attr:`bill_number` — see
+    :class:`~va_lis_client.models.minutes.MinutesActivity`.  Pass it to
+    :meth:`LISService.roll_call` to name the members.
+    """
+
+    book: MinutesBook
+    entry: MinutesEntry
+    activity: MinutesActivity
+
+    @property
+    def bill_number(self) -> str | None:
+        """e.g. ``"SB2"``, or ``None`` for procedural business."""
+        return self.entry.LegislationNumber
+
+    @property
+    def date(self) -> datetime | None:
+        """The day the body met."""
+        return self.book.MinutesDate
+
+    @property
+    def body(self) -> str | None:
+        """The committee name, or the chamber code for a floor book."""
+        return self.book.CommitteeName or self.book.ChamberCode
+
+    @property
+    def description(self) -> str | None:
+        """What happened, e.g. ``"Reported from Rules (13-Y 0-N)"``."""
+        return self.activity.Description
+
+    @property
+    def event_code(self) -> str | None:
+        """The action's event code, e.g. ``"S1005"``."""
+        return self.activity.EventCode
+
+    @property
+    def vote_id(self) -> int | None:
+        """The roll call for this bill, or ``None`` when no vote was taken."""
+        return self.activity.VoteID
+
+    @property
+    def tally(self) -> str | None:
+        """The minutes' tally string, which keeps a chair's tiebreak."""
+        return self.activity.VoteTally
+
+    @property
+    def is_block(self) -> bool:
+        """Whether one motion disposed of this bill along with others."""
+        return self.activity.IsBlock
+
+    @property
+    def is_voice(self) -> bool:
+        """Whether the vote was a voice vote, which names no members."""
+        return self.activity.is_voice
+
+
 class LISService:
     """Resolution and reference joins over a :class:`LISClient`.
 
@@ -365,6 +443,8 @@ class LISService:
         self._committees: dict[tuple[str | None, bool], tuple[float, list[Committee]]] = {}
         self._committee_rosters: dict[tuple[int, int], tuple[float, list[CommitteeMember]]] = {}
         self._dockets: dict[int, tuple[float, DocketDetail | None]] = {}
+        self._minutes: dict[int, tuple[float, MinutesBook | None]] = {}
+        self._calendar_actions: dict[int, list[CalendarAction]] | None = None
         self._event_types: dict[str, list[LegislationEventType]] | None = None
         self._statuses_by_name: dict[str, LegislationStatus] | None = None
         self._statuses_by_id: dict[int, LegislationStatus] | None = None
@@ -379,6 +459,7 @@ class LISService:
         self._committee_locks: dict[tuple[str | None, bool], threading.Lock] = {}
         self._committee_roster_locks: dict[tuple[int, int], threading.Lock] = {}
         self._docket_locks: dict[int, threading.Lock] = {}
+        self._minutes_locks: dict[int, threading.Lock] = {}
         self._guard = threading.Lock()
         self._reference_lock = threading.Lock()
 
@@ -1207,6 +1288,217 @@ class LISService:
 
         return entries
 
+    def minutes_books(
+        self,
+        session_code: int,
+        *,
+        committee: int | str | None = None,
+        chamber_code: str | None = None,
+        start_date: str | date | datetime | None = None,
+        end_date: str | date | datetime | None = None,
+    ) -> list[MinutesBookListItem]:
+        """The published minutes books for a session, shallow and cheap.
+
+        One request.  The rows name no bills; pass a ``MinutesBookID`` to
+        :meth:`minutes_records` for those.
+
+        Both chambers publish committee books, but **only the Senate
+        publishes floor books**: 46 of 388 rows in 20261, 33 of 599 in 20251,
+        and all 45 rows of 20241.  Test
+        :attr:`~va_lis_client.models.minutes.MinutesBookListItem.is_floor` to
+        split them; the ``IsCommittee`` flag LIS sends is ``False`` on every
+        row and means nothing.
+
+        Args:
+            session_code: e.g. ``20261``.  20271 was empty on 2026-09-15.
+            committee: A ``CommitteeID``, or a number or name for
+                :meth:`resolve_committee` (``"S13"``, ``"Courts of Justice"``).
+                Filtering by one excludes every floor book.
+            chamber_code: ``"H"`` or ``"S"``.  Omit for both.
+            start_date: Inclusive lower bound on the meeting date.
+            end_date: Inclusive upper bound on the meeting date.
+
+        Raises:
+            CommitteeNotFoundError: A name or number matches nothing, or more
+                than one committee.
+        """
+        committee_id = None
+        if isinstance(committee, str):
+            committee_id = self.resolve_committee(committee, chamber_code).CommitteeID
+        elif committee is not None:
+            committee_id = committee
+
+        return self.client.get_minutes_books(
+            session_code=session_code,
+            committee_id=committee_id,
+            chamber_code=chamber_code,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    def minutes_book(
+        self,
+        minutes_book_id: int,
+        *,
+        refresh: bool = False,
+    ) -> MinutesBook | None:
+        """One full book, cached for ``roster_ttl``.
+
+        A book is large — Senate book 3861 runs to 195 entries — so it is
+        worth keeping between calls.
+
+        Args:
+            minutes_book_id: ``MinutesBookID`` from :meth:`minutes_books`.
+            refresh: Fetch the book again even when cached.
+        """
+        return self._memo(
+            self._minutes,
+            self._minutes_locks,
+            minutes_book_id,
+            lambda: self.client.get_minutes_book(minutes_book_id),
+            refresh=refresh,
+        )
+
+    def minutes_records(
+        self,
+        minutes_book_id: int,
+        *,
+        bills_only: bool = True,
+        refresh: bool = False,
+    ) -> list[MinutesRecord]:
+        """Every action in one book, flattened, in book order.
+
+        This is the layer that answers "what did this body do, and how did
+        each member vote on it".  Each record carries the book, the entry
+        that names the bill, and the activity that names the vote.  Feed
+        :attr:`MinutesRecord.vote_id` to :meth:`roll_call`; unlike a bill
+        event's vote id, this one belongs to the bill on the record.
+
+        Senate book 3861 holds 205 activities and yields 190 bill records,
+        169 of them naming a vote and 14 of those cast in a block.
+
+        Args:
+            minutes_book_id: ``MinutesBookID`` from :meth:`minutes_books`.
+            bills_only: Drop procedural entries — recesses, prayers, orders
+                of business — that name no bill.  Pass ``False`` for the
+                whole day's proceedings.
+            refresh: Fetch the book again even when cached.
+        """
+        book = self.minutes_book(minutes_book_id, refresh=refresh)
+        if book is None:
+            return []
+
+        entries = book.bill_entries if bills_only else book.entries
+
+        return [
+            MinutesRecord(book, entry, activity)
+            for entry in entries
+            for activity in entry.MinutesActivities
+        ]
+
+    def committee_staff(
+        self,
+        committee: int | str,
+        *,
+        chamber_code: str | None = None,
+        staff_role_type_id: int | None = None,
+    ) -> list[Personnel]:
+        """Who clerks or staffs a committee.
+
+        This is the only place LIS says it. ``AffiliationID`` on a personnel
+        row is a ``CommitteeID``, and all 34 distinct values resolve, ten of
+        them to subcommittees the committee list does not return.
+
+        The data is not session scoped, so there is no session argument. Rows
+        carry an ``EffectiveBeginDate`` if you need to age them.
+
+        Args:
+            committee: A ``CommitteeID``, or a number or name for
+                :meth:`resolve_committee` (``"H08"``, ``"Courts of Justice"``).
+            chamber_code: Disambiguates a name both chambers use.
+            staff_role_type_id: ``1`` clerks, ``2`` staff. Omit for both.
+
+        Raises:
+            CommitteeNotFoundError: A name or number matches nothing, or more
+                than one committee.
+        """
+        if isinstance(committee, str):
+            committee_id = self.resolve_committee(committee, chamber_code).CommitteeID
+        else:
+            committee_id = committee
+
+        return self.client.get_personnel(
+            affiliation_id=committee_id,
+            staff_role_type_id=staff_role_type_id,
+        )
+
+    def member_office(self, member_id: int) -> Contact | None:
+        """A member's district office address and phone, or ``None``.
+
+        The district office is the part of a member's contact detail that
+        lives nowhere else in LIS. A :class:`~va_lis_client.models.member.Member`
+        already carries ``GABEmailAddress`` and ``GABPhoneNumber``, and the
+        email agrees on 115 of 124 rows, so the address and the district
+        phone are the reason to call this.
+
+        **Many members have no row.** 390 member contacts exist against the
+        148 members sitting in 20261, so the set is part historical and part
+        incomplete. Member 503 answers and member 527 does not.
+
+        Args:
+            member_id: ``MemberID`` from :meth:`find_members` or a roll call.
+        """
+        contacts = self.client.get_contacts(member_id, _MEMBER_OWNER_TYPE)
+
+        return next((c for c in contacts if c.ContactTypeID == _MEMBER_MAILING), None)
+
+    def calendar_actions_by_id(self) -> dict[int, list[CalendarAction]]:
+        """The action vocabulary indexed by ``CalendarActionID``, fetched once.
+
+        This is what turns a minutes activity's ``CalendarActionID`` into a
+        label. The fetch is 4,952 rows and roughly 2 MB with no filter
+        available, so it is kept for the life of the instance.
+
+        **The value is a list, not a single row.** Those 4,952 rows hold only
+        490 distinct ids, because LIS emits one row per calendar category the
+        action can appear under. Id 1016 arrives 84 times, identical except
+        for the category, all carrying ``EventCode`` ``"H4000"``. This is the
+        same one-to-many shape as :meth:`event_types_by_code`.
+        """
+        with self._reference_lock:
+            if self._calendar_actions is None:
+                index: dict[int, list[CalendarAction]] = {}
+                for action in self.client.get_calendar_actions():
+                    index.setdefault(action.CalendarActionID, []).append(action)
+
+                self._calendar_actions = index
+
+            return self._calendar_actions
+
+    def action_for(self, activity: MinutesActivity) -> CalendarAction | None:
+        """The vocabulary row describing one minutes activity.
+
+        Picks the row whose ``EventCode`` matches the activity's, which is
+        what disambiguates the repeated ids. Against Senate book 3861, 204 of
+        205 activities resolved and the event code agreed on every one.
+
+        Returns ``None`` when the activity names no action, or when the id is
+        absent from the vocabulary.
+        """
+        if activity.CalendarActionID is None:
+            return None
+
+        rows = self.calendar_actions_by_id().get(activity.CalendarActionID)
+        if not rows:
+            return None
+
+        if activity.EventCode:
+            match = next((r for r in rows if r.EventCode == activity.EventCode), None)
+            if match is not None:
+                return match
+
+        return rows[0]
+
     def session_id(self, session_code: int) -> int:
         """The ``SessionID`` behind a session code, e.g. ``59`` for ``20261``.
 
@@ -1367,9 +1659,11 @@ class LISService:
             self._committees.clear()
             self._committee_rosters.clear()
             self._dockets.clear()
+            self._minutes.clear()
 
         with self._reference_lock:
             self._session_ids = None
+            self._calendar_actions = None
             self._event_types = None
             self._statuses_by_name = None
             self._statuses_by_id = None
