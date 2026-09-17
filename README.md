@@ -74,6 +74,9 @@ item, detail = service.bill_text("HB1", 20261)
 item, detail = service.bill_text("HB1", 20261, "HB1ER")
 print(strip_html(detail.DraftText))
 
+# The versions of many bills in one request, grouped back by bill.
+versions = service.bill_versions(["HB1", "HB1503"], 20261)
+
 # Who voted which way, with party and district already attached.
 for row in service.roll_call("HB1", 20261):
     print(row.name, row.party, row.district, row.response)
@@ -248,7 +251,7 @@ several overlapping identifiers:
 | `SessionID` | `59` | Surrogate PK. Either code or ID works as query param |
 | `LegislationNumber` | `"HB1"` | **Must be unpadded** — `HB0001` returns 204 |
 | `LegislationID` | `98525` | Surrogate PK for the *logical* bill — reused across carry-over (see below) |
-| `DocumentCode` | `"HB1ER"` | Bill number + version suffix |
+| `DocumentCode` | `"HB1ER"` | Bill number + version code, e.g. `HB1503HC1`. A chaptered version carries its chapter number instead, e.g. `CHAP0350` |
 | `LegislationTextID` | `257719` | PK for one immutable text snapshot — follows the bill across carry-over (see below) |
 | `CommitteeID` | `14` | Surrogate PK for a committee |
 | `MinutesBookID` | `3861` | Surrogate PK for one body's proceedings on one day |
@@ -352,9 +355,15 @@ The docs say `ListItems` everywhere. Reality:
 | Agencies | `ListItems` | `Agencies` |
 | Category types | `ListItems` | `CategoryTypes` |
 | Chamber patron index | `ListItems` | `PatronLegislation` |
+| Bill versions (both calls) | `ListItems` | `LegislationsVersion` |
+| Chamber statistics | `ListItems` | `ChamberStatistics` |
+| Committee statistics | `ListItems` | `CommitteeStatistics` |
 
 MinutesBook and LegislationCommunications each answer a list and a detail
 under *different* keys, so the spec is wrong twice for both.
+
+`LegislationsVersion` is not a typo in this table. LIS pluralizes the first
+word, and sends a `SearchCriteria` key beside it that was null on every call.
 
 ## Pagination (undocumented)
 
@@ -429,9 +438,22 @@ the row count nor the unique bill count. See
 - `get_legislation_statuses()` → all 52 status reference entries
 
 #### LegislationText (`/LegislationText/api/`)
-- `get_legislation_versions()` → 13 version type references (Introduced, Enrolled, etc.)
+- `get_legislation_versions()` → 13 version type references (Introduced, Enrolled, etc.), the vocabulary and not one bill's versions
 - `get_bill_texts(legislation_number, session_code)` → text version list
 - `get_bill_text_detail(legislation_id, session_code)` → full HTML bill text
+
+#### LegislationVersion (`/LegislationVersion/api/`)
+- `get_bill_versions(legislation_number, session_code=None, session_id=None)` → one bill's published versions, oldest first; a session is required
+- `get_bill_versions_by_id(legislation_id=None, legislation_ids=None)` → the same by id, for one bill or many in one request; raises `ValueError` with no id
+
+The rows are `BillVersion`, not `LegislationVersion`. That name belongs to the
+version type vocabulary above. They are the text list's records in another
+shape, and the service earns its place twice. The bulk form fetches many
+bills in one request, and `LISService.bill_versions` turns bill numbers into
+that call. The single id form is the one that returns the PDF, HTML and
+impact statement links. Read [Bill versions](#bill-versions).
+
+Not wired: `clearpubliccache`, which changes server state.
 
 #### LegislationSummary (`/LegislationSummary/api/`)
 - `get_bill_summaries(legislation_number, session_code)` → bill summaries (HTML)
@@ -656,6 +678,16 @@ that one.
 `clearpubliccache` and `clearintroductiondatelistcacheasync` are cache
 management, not data.
 
+#### Statistics (`/Statistics/api/`)
+- `get_chamber_statistics(session_code=None, session_id=None)` → bill counts per chamber and legislation type, 6 rows for 20261; a session is required
+- `get_committee_statistics(chamber_code, session_code=None, session_id=None)` → referral counts per standing committee, 14 House and 11 Senate for 20261; a chamber and a session are both required
+
+LIS aggregates these itself and names no bill, and the numbers do not always
+agree with the lists they summarize. Read
+[Session statistics](#session-statistics) before you report one.
+
+Not wired: `clearpubliccache`, which changes server state.
+
 ### Investigated and deliberately not wired
 
 Every service below was read from its OpenAPI spec and probed live on
@@ -712,12 +744,6 @@ ReportFileGeneration does have two public paths, and they are how you
 survey the API: `GetApiListAsync?IsPartner=false` returns the 31 public
 service names, and `getapidocumentationasync?ApiName=<Service>` returns one
 service's OpenAPI document.
-
-Not wired yet: **Statistics** (`getchamberstatisticsasync`,
-`getcommitteestatisticsasync`) and **LegislationVersion**
-(`getlegislationversionbybillnumberasync`,
-`getlegislationversionbylegislationidasync`). Both answer with data for a
-public key.
 
 ## Searching bills
 
@@ -1790,6 +1816,180 @@ of one per member.
 personnel identity. It is wired for completeness, and it will not join to
 anything you are working on.
 
+## Bill versions
+
+The LegislationVersion service lists a bill's published versions: introduced,
+each substitute and amendment, engrossed, enrolled, chaptered. Every row is a
+record the text list already has, with the same `LegislationTextID` (checked
+on HB1 in 20261 and 20241, and on HB1503 in 20261). It adds the chamber that
+made the version, its sponsor, and its disposition, and drops `IsComplete`,
+`GovernorsRequest`, `IsEmergency` and `IsReprint`.
+
+```python
+for v in client.get_bill_versions("HB1503", session_code=20261):
+    print(v.DocumentCode, v.Version, v.Description, v.TextDisposition)
+# HB1503     Introduced  Introduced            Posted
+# HB1503HC1  Substitute  Education Substitute  Offered
+# ...
+# CHAP0869   Chaptered   Chaptered             Posted
+
+# Many bills at once, grouped back by bill. No files on this path.
+by_bill = service.bill_versions(["HB1", "HB1503", "SB2"], 20261)
+
+# One request per bill, and the files come back.
+for v in client.get_bill_versions_by_id(98525):
+    print(v.DocumentCode, v.PdfFile[0].FileURL)
+# HB1       https://lis.blob.core.windows.net/files/1081188.PDF
+```
+
+Every count below was measured on 2026-09-17.
+
+### Two things are named LegislationVersion
+
+`LegislationVersion` in `va_lis_client.models` is the 13 row vocabulary of
+version *types* that `get_legislation_versions()` returns. The
+LegislationVersion *service* returns one bill's versions, modeled as
+`BillVersion`. `BillVersion.LegislationVersionID` points into the vocabulary,
+and `Version` equalled the vocabulary's `Name` on all 551 rows checked.
+
+### Only a request by one id returns the files
+
+`get_bill_versions_by_id(98525)` sends `legislationID`, and LIS fills
+`PdfFile`, `HtmlFile` and `ImpactFile`: a PDF and an HTML link on each of
+HB1's three versions and HB1503's six, plus impact statement PDFs. Every
+other route sends the arrays empty for the same versions:
+
+- the bill number form,
+- the bulk `legislationIDs` form, **even with a single id in the list**,
+- the text list's `PDFFile` and `HTMLFile`.
+
+So the links cost one request per bill. `LISService.bill_versions` takes
+`with_files=True` to pay that. `LinkFile` was empty everywhere.
+
+### The bulk form mixes the bills together
+
+`get_bill_versions_by_id(legislation_ids=[...])` sends the ids as repeated
+`legislationIDs` keys. LIS answers with one list sorted by `DraftDate` across
+every bill, nulls first. Rows from different bills interleave, and the order
+has nothing to do with the order you asked in. Group on `LegislationID`, or
+call `LISService.bill_versions`. 102 ids in one request answered 404 rows and
+228 KB.
+
+| Request | LIS answers |
+| --- | --- |
+| No id at all | Nothing within 60 seconds. The client raises `ValueError` instead of sending it |
+| `legislationID` and `legislationIDs` together | 204. The client folds the single id into the list |
+| `legislationIDs=98631,98525` | 400, "The value '98631,98525' is not valid." |
+
+### The number form wants `BillNumber` and a session
+
+The key is `BillNumber`. `legislationNumber`, which the other bill endpoints
+take, answers 400 "The BillNumber field is required." Without a session LIS
+answers 400 "SessionID or SessionCode not provided." The value is case
+insensitive, and a padded `HB0001` answers 204.
+
+**A carried bill answers for the odd year with its even year rows.** HB1013
+in 20251 returns the same single row as in 20241, with `SessionID` 55.
+
+### Row traps
+
+- **`ChamberCode` is the version's chamber, not the bill's.** A Senate
+  committee substitute for a House bill says `S`. 44 of 404 rows sampled from
+  20261 differ from the bill number's prefix, and all of them are substitutes
+  or amendments.
+- **`IsActive` does not mark the current version.** SB633 in 20241 has two
+  active rows and HB241 has none, and 6 of 102 bills sampled from 20261 had
+  two. Order by `DraftDate` instead.
+- **`DocumentCode` is not the bill number plus the vocabulary's suffix.**
+  Substitutes read `HB1503HC1` or `HB1503H1`, never the `S` the vocabulary
+  gives, and a chaptered version carries its chapter number, `CHAP0350`.
+- **`Description` is the specific name and `Version` the type.** "Education
+  Substitute" against "Substitute". They differed on 169 of 404 rows.
+- **2024 rows are thinner.** They pad `DocumentCode` to ten characters, which
+  the model strips. They omit the `TextDisposition` and `TextDispositionID`
+  keys (145 of 147 rows sampled). Some send `DraftDate` null, and their dates
+  can run backwards: SJ76 was enrolled on 2024-02-06 and introduced on
+  2024-02-15.
+
+## Session statistics
+
+```python
+for row in client.get_chamber_statistics(session_code=20251):
+    print(row.ChamberCode, row.LegislationTypeCode, row.total, row.Passed, row.Failed)
+# H B 1463 537 895
+# ...
+
+senate = client.get_committee_statistics("S", session_code=20261)
+```
+
+Every count below was measured on 2026-09-17.
+
+### The chamber totals, checked against the lists
+
+`ChamberStatistic.total` is `Introduced + ContinuedFromLastSession`, the
+session's count for one chamber and one legislation type. Checked against
+`get_legislative_numbers` for 20241 and 20251, and against the session bill
+list for 20261:
+
+| Session | Rows | Sum of `total` | Bills listed | Where they differ |
+| --- | --- | --- | --- | --- |
+| 20241 | 6 | 3,595 | 3,596 | House resolutions: 452 against 453 |
+| 20251 | 6 | 3,512 | 3,512 | Nowhere |
+| 20261 | 6 | 3,646 | 3,645 | House resolutions: 495 against 494 |
+| 20271 | 5 | 443 | not counted | No House resolution row, because none carried over |
+
+**An empty type is omitted, not zeroed**, which is why 20271 has five rows.
+
+### The outcome columns add up differently each session
+
+- **20251:** `Passed + Failed + Incorporated` equals `total` on every row.
+  `Failed` includes the carried over bills that died.
+- **20241:** `Passed + Failed + ContinuedToNextSession` equals it instead.
+  `Incorporated` is 0 on every row, so incorporated bills sit inside `Failed`.
+- **20261:** `Passed + Failed + Incorporated + Pending` overshoots. House
+  bills sum to 1,531 against 1,530, Senate bills to 838 against 836. The bill
+  list's statuses count 493 and 201 failed where the statistics say 494 and
+  203.
+
+`Passed` is chaptered plus vetoed: 712 plus 16 makes the 728 House bills of
+20261. `Pending` matched the bills the list shows as introduced or in
+committee.
+
+### Other chamber traps
+
+- **`ContinuedToNextSession` overcounts.** 20261 says 257 House bills and 175
+  Senate bills were continued. 20271's `ContinuedFromLastSession` says 255 and
+  174, the same as 20261's `Pending`. Use those.
+- **`PassedHouse` and `PassedSenate` are not a funnel.** Senate joint
+  resolutions in 20261 read `PassedSenate` 281, `PassedHouse` 289 and
+  `Passed` 289, though none can reach the House before it passes the Senate.
+- **The chamber endpoint ignores `chamberCode`** and always answers for both.
+- **`AwaitingGovAction` was 0** on every row of all four sessions.
+
+### Committee statistics count referrals, not bills
+
+- **One row per standing committee**, never a subcommittee. The `H` and `S`
+  column prefixes name the **bill's** chamber, so `SReferred` on a House
+  committee counts Senate bills sent to it after crossover.
+- **The committee fields are honest.** `CommitteeID`, `CommitteeNumber` and
+  `CommitteeName` matched the committee list on all 98 rows checked.
+- **The columns do not add up.** In 20261,
+  `Reported + Failed + Incorporated + InCommittee` equalled `Referred` for
+  only 16 of 50 committee and prefix pairs. `Failed` is only what a committee
+  killed: House committees failed 31 House bills, against the 494 House bills
+  the chamber row counts as failed.
+- **`Continued` matches nothing exactly.** 20261 House committees continued
+  182 House bills, and 20271 says 181 came in. H07 continued 21 while holding
+  20 `InCommittee`.
+- **The committee set moves.** 20251 has no row for H18 Privileges and
+  Elections or H24 Health and Human Services, which 20241 and 20261 both list.
+  And 20251's Senate committees still held 5 Senate bills `InCommittee` after
+  the session closed.
+- **A chamber and a session are both required.** Without the chamber LIS
+  answers 400 "The chamberCode field is required." Without a session it
+  answers 400 "Must provide either a valid Session ID or Session Code". An
+  unknown chamber answers 204.
+
 ## How a bill becomes law (Virginia)
 
 A bill's lifecycle through the General Assembly, mapped to LIS status IDs.
@@ -2049,6 +2249,8 @@ src/va_lis_client/
     ├── session.py      # Session, SessionEvent
     ├── legislation.py  # Patron, Legislation, LegislationStatus, ...
     ├── text.py         # LegislationTextItem, LegislationTextDetail, ...
+    ├── bill_version.py # BillVersion: one bill's versions, not the LegislationVersion vocabulary
+    ├── statistics.py   # ChamberStatistic, CommitteeStatistic
     ├── search.py       # LegislationSearchResult, SUMMARY_VERSION_RANK, ...
     ├── event.py        # LegislationEvent, LegislationEventType, ActorType
     ├── pagination.py   # Pagination, PagedList — the X-Pagination protocol

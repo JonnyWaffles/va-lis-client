@@ -16,6 +16,9 @@ questions the raw endpoints leave to every caller:
   to one vocabulary row takes the bill's chamber and ``IsPassed`` as well.
 - Bill text spans two endpoints whose rows match on ``LegislationTextID``,
   and the body arrives as HTML.
+- The bulk version endpoint takes ids, not numbers, and returns every bill's
+  rows interleaved by date.  ``bill_versions`` resolves the numbers through
+  the session's number list and groups the rows back under them.
 - Votes have no bill-first endpoint.  Reaching a bill's roll calls means
   walking its events for ``VoteID`` and fetching each one.
 - A ballot names a member by ``MemberID`` and nothing else, so party and
@@ -67,6 +70,7 @@ from va_lis_client.exceptions import (
     TextVersionNotFoundError,
 )
 from va_lis_client.models import (
+    BillVersion,
     CalendarAction,
     Committee,
     CommitteeMember,
@@ -106,6 +110,10 @@ _MEMBER_OWNER_TYPE = 3
 _MEMBER_MAILING = 9
 
 _BILL_NUMBER_RE = re.compile(r"([A-Z]+)(\d+)")
+
+# Ids per bulk version request.  102 went through in one request on
+# 2026-09-17, so 100 stays inside what has been seen to work.
+_VERSION_BATCH = 100
 
 
 @dataclass(frozen=True)
@@ -444,6 +452,7 @@ class LISService:
         self._committee_rosters: dict[tuple[int, int], tuple[float, list[CommitteeMember]]] = {}
         self._dockets: dict[int, tuple[float, DocketDetail | None]] = {}
         self._minutes: dict[int, tuple[float, MinutesBook | None]] = {}
+        self._legislation_numbers: dict[int, tuple[float, dict[str, int]]] = {}
         self._calendar_actions: dict[int, list[CalendarAction]] | None = None
         self._event_types: dict[str, list[LegislationEventType]] | None = None
         self._statuses_by_name: dict[str, LegislationStatus] | None = None
@@ -460,6 +469,7 @@ class LISService:
         self._committee_roster_locks: dict[tuple[int, int], threading.Lock] = {}
         self._docket_locks: dict[int, threading.Lock] = {}
         self._minutes_locks: dict[int, threading.Lock] = {}
+        self._legislation_number_locks: dict[int, threading.Lock] = {}
         self._guard = threading.Lock()
         self._reference_lock = threading.Lock()
 
@@ -653,6 +663,86 @@ class LISService:
             )
 
         return selected, detail
+
+    def bill_versions(
+        self,
+        bill_numbers: list[str],
+        session_code: int,
+        *,
+        with_files: bool = False,
+    ) -> dict[str, list[BillVersion]]:
+        """Every published version of several bills, grouped by bill.
+
+        The bulk endpoint takes ids and returns every bill's rows mixed
+        together, sorted by date.  This resolves each number to its
+        ``LegislationID`` through the session's number list (268 KB for
+        20261, cached for ``roster_ttl``), fetches the versions 100 ids at a
+        time, and groups the rows back under the numbers asked for.  Each
+        bill keeps the order LIS sent, oldest ``DraftDate`` first.
+
+        For one bill, ``client.get_bill_versions`` is a single small request
+        and needs no list.
+
+        **The bulk request returns no files.**  LIS fills the PDF, HTML and
+        impact statement arrays only when a request names one id, so
+        ``with_files=True`` spends one request per bill to get them.  Without
+        it the arrays are empty, except for a batch that happens to hold a
+        single bill.
+
+        A carried bill's rows name the even year session, because LIS answers
+        with those rows for the odd year too.
+
+        Args:
+            bill_numbers: Any case, padded or not.  Repeats collapse.
+            session_code: e.g. ``20261``.
+            with_files: Fetch one bill at a time, so the file arrays are filled.
+
+        Returns:
+            A dict keyed by normalized bill number, in the order asked.  A
+            bill with no published version maps to ``[]``.
+
+        Raises:
+            InvalidBillNumberError: A string does not parse as a bill number.
+            BillNotFoundError: A number is not in the session, even after the
+                number list is fetched again.
+        """
+        numbers = list(dict.fromkeys(normalize_bill_number(n) for n in bill_numbers))
+        if not numbers:
+            return {}
+
+        ids = self._legislation_ids(session_code)
+        if any(n not in ids for n in numbers):
+            # The bill may be newer than the cached list, so look once more.
+            ids = self._legislation_ids(session_code, refresh=True)
+
+        missing = [n for n in numbers if n not in ids]
+        if missing:
+            raise BillNotFoundError(
+                f"{', '.join(missing)} not in session {session_code}. Check the bill "
+                f"numbers and the session code (20261 = 2026 Regular Session)."
+            )
+
+        wanted = {ids[n]: n for n in numbers}
+        grouped: dict[str, list[BillVersion]] = {n: [] for n in numbers}
+
+        if with_files:
+            for legislation_id, number in wanted.items():
+                grouped[number] = self.client.get_bill_versions_by_id(legislation_id)
+
+            return grouped
+
+        batch = list(wanted)
+
+        for start in range(0, len(batch), _VERSION_BATCH):
+            rows = self.client.get_bill_versions_by_id(
+                legislation_ids=batch[start : start + _VERSION_BATCH]
+            )
+            for row in rows:
+                number = wanted.get(row.LegislationID)
+                if number is not None:
+                    grouped[number].append(row)
+
+        return grouped
 
     def bill_votes(
         self,
@@ -1660,6 +1750,7 @@ class LISService:
             self._committee_rosters.clear()
             self._dockets.clear()
             self._minutes.clear()
+            self._legislation_numbers.clear()
 
         with self._reference_lock:
             self._session_ids = None
@@ -1812,6 +1903,19 @@ class LISService:
             raise CommitteeNotFoundError(f"No committee has CommitteeID {committee_id}.")
 
         return committee
+
+    def _legislation_ids(self, session_code: int, *, refresh: bool = False) -> dict[str, int]:
+        """Bill number to ``LegislationID`` for a session, from the cheap number list."""
+        return self._memo(
+            self._legislation_numbers,
+            self._legislation_number_locks,
+            session_code,
+            lambda: {
+                row.LegislationNumber.upper(): row.LegislationID
+                for row in self.client.get_legislative_numbers(session_code=session_code)
+            },
+            refresh=refresh,
+        )
 
     def _load_statuses(self) -> None:
         if self._statuses_by_name is not None:

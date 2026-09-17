@@ -11,7 +11,9 @@ Run with:
 import unittest
 from datetime import date, datetime
 
-from va_lis_client.client import _date_param
+import requests
+
+from va_lis_client.client import LISClient, _date_param
 from va_lis_client.exceptions import (
     BillNotFoundError,
     CommitteeNotFoundError,
@@ -22,15 +24,19 @@ from va_lis_client.exceptions import (
 )
 from va_lis_client.models import (
     CHIEF_PATRON,
+    BillVersion,
     CalendarAction,
     CalendarDetail,
+    ChamberStatistic,
     Committee,
     CommitteeMember,
+    CommitteeStatistic,
     DocketDetail,
     DocketListItem,
     Legislation,
     LegislationEvent,
     LegislationEventType,
+    LegislationNumberEntry,
     LegislationSearchResult,
     LegislationStatus,
     LegislationSummaryItem,
@@ -377,6 +383,21 @@ def search_row(legislation_id, number, summary_version, status="Continued"):
     )
 
 
+def number_entry(number, legislation_id):
+    return LegislationNumberEntry(LegislationNumber=number, LegislationID=legislation_id)
+
+
+def version_row(text_id, legislation_id, number, version="Introduced", draft=None):
+    """One LegislationVersion row, trimmed to the fields the grouping reads."""
+    return BillVersion(
+        LegislationTextID=text_id,
+        LegislationID=legislation_id,
+        LegislationNumber=number,
+        Version=version,
+        DraftDate=draft,
+    )
+
+
 class FakeClient:
     """A stand-in for LISClient that serves fixtures and counts calls."""
 
@@ -401,6 +422,8 @@ class FakeClient:
         minutes_details=None,
         calendar_actions=None,
         search_results=None,
+        legislative_numbers=None,
+        versions=None,
     ):
         self.events = events if events is not None else []
         self.votes = votes if votes is not None else {}
@@ -451,6 +474,11 @@ class FakeClient:
             ]
         )
         self.search_results = search_results if search_results is not None else []
+        self.legislative_numbers = legislative_numbers if legislative_numbers is not None else []
+        # Every bill's versions in one list, in the date order LIS sends.
+        self.versions = versions if versions is not None else []
+        self.version_batches = []
+        self.single_version_ids = []
         self.last_criteria = None
         self.calls = {}
 
@@ -616,6 +644,21 @@ class FakeClient:
         self._count("search_legislation")
         self.last_criteria = criteria
         return list(self.search_results)
+
+    def get_legislative_numbers(self, session_code=None, session_id=None):
+        self._count("get_legislative_numbers")
+        return list(self.legislative_numbers)
+
+    def get_bill_versions_by_id(self, legislation_id=None, *, legislation_ids=None):
+        self._count("get_bill_versions_by_id")
+        if legislation_id is not None:
+            self.single_version_ids.append(legislation_id)
+            ids = [legislation_id]
+        else:
+            ids = list(legislation_ids)
+            self.version_batches.append(ids)
+
+        return [v for v in self.versions if v.LegislationID in set(ids)]
 
 
 class SearchDedupeTest(unittest.TestCase):
@@ -2310,3 +2353,270 @@ class MeetingShapesTest(unittest.TestCase):
         self.assertEqual(_date_param(date(2026, 2, 2)), "2026-02-02")
         self.assertEqual(_date_param(datetime(2026, 2, 2, 9, 30)), "2026-02-02")
         self.assertEqual(_date_param("2026-02-02"), "2026-02-02")
+
+
+class BillVersionsTest(unittest.TestCase):
+    """The bulk version call mixes bills together; the service sorts them out."""
+
+    def client(self, numbers=None, versions=None):
+        if numbers is None:
+            numbers = [
+                number_entry("HB1", 98525),
+                number_entry("SB2", 98536),
+                number_entry("HB9", 98631),
+            ]
+
+        if versions is None:
+            # Interleaved by date across bills, the way LIS sends them.
+            versions = [
+                version_row(257719, 98525, "HB1", draft="2025-11-17T07:28:00"),
+                version_row(257905, 98631, "HB9", draft="2025-12-19T07:32:00"),
+                version_row(266240, 98525, "HB1", "Enrolled", draft="2026-03-11T04:00:00"),
+                version_row(267622, 98536, "SB2", "Enrolled", draft="2026-03-12T04:00:00"),
+            ]
+
+        return FakeClient(legislative_numbers=numbers, versions=versions)
+
+    def test_interleaved_rows_are_grouped_under_the_numbers_asked(self):
+        grouped = LISService(self.client()).bill_versions(["SB2", "HB1"], 20261)
+
+        self.assertEqual(list(grouped), ["SB2", "HB1"])
+        self.assertEqual([v.LegislationTextID for v in grouped["HB1"]], [257719, 266240])
+        self.assertEqual([v.LegislationTextID for v in grouped["SB2"]], [267622])
+
+    def test_numbers_are_normalized_and_repeats_collapse(self):
+        client = self.client()
+
+        grouped = LISService(client).bill_versions(["hb0001", "HB1"], 20261)
+
+        self.assertEqual(list(grouped), ["HB1"])
+        self.assertEqual(client.version_batches, [[98525]])
+
+    def test_ids_go_out_in_batches_of_one_hundred(self):
+        numbers = [number_entry(f"HB{i}", 100000 + i) for i in range(1, 251)]
+        client = self.client(numbers=numbers, versions=[])
+
+        grouped = LISService(client).bill_versions([f"HB{i}" for i in range(1, 251)], 20261)
+
+        self.assertEqual([len(b) for b in client.version_batches], [100, 100, 50])
+        self.assertEqual(grouped["HB250"], [])
+
+    def test_with_files_asks_one_bill_at_a_time(self):
+        """Only a request by one ``legislationID`` comes back with files."""
+        client = self.client()
+
+        grouped = LISService(client).bill_versions(["SB2", "HB1"], 20261, with_files=True)
+
+        self.assertEqual(client.single_version_ids, [98536, 98525])
+        self.assertEqual(client.version_batches, [])
+        self.assertEqual([v.LegislationTextID for v in grouped["HB1"]], [257719, 266240])
+
+    def test_the_number_list_is_cached(self):
+        client = self.client()
+        service = LISService(client)
+
+        service.bill_versions(["HB1"], 20261)
+        service.bill_versions(["SB2"], 20261)
+
+        self.assertEqual(client.calls["get_legislative_numbers"], 1)
+
+    def test_an_unknown_number_refetches_the_list_once_then_raises(self):
+        client = self.client()
+
+        with self.assertRaises(BillNotFoundError) as caught:
+            LISService(client).bill_versions(["HB1", "HB99999"], 20261)
+
+        self.assertIn("HB99999", str(caught.exception))
+        self.assertEqual(client.calls["get_legislative_numbers"], 2)
+        self.assertNotIn("get_bill_versions_by_id", client.calls)
+
+    def test_a_bill_newer_than_the_cached_list_is_found_on_the_refetch(self):
+        client = self.client()
+        service = LISService(client)
+        service.bill_versions(["HB1"], 20261)
+
+        client.legislative_numbers.append(number_entry("HB2000", 120000))
+        grouped = service.bill_versions(["HB2000"], 20261)
+
+        self.assertEqual(grouped, {"HB2000": []})
+        self.assertEqual(client.calls["get_legislative_numbers"], 2)
+
+    def test_clear_cache_drops_the_number_list(self):
+        client = self.client()
+        service = LISService(client)
+
+        service.bill_versions(["HB1"], 20261)
+        service.clear_cache()
+        service.bill_versions(["HB1"], 20261)
+
+        self.assertEqual(client.calls["get_legislative_numbers"], 2)
+
+    def test_no_numbers_costs_nothing(self):
+        client = self.client()
+
+        self.assertEqual(LISService(client).bill_versions([], 20261), {})
+        self.assertEqual(client.calls, {})
+
+    def test_a_bad_number_raises_before_any_request(self):
+        client = self.client()
+
+        with self.assertRaises(InvalidBillNumberError):
+            LISService(client).bill_versions(["not a bill"], 20261)
+
+        self.assertEqual(client.calls, {})
+
+
+class VersionAndStatisticsRequestTest(unittest.TestCase):
+    """The parameter traps the client steps around, with ``_get`` replaced."""
+
+    def setUp(self):
+        self.client = LISClient(api_key="not-a-real-key")
+        self.sent = []
+        self.answer = None
+
+        def fake_get(path, params=None, **kwargs):
+            self.sent.append((path, params))
+            return self.answer
+
+        self.client._get = fake_get
+
+    def test_no_id_raises_before_any_request(self):
+        """LIS does not refuse this request; it did not answer within 60 seconds."""
+        with self.assertRaises(ValueError):
+            self.client.get_bill_versions_by_id()
+
+        with self.assertRaises(ValueError):
+            self.client.get_bill_versions_by_id(legislation_ids=[])
+
+        self.assertEqual(self.sent, [])
+
+    def test_one_id_uses_the_singular_key(self):
+        """The singular key is the only form that returns the file arrays."""
+        self.client.get_bill_versions_by_id(98525)
+        self.client.get_bill_versions_by_id(legislation_ids=[98525])
+
+        self.assertEqual(self.sent[0][1], {"legislationID": 98525})
+        self.assertEqual(self.sent[1][1], {"legislationID": 98525})
+
+    def test_both_forms_fold_into_the_list(self):
+        """LIS answers 204 when both keys arrive together."""
+        self.client.get_bill_versions_by_id(98525, legislation_ids=[98631])
+
+        self.assertEqual(self.sent[0][1], {"legislationIDs": [98525, 98631]})
+
+    def test_a_list_goes_out_as_repeated_keys(self):
+        """A comma joined value answers 400; repeated keys are what LIS wants."""
+        request = requests.Request(
+            "GET", "https://x/y", params={"legislationIDs": [98631, 98525]}
+        ).prepare()
+
+        self.assertEqual(request.url, "https://x/y?legislationIDs=98631&legislationIDs=98525")
+
+    def test_the_bill_number_key_is_capitalized(self):
+        self.client.get_bill_versions("HB1", session_code=20261)
+
+        self.assertEqual(
+            self.sent[0],
+            (
+                "/LegislationVersion/api/getlegislationversionbybillnumberasync",
+                {"BillNumber": "HB1", "sessionCode": 20261},
+            ),
+        )
+
+    def test_committee_statistics_always_send_the_chamber(self):
+        self.client.get_committee_statistics("H", session_id=59)
+
+        self.assertEqual(
+            self.sent[0],
+            ("/Statistics/api/getcommitteestatisticsasync", {"chamberCode": "H", "sessionID": 59}),
+        )
+
+    def test_a_204_gives_empty_lists(self):
+        self.assertEqual(self.client.get_bill_versions("HB1", session_code=20271), [])
+        self.assertEqual(self.client.get_bill_versions_by_id(98525), [])
+        self.assertEqual(self.client.get_chamber_statistics(session_code=20261), [])
+        self.assertEqual(self.client.get_committee_statistics("X", session_code=20261), [])
+
+    def test_the_odd_plural_envelope_key_is_read(self):
+        self.answer = {
+            "LegislationsVersion": [{"LegislationTextID": 257719, "LegislationID": 98525}],
+            "SearchCriteria": None,
+        }
+
+        rows = self.client.get_bill_versions("HB1", session_code=20261)
+
+        self.assertEqual([r.LegislationTextID for r in rows], [257719])
+
+    def test_the_statistics_envelope_keys_are_read(self):
+        self.answer = {
+            "ChamberStatistics": [{"ChamberCode": "H", "LegislationTypeCode": "B"}],
+            "CommitteeStatistics": [{"CommitteeID": 1}],
+        }
+
+        self.assertEqual(len(self.client.get_chamber_statistics(session_code=20261)), 1)
+        self.assertEqual(len(self.client.get_committee_statistics("H", session_code=20261)), 1)
+
+
+class VersionAndStatisticsShapesTest(unittest.TestCase):
+    def test_a_2024_version_row_parses(self):
+        """20241 pads the code, nulls the date, and omits the disposition keys."""
+        row = BillVersion.model_validate(
+            {
+                "LegislationID": 91072,
+                "LegislationNumber": "HB1",
+                "ChamberCode": "H",
+                "SessionID": 55,
+                "LegislationTextID": 246666,
+                "DraftDate": None,
+                "DocumentCode": "HB1AG     ",
+                "Description": "Veto Explanation",
+                "Sponsor": "Governor",
+                "LDNumber": None,
+                "LegislationVersionID": 9,
+                "Version": "Veto Explanation",
+                "IsPublic": True,
+                "IsActive": False,
+                "PdfFile": [],
+                "HtmlFile": [],
+                "LinkFile": [],
+                "ImpactFile": [],
+            }
+        )
+
+        self.assertEqual(row.DocumentCode, "HB1AG")
+        self.assertIsNone(row.DraftDate)
+        self.assertIsNone(row.TextDisposition)
+        self.assertEqual(row.PdfFile, [])
+
+    def test_a_padded_description_is_stripped(self):
+        row = BillVersion(LegislationTextID=1, Description="Conference Report ")
+
+        self.assertEqual(row.Description, "Conference Report")
+
+    def test_chamber_total_adds_the_carry_over(self):
+        """20251 House bills: 1,236 introduced plus 227 carried over."""
+        row = ChamberStatistic(
+            ChamberCode="H",
+            LegislationTypeCode="B",
+            Introduced=1236,
+            ContinuedFromLastSession=227,
+        )
+
+        self.assertEqual(row.total, 1463)
+        self.assertEqual(ChamberStatistic(ChamberCode="H", LegislationTypeCode="R").total, 0)
+
+    def test_a_committee_row_parses(self):
+        row = CommitteeStatistic.model_validate(
+            {
+                "CommitteeID": 1,
+                "CommitteeNumber": "H01",
+                "CommitteeName": "Agriculture, Chesapeake and Natural Resources",
+                "HReferred": 90,
+                "SReferred": 18,
+                "HContinuedFrom": 0,
+            }
+        )
+
+        self.assertEqual(row.CommitteeNumber, "H01")
+        self.assertEqual(row.SReferred, 18)
+        self.assertIsNone(row.SFailed)

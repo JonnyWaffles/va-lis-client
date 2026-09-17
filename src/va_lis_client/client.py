@@ -66,16 +66,19 @@ from va_lis_client.models import (
     ActionReferenceType,
     ActorType,
     Agency,
+    BillVersion,
     CalendarAction,
     CalendarCategoryType,
     CalendarDetail,
     CalendarItem,
     CalendarType,
     CategoryType,
+    ChamberStatistic,
     Committee,
     CommitteeAction,
     CommitteeMember,
     CommitteeRole,
+    CommitteeStatistic,
     Communication,
     CommunicationCategoryType,
     CommunicationFile,
@@ -609,6 +612,130 @@ class LISClient:
         if data is None:
             return []
         return [LegislationTextDetail.model_validate(t) for t in data.get("TextsList", [])]
+
+    # ------------------------------------------------------------------
+    # Legislation versions (one bill's published versions, and a bulk form)
+    # ------------------------------------------------------------------
+
+    def get_bill_versions(
+        self,
+        legislation_number: str,
+        *,
+        session_code: int | None = None,
+        session_id: int | None = None,
+    ) -> list[BillVersion]:
+        """Every published version of one bill in a session, oldest first.
+
+        The same records :meth:`get_bill_texts` lists, in the
+        :class:`BillVersion` shape, which adds the chamber that made each
+        version, its sponsor, and its disposition.
+
+        **The file arrays come back empty here.**  Call
+        :meth:`get_bill_versions_by_id` with the one id for the PDF, HTML and
+        impact statement links.
+
+        **A session is required.**  With none LIS answers 400, "SessionID or
+        SessionCode not provided."  The two forms returned the same rows for
+        HB1 in 20261 (checked 2026-09-17).
+
+        The query key is ``BillNumber``.  LIS ignores ``legislationNumber``
+        here and answers 400, "The BillNumber field is required."  The value
+        may be any case, but must be unpadded: ``HB0001`` answers 204.
+
+        **A carried bill answers with its even year rows.**  HB1013 in 20251
+        returned its one 20241 row, ``SessionID`` 55, exactly as 20241 did,
+        and HB9 in 20271 returned its 20261 row.  A number the session does
+        not hold answers 204, so HB1 in 20251 and in 20271 both return ``[]``.
+
+        Args:
+            legislation_number: Unpadded, e.g. ``"HB1"``.
+            session_code: e.g. ``20261``.
+            session_id: e.g. ``59``.  An alternative to ``session_code``.
+
+        Envelope key: ``LegislationsVersion``, plural on the first word, beside
+        a ``SearchCriteria`` key that was null.
+        """
+        params: dict = {"BillNumber": legislation_number}
+        if session_code is not None:
+            params["sessionCode"] = session_code
+
+        if session_id is not None:
+            params["sessionID"] = session_id
+
+        data = self._get(
+            "/LegislationVersion/api/getlegislationversionbybillnumberasync",
+            params=params,
+        )
+        if data is None:
+            return []
+        return [BillVersion.model_validate(v) for v in data.get("LegislationsVersion", [])]
+
+    def get_bill_versions_by_id(
+        self,
+        legislation_id: int | None = None,
+        *,
+        legislation_ids: list[int] | None = None,
+    ) -> list[BillVersion]:
+        """Every published version of one bill, or of many, by ``LegislationID``.
+
+        No session is involved, because the id names the bill across its
+        carry over.  HB9 (98631) returned the same row here as by number.
+
+        **Only the single id request returns files.**  With one id this
+        method sends ``legislationID``, and LIS fills ``PdfFile``,
+        ``HtmlFile`` and ``ImpactFile``.  With more it sends
+        ``legislationIDs``, and LIS sends every file array empty, even when
+        that list holds a single id (checked 2026-09-17).  So one request per
+        bill is the price of the links.
+
+        **The bulk form interleaves the bills.**  The rows come back sorted
+        by ``DraftDate`` across the whole response, nulls first, not grouped
+        by bill and not in the order you asked.  Group them on
+        ``LegislationID``, or call ``LISService.bill_versions``, which does.
+        102 ids in one request returned 404 rows and 228 KB (2026-09-17).
+
+        Three traps in the parameters, which this method steps around:
+
+        - **No id at all is not refused.**  LIS neither answered nor errored
+          within 60 seconds, so this method raises ``ValueError`` instead of
+          sending that request.
+        - **``legislationID`` and ``legislationIDs`` together answer 204.**
+          This method folds ``legislation_id`` into the list and sends one
+          form.
+        - **The list rides repeated keys.**  A comma joined value answers 400,
+          "The value '98631,98525' is not valid."
+
+        Args:
+            legislation_id: One id, e.g. ``98525`` for HB1 in 20261.
+            legislation_ids: Many ids, e.g. from :meth:`get_legislative_numbers`.
+                A list of one is sent as ``legislation_id`` would be.
+
+        Raises:
+            ValueError: Neither argument names an id.
+
+        Envelope key: ``LegislationsVersion``.
+        """
+        ids = list(legislation_ids or [])
+        if legislation_id is not None:
+            ids.insert(0, legislation_id)
+
+        if not ids:
+            raise ValueError(
+                "Pass legislation_id or legislation_ids. LIS does not refuse a request "
+                "with neither, and it did not answer one within 60 seconds."
+            )
+
+        # One id goes out singular, which is the only form that returns files.
+        # requests sends a list as a repeated key, which is the form LIS wants.
+        params = {"legislationID": ids[0]} if len(ids) == 1 else {"legislationIDs": ids}
+
+        data = self._get(
+            "/LegislationVersion/api/getlegislationversionbylegislationidasync",
+            params=params,
+        )
+        if data is None:
+            return []
+        return [BillVersion.model_validate(v) for v in data.get("LegislationsVersion", [])]
 
     # ------------------------------------------------------------------
     # Legislation summary
@@ -2291,6 +2418,90 @@ class LISClient:
             LegislationCategory.model_validate(row)
             for row in data.get("LegislationCategoriesList", [])
         ]
+
+    # ------------------------------------------------------------------
+    # Statistics (counts LIS aggregates; they do not always add up)
+    # ------------------------------------------------------------------
+
+    def get_chamber_statistics(
+        self,
+        session_code: int | None = None,
+        session_id: int | None = None,
+    ) -> list[ChamberStatistic]:
+        """Bill counts for a session, one row per chamber and legislation type.
+
+        Six rows for a full session, fewer when a type is empty: 20271 had
+        five before it convened.  Both chambers always come back.  LIS
+        silently ignores ``chamberCode`` here, so this method does not take
+        one.
+
+        **A session is required.**  With none LIS answers 400, "Must provide
+        either a valid Session ID or Session Code".  The two forms returned
+        the same rows for 20261 (checked 2026-09-17).
+
+        Read :class:`ChamberStatistic` before you sum a column.  The outcome
+        columns add up differently from session to session, and in 20261 they
+        overshoot the session's own totals by a bill or two.
+
+        Args:
+            session_code: e.g. ``20261``.
+            session_id: e.g. ``59``.  An alternative to ``session_code``.
+
+        Envelope key: ``ChamberStatistics``.
+        """
+        params: dict = {}
+        if session_code is not None:
+            params["sessionCode"] = session_code
+
+        if session_id is not None:
+            params["sessionID"] = session_id
+
+        data = self._get("/Statistics/api/getchamberstatisticsasync", params=params)
+        if data is None:
+            return []
+
+        return [ChamberStatistic.model_validate(r) for r in data.get("ChamberStatistics", [])]
+
+    def get_committee_statistics(
+        self,
+        chamber_code: str,
+        *,
+        session_code: int | None = None,
+        session_id: int | None = None,
+    ) -> list[CommitteeStatistic]:
+        """Referral counts for one chamber's standing committees in a session.
+
+        14 House and 11 Senate rows for 20261.  No subcommittee ever appears.
+
+        **Both a chamber and a session are required.**  Without the chamber
+        LIS answers 400, "The chamberCode field is required."  Without a
+        session it answers 400, "Must provide either a valid Session ID or
+        Session Code".  An unknown chamber answers 204.  The two session forms
+        returned the same rows for House 20261 (checked 2026-09-17).
+
+        Every row counts bills from both chambers: the ``H`` and ``S`` column
+        prefixes name the bill's chamber, not the committee's.  See
+        :class:`CommitteeStatistic`.
+
+        Args:
+            chamber_code: ``"H"`` or ``"S"``, the committees' chamber.
+            session_code: e.g. ``20261``.
+            session_id: e.g. ``59``.  An alternative to ``session_code``.
+
+        Envelope key: ``CommitteeStatistics``.
+        """
+        params: dict = {"chamberCode": chamber_code}
+        if session_code is not None:
+            params["sessionCode"] = session_code
+
+        if session_id is not None:
+            params["sessionID"] = session_id
+
+        data = self._get("/Statistics/api/getcommitteestatisticsasync", params=params)
+        if data is None:
+            return []
+
+        return [CommitteeStatistic.model_validate(r) for r in data.get("CommitteeStatistics", [])]
 
 
 def _date_param(value: str | date | datetime) -> str:
