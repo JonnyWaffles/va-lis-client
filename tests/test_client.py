@@ -732,6 +732,33 @@ class LiveMemberBillsTest(unittest.TestCase):
         self.assertEqual(roles[1], "Chief Patron")
         self.assertEqual(roles[4], "Co-Patron")
 
+    def test_the_chamber_patron_index_is_chief_patron_only(self):
+        """One row per member, and never a co-patron, despite the name."""
+        house = self.client.get_patron_legislation(20261, "H")
+        senate = self.client.get_patron_legislation(20261, "S")
+
+        self.assertEqual(len(house), 102)
+        self.assertEqual(len(senate), 42)
+        self.assertEqual({p.Name for p in house + senate}, {"Chief Patron"})
+        self.assertEqual(len({p.MemberID for p in house}), len(house))
+
+        self.assertEqual(sum(len(p.bills) for p in house), 2342)
+        self.assertEqual(sum(len(p.bills) for p in senate), 1304)
+
+    def test_the_patron_index_needs_both_a_session_and_a_chamber(self):
+        with self.assertRaises(requests.HTTPError):
+            self.client.get_patron_legislation(20261, "")
+
+        self.assertEqual(self.client.get_patron_legislation(20271, "H"), [])
+
+    def test_the_patron_index_agrees_with_the_bill_detail(self):
+        schmidt = next(
+            p for p in self.client.get_patron_legislation(20261, "H") if p.MemberID == 544
+        )
+
+        self.assertEqual(schmidt.MemberDisplayName, "Charlie Schmidt")
+        self.assertIn("HB1408", [b.LegislationNumber for b in schmidt.bills])
+
     def test_the_service_finds_a_member_and_collapses_the_rows(self):
         service = LISService(self.client)
 
@@ -882,6 +909,361 @@ class LiveMeetingsTest(unittest.TestCase):
         self.assertGreater(len(entries), 50)
         self.assertTrue(all(e.bill_number for e in entries))
         self.assertEqual(len({e.docket.DocketID for e in entries}), 16)
+
+
+@_skip_live
+class LiveMinutesTest(unittest.TestCase):
+    """The daily record, and the one vote join in LIS that can be trusted."""
+
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_a_session_of_books_splits_into_floor_and_committee(self):
+        books = self.client.get_minutes_books(session_code=20261)
+
+        self.assertEqual(len(books), 388)
+        self.assertEqual(len({b.MinutesBookID for b in books}), 388)
+        self.assertEqual(Counter(b.ChamberCode for b in books), {"H": 201, "S": 187})
+
+        floor = [b for b in books if b.is_floor]
+        self.assertEqual(len(floor), 46)
+        self.assertEqual({b.ChamberCode for b in floor}, {"S"})
+
+    def test_the_house_publishes_no_floor_book(self):
+        """Committee books come from both chambers; floor books never do."""
+        house = self.client.get_minutes_books(session_code=20261, chamber_code="H")
+
+        self.assertTrue(house)
+        self.assertFalse(any(b.is_floor for b in house))
+
+    def test_iscommittee_is_false_even_on_a_committee_book(self):
+        books = self.client.get_minutes_books(session_code=20261)
+        committee = [b for b in books if not b.is_floor]
+
+        self.assertTrue(committee)
+        self.assertFalse(any(b.IsCommittee for b in committee))
+        self.assertFalse(any(b.SessionCode for b in books))
+
+    def test_either_session_form_answers_the_same(self):
+        by_code = self.client.get_minutes_books(session_code=20261)
+        by_id = self.client.get_minutes_books(session_id=59)
+
+        self.assertEqual({b.MinutesBookID for b in by_code}, {b.MinutesBookID for b in by_id})
+
+    def test_a_filter_without_a_session_is_rejected(self):
+        with self.assertRaises(requests.HTTPError):
+            self.client.get_minutes_books(committee_id=22)
+
+    def test_the_filters_narrow_the_list(self):
+        window = self.client.get_minutes_books(
+            session_code=20261, start_date="2026-01-14", end_date="2026-01-31"
+        )
+        committee = self.client.get_minutes_books(session_code=20261, committee_id=22)
+
+        self.assertEqual(len(window), 166)
+        self.assertEqual(len(committee), 10)
+        self.assertEqual({b.CommitteeID for b in committee}, {22})
+
+    def test_a_book_nests_categories_entries_and_activities(self):
+        book = self.client.get_minutes_book(3861)
+
+        self.assertEqual(len(book.MinutesCategories), 11)
+        self.assertEqual(len(book.entries), 195)
+        self.assertEqual(len(book.bill_entries), 181)
+        self.assertEqual(len(book.activities), 205)
+        self.assertEqual(sum(1 for a in book.activities if a.VoteID), 171)
+
+    def test_the_calendar_id_is_a_second_key_to_the_same_book(self):
+        book = self.client.get_minutes_book(3861)
+        same = self.client.get_minutes_book(calendar_id=book.MinutesCalendars[0].CalendarID)
+
+        self.assertEqual(same.MinutesBookID, book.MinutesBookID)
+
+    def test_an_activity_vote_belongs_to_the_bill_on_its_entry(self):
+        """Unlike ``LegislationEvent.VoteID``, which often names another bill."""
+        book = self.client.get_minutes_book(3861)
+        pairs = [
+            (e.LegislationNumber, a.VoteID)
+            for e in book.bill_entries
+            for a in e.MinutesActivities
+            if a.VoteID and not a.IsBlock
+        ]
+
+        for number, vote_id in pairs[:5]:
+            vote = self.client.get_vote(vote_id)
+            self.assertIn(number, [v.LegislationNumber for v in vote.vote_legislation])
+
+    def test_a_block_vote_is_shared_across_the_bills_it_disposed_of(self):
+        book = self.client.get_minutes_book(3861)
+        blocks = [
+            (e.LegislationNumber, a.VoteID)
+            for e in book.bill_entries
+            for a in e.MinutesActivities
+            if a.IsBlock
+        ]
+
+        self.assertEqual(len(blocks), 14)
+        self.assertLess(len({v for _, v in blocks}), len(blocks))
+
+    def test_the_minutes_tally_keeps_a_tiebreak_the_vote_record_drops(self):
+        book = self.client.get_minutes_book(3861)
+        tiebreak = next(a for a in book.activities if a.VoteTally and "Chair votes" in a.VoteTally)
+
+        vote = self.client.get_vote(tiebreak.VoteID)
+        self.assertNotIn("Chair votes", vote.VoteTally)
+        # The counts agree; only the minutes carry the tiebreak, and they
+        # move the closing paren to make room for it.
+        self.assertIn(vote.VoteTally.strip("()"), tiebreak.VoteTally)
+
+    def test_the_interactive_view_drops_the_vote_detail(self):
+        plain = self.client.get_minutes_book(3861)
+        interactive = self.client.get_minutes_book_interactive(3861)
+
+        self.assertLess(len(interactive.entries), len(plain.entries))
+        self.assertEqual(sum(1 for a in interactive.activities if a.VoteTally), 0)
+        self.assertGreater(sum(1 for a in plain.activities if a.VoteTally), 0)
+
+    def test_the_reference_vocabulary_names_the_service_that_resolves_a_citation(self):
+        types = self.client.get_action_reference_types()
+        by_id = {t.ActionReferenceTypeID: t for t in types}
+
+        self.assertEqual(len(types), 15)
+        self.assertNotIn(10, by_id)
+        self.assertEqual(by_id[5].ObjectName, "Legislation")
+        self.assertIsNone(by_id[1].ObjectName)
+
+    def test_the_action_vocabulary_repeats_one_id_per_category(self):
+        actions = self.client.get_calendar_actions()
+        by_id = {}
+        for action in actions:
+            by_id.setdefault(action.CalendarActionID, []).append(action)
+
+        self.assertEqual(len(actions), 4952)
+        self.assertEqual(len(by_id), 490)
+
+        repeated = by_id[1016]
+        self.assertEqual(len(repeated), 84)
+        self.assertEqual({a.EventCode for a in repeated}, {"H4000"})
+        self.assertGreater(len({a.CategoryCode for a in repeated}), 1)
+
+    def test_the_service_resolves_a_minutes_activity_to_its_action(self):
+        service = LISService(self.client)
+        book = service.minutes_book(3861)
+
+        resolved = [(a, service.action_for(a)) for a in book.activities]
+        hits = [(a, row) for a, row in resolved if row is not None]
+
+        self.assertEqual(len(hits), 204)
+        self.assertEqual(len(resolved), 205)
+        for activity, row in hits:
+            self.assertEqual(row.EventCode, activity.EventCode)
+
+    def test_the_category_type_on_a_minutes_category_resolves(self):
+        names = {t.CategoryTypeID: t.Name for t in self.client.get_category_types()}
+        book = self.client.get_minutes_book(3861)
+
+        self.assertEqual(len(names), 8)
+        self.assertEqual(names[1], "Order")
+        for category in book.MinutesCategories:
+            self.assertEqual(names[category.CategoryTypeID], category.CategoryType)
+
+    def test_the_service_flattens_a_book_into_records(self):
+        records = LISService(self.client).minutes_records(3861)
+
+        self.assertEqual(len(records), 190)
+        self.assertTrue(all(r.bill_number for r in records))
+        self.assertEqual(sum(1 for r in records if r.vote_id), 169)
+        self.assertEqual(sum(1 for r in records if r.is_block), 14)
+        self.assertEqual({r.body for r in records}, {"S"})
+
+
+@_skip_live
+class LiveCommunicationsTest(unittest.TestCase):
+    """What one chamber formally told the other."""
+
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_a_session_of_communications_splits_by_chamber(self):
+        rows = self.client.get_communications(session_code=20261)
+
+        self.assertEqual(len(rows), 131)
+        self.assertEqual(Counter(r.ChamberCode for r in rows), {"S": 67, "H": 64})
+        self.assertEqual(len({r.CommunicationID for r in rows}), 131)
+
+    def test_the_type_fields_are_constant_and_carry_nothing(self):
+        rows = self.client.get_communications(session_code=20261)
+
+        self.assertEqual({r.CommunicationType for r in rows}, {"Floor"})
+        self.assertEqual({r.CommunicationTypeID for r in rows}, {1})
+        self.assertEqual({r.IsPublic for r in rows}, {True})
+
+    def test_either_session_form_answers_the_same(self):
+        by_code = self.client.get_communications(session_code=20261)
+        by_id = self.client.get_communications(session_id=59)
+
+        self.assertEqual({r.CommunicationID for r in by_code}, {r.CommunicationID for r in by_id})
+
+    def test_an_unknown_chamber_answers_nothing(self):
+        self.assertEqual(self.client.get_communications(session_code=20261, chamber_code="X"), [])
+
+    def test_a_communication_nests_categories_bills_and_patrons(self):
+        detail = self.client.get_communication(4519)
+
+        self.assertEqual(detail.SessionCode, "20261")
+        self.assertIsNone(detail.DocumentCode)
+        self.assertEqual(len(detail.CommunicationCategories), 15)
+        self.assertEqual(len(detail.categories), 8)
+        self.assertEqual(len(detail.bills), 56)
+        self.assertTrue(detail.bills[0].Patrons)
+
+    def test_the_bill_ids_on_a_communication_are_honest(self):
+        detail = self.client.get_communication(4519)
+
+        for row in detail.bills[:3]:
+            bill = self.client.get_bill(row.LegislationID)
+            self.assertEqual(bill.LegislationNumber, row.LegislationNumber)
+
+    def test_there_is_no_vote_join(self):
+        detail = self.client.get_communication(4519)
+
+        self.assertTrue(all(b.VoteNumber is None for b in detail.bills))
+        self.assertTrue(all(b.EventCode is None for b in detail.bills))
+        self.assertTrue(all(b.CommitteeReferredName is None for b in detail.bills))
+
+    def test_structured_content_starts_in_2024(self):
+        """An older communication gives you the file and nothing else."""
+        old = self.client.get_communications(session_code=20191)
+        detail = self.client.get_communication(old[0].CommunicationID)
+
+        self.assertEqual(detail.CommunicationCategories, [])
+        self.assertTrue(detail.CommunicationFiles)
+
+    def test_the_files_come_in_a_pair(self):
+        files = self.client.get_communication_files(4519)
+
+        self.assertEqual({f.TextFormatID for f in files}, {2, 5})
+        self.assertTrue(all(f.FileURL for f in files))
+
+    def test_the_category_vocabulary_splits_by_chamber(self):
+        types = self.client.get_communication_category_types()
+        house = self.client.get_communication_category_types("H")
+
+        self.assertEqual(len(types), 231)
+        self.assertEqual(len(house), 87)
+        self.assertEqual({t.ChamberCode for t in house}, {"H"})
+        self.assertEqual(sum(1 for t in types if t.Sequence is None), 1)
+
+
+@_skip_live
+class LiveDirectoryTest(unittest.TestCase):
+    """Committee clerks, member district offices, and budget agencies."""
+
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_an_unfiltered_personnel_call_omits_the_committee_link(self):
+        bare = self.client.get_personnel()
+        clerks = self.client.get_personnel(staff_role_type_id=1)
+
+        self.assertEqual(len(bare), 33)
+        self.assertTrue(all(p.StaffID is None for p in bare))
+        self.assertTrue(all(p.AffiliationID is None for p in bare))
+
+        self.assertEqual(len(clerks), 54)
+        self.assertTrue(all(p.StaffID for p in clerks))
+        self.assertTrue(all(p.AffiliationID for p in clerks))
+
+    def test_the_affiliation_id_is_a_committee_id(self):
+        clerks = self.client.get_personnel(staff_role_type_id=1)
+        committees = {c.CommitteeID for c in self.client.get_committees(include_subcommittees=True)}
+
+        self.assertGreater(len({p.AffiliationID for p in clerks}), 30)
+        for committee_id in sorted({p.AffiliationID for p in clerks})[:5]:
+            self.assertIn(committee_id, committees)
+
+    def test_the_phone_and_email_columns_are_dead(self):
+        clerks = self.client.get_personnel(staff_role_type_id=1)
+
+        self.assertTrue(all(p.PhoneNumber is None for p in clerks))
+        self.assertTrue(all(p.EmailAddress is None for p in clerks))
+
+    def test_the_date_filter_narrows_the_list(self):
+        self.assertEqual(
+            len(self.client.get_personnel(staff_role_type_id=1, effective_begin_date="2026-01-01")),
+            44,
+        )
+
+    def test_the_service_names_a_committee_s_staff(self):
+        service = LISService(self.client)
+
+        staff = service.committee_staff("Courts of Justice", chamber_code="H")
+
+        self.assertTrue(staff)
+        self.assertEqual({p.AffiliationID for p in staff}, {8})
+        self.assertTrue(all(p.FullName for p in staff))
+
+    def test_staff_role_types(self):
+        roles = {r.StaffRoleTypeID: r.Name for r in self.client.get_staff_role_types()}
+
+        self.assertEqual(len(roles), 7)
+        self.assertEqual(roles[1], "Committee Clerk")
+
+    def test_a_member_office_is_the_district_address(self):
+        service = LISService(self.client)
+
+        office = service.member_office(503)
+
+        self.assertEqual(office.ContactTypeID, 9)
+        self.assertEqual(office.City, "Norfolk")
+        self.assertEqual(office.StateCode, "VA")
+        self.assertTrue(office.PhoneNumber)
+
+    def test_a_member_with_no_office_is_none_not_an_error(self):
+        self.assertIsNone(LISService(self.client).member_office(527))
+
+    def test_half_a_contact_key_is_rejected(self):
+        with self.assertRaises(requests.HTTPError):
+            self.client.get_contacts(503, None)
+
+    def test_no_contact_key_returns_every_contact_in_three_populations(self):
+        """The total grows with website sign-ups, so only its floor is pinned."""
+        contacts = self.client.get_contacts()
+        by_type = Counter(c.ContactTypeID for c in contacts)
+
+        self.assertGreater(len(contacts), 6800)
+        self.assertEqual(set(by_type), {3, 9, 10})
+        self.assertEqual(by_type[10], 2)
+        self.assertGreater(by_type[9], 300)
+
+        accounts = [c for c in contacts if c.ContactTypeID == 3]
+        self.assertTrue(all(c.Address1 is None and c.PhoneNumber is None for c in accounts))
+
+    def test_the_bulk_member_rows_match_the_per_member_call(self):
+        offices = {c.OwnerID: c for c in self.client.get_contacts() if c.ContactTypeID == 9}
+
+        self.assertEqual(
+            offices[503].ContactInformationID,
+            self.client.get_contacts(503, 3)[0].ContactInformationID,
+        )
+
+    def test_the_contact_vocabularies_decode_an_owner(self):
+        types = {t.ContactTypeID: t for t in self.client.get_contact_types()}
+        owners = {o.OwnerTypeID: o.OwnerType for o in self.client.get_owner_types()}
+
+        self.assertEqual(len(types), 10)
+        self.assertEqual(len(owners), 6)
+        self.assertEqual(types[9].ContactType, "Mailing")
+        self.assertEqual(types[9].OwnerTypeID, 3)
+        self.assertEqual(owners[3], "Member")
+
+    def test_agencies_are_budget_data_with_no_legislative_join(self):
+        agencies = self.client.get_agencies()
+        members = {m.MemberID for m in self.client.get_members(20261)}
+
+        self.assertEqual(len(agencies), 295)
+        self.assertGreater(len({a.Branch for a in agencies}), 10)
+        self.assertEqual({a.IdentityID for a in agencies} & members, set())
 
 
 @_skip_live
