@@ -99,8 +99,8 @@ class MinutesActivity(LISModel):
     entry.**  That is worth stating plainly, because
     :attr:`~va_lis_client.models.event.LegislationEvent.VoteID` is not: a
     bill event often points at a vote that disposed of some *other* bill (see
-    "A VoteID on a bill event is often not that bill's roll call" in the
-    README).  Sampled live on 2026-09-15 against Senate book 3861 — 3
+    "A VoteID on a bill event is often not that bill's roll call" in
+    ``docs/votes.md``).  Sampled live on 2026-09-15 against Senate book 3861 — 3
     recorded roll calls, 2 block votes and 2 voice votes — every ``VoteID``
     resolved to a vote whose ``VoteLegislation`` listed the entry's own bill,
     and every ``VoteNumber`` matched the vote record exactly.
