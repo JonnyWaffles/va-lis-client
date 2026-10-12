@@ -35,6 +35,7 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/JonnyWaffles/va-lis-client"
 Repository = "https://github.com/JonnyWaffles/va-lis-client"
+Documentation = "https://github.com/JonnyWaffles/va-lis-client/tree/main/docs"
 "Bug Tracker" = "https://github.com/JonnyWaffles/va-lis-client/issues"
 
 [build-system]
