@@ -347,3 +347,194 @@ class PatronLegislation(Patron):
     """
 
     bills: list[PatronBill] = Field(default=[], alias="Legislation")
+
+
+class Amendment(LISModel):
+    """One amendment text on a bill, nested in :class:`AmendedLegislation`.
+
+    Key: ``LegislationTextID``, which resolves through
+    :meth:`~va_lis_client.client.LISClient.get_draft_text`.
+
+    ``ChamberCode`` is the chamber that offered the amendment, not the bill's.
+    ``DocumentCode`` encodes it: ``HB1005AH1`` is the first House amendment
+    to HB1005, and a Senate amendment to it would carry ``AS``.
+
+    ``TextDisposition`` says what became of it.  The House list for 20261
+    held 268 ``Adopted``, 66 ``Engrossed``, 21 ``Not Adopted``, 13
+    ``Removed`` and 11 ``Posted`` (measured 2026-10-12).  ``LDNumber`` was
+    null on 71 of those 379.
+
+    Example::
+
+        {"LegislationID": 99829, "LegislationTextID": 261928,
+         "LegislationVersionID": 8, "LegislationVersion": "Amendment",
+         "TextDispositionID": 6, "TextDisposition": "Adopted",
+         "DocumentCode": "HB1005AH1", "ChamberCode": "H",
+         "Description": "General Laws Amendment", "LDNumber": "26106673A",
+         "VersionDate": "2026-02-03T18:15:00"}
+    """
+
+    LegislationID: int | None = None
+    LegislationTextID: int
+    LegislationVersionID: int | None = None  # 8 on every observed row
+    LegislationVersion: str | None = None  # "Amendment" on every observed row
+    TextDispositionID: int | None = None  # see get_text_dispositions
+    TextDisposition: str | None = None  # e.g. "Adopted", "Not Adopted"
+    IsActive: bool = False
+    IsPublic: bool = True
+    DocumentCode: str | None = None  # e.g. "HB1005AH1"
+    ChamberCode: str | None = None  # the amendment's chamber, not the bill's
+    Description: str | None = None  # e.g. "General Laws Amendment"
+    LDNumber: str | None = None
+    VersionDate: datetime | None = None
+
+
+class AmendedLegislation(LISModel):
+    """A bill with its amendments, from ``getlegislationamendmentlistasync``.
+
+    Key: ``(LegislationID, SummaryVersion)``.  **A bill repeats once per
+    summary version**, each copy carrying the same amendments: HB18 arrived
+    three times in the 20261 House list, as ``SUMMARY AS INTRODUCED``,
+    ``SUMMARY AS PASSED CHAMBER`` and ``SUMMARY AS PASSED``.  That list held
+    278 rows over 263 bills.  Collapse on ``LegislationID`` before you count.
+
+    **The chamber filter picks the amendments, not the bills.**  The House
+    list for 20261 held 207 House bills and 71 Senate bills, and every one of
+    its 379 amendments was a House amendment.  ``ChamberCode`` on the row is
+    the bill's chamber.
+
+    ``LegislationSummary``, ``LegislationTitle``, ``IntroductionDate`` and
+    ``FullNumber`` were null on all 278 rows.  ``Patrons`` holds the chief
+    patron only.  ``CommitteeID`` is ``0`` rather than null when the bill
+    sits in no committee.
+
+    Example (truncated)::
+
+        {"LegislationID": 99829, "LegislationNumber": "HB1005",
+         "LegislationStatus": "Acts of Assembly Chapter",
+         "SummaryVersion": "SUMMARY AS PASSED", "ChamberCode": "H",
+         "SessionID": 59, "SessionCode": "20261",
+         "Amendments": [{"DocumentCode": "HB1005AH1", ...}],
+         "Patrons": [{"MemberID": 400, "Name": "Chief Patron", ...}]}
+    """
+
+    LegislationID: int
+    LegislationNumber: str | None = None
+    LegislationKey: int | None = None  # numeric part of the bill number
+    Description: str | None = None
+    LegislationTitle: str | None = None  # null on every observed row
+    ChamberCode: str | None = None  # the bill's chamber
+    LegislationTypeCode: str | None = None
+    FullNumber: str | None = None  # null on every observed row
+    LegislationStatusID: int | None = None
+    LegislationStatus: str | None = None
+    LegislationSummary: str | None = None  # null on every observed row
+    SummaryVersion: str | None = None  # the row repeats once per version
+    LegislationTextID: int | None = None  # 0 on every observed row
+    EffectiveType: str | None = None
+    EffectiveTypeID: int | None = None
+    PendingChange: bool = False
+    IntroductionDate: datetime | None = None  # null on every observed row
+    SessionID: int | None = None
+    SessionCode: str | None = None
+    SessionName: str | None = None
+    CommitteeID: int | None = None  # 0, not null, when there is no committee
+    CommitteeName: str | None = None
+    CommitteeNumber: str | None = None
+    ParentCommitteeName: str | None = None
+    Amendments: list[Amendment] = []
+    Patrons: list[Patron] = []  # chief patron only
+
+
+class ConferenceLegislation(LISModel):
+    """A bill that went to a conference committee.
+
+    From ``/Legislation/api/getconferencelegislationlistasync``.
+
+    Key: ``(SessionID, LegislationID)``.  The list without a session spans
+    every session, and 2,826 rows there held 2,689 unique ids.
+
+    170 rows for 20261, 85 from each chamber, all of them bills (measured
+    2026-10-12).  Their statuses were 141 ``Acts of Assembly Chapter``, 18
+    ``Failed`` and 11 ``Governor's Veto``.
+
+    The row is thin.  It carries no patrons, no summary, no committee and no
+    conferees, so it says that a conference happened and nothing about it.
+    The conferees are in the bill's events ("House Conferees: Seibold,
+    Schmidt, Williams").
+
+    Example::
+
+        {"LegislationID": 98529, "LegislationNumber": "HB5",
+         "FullNumber": "HB0005",
+         "Description": "Employment; paid sick leave, civil penalties.",
+         "ChamberCode": "H", "LegislationTypeCode": "B",
+         "LegislationStatus": "Acts of Assembly Chapter",
+         "SessionID": 59, "SessionName": "Regular Session", "IsPrefile": true}
+    """
+
+    LegislationID: int
+    LegislationNumber: str | None = None
+    FullNumber: str | None = None  # zero padded, e.g. "HB0005"
+    Description: str | None = None
+    IntroductionDate: datetime | None = None
+    OfferedDate: datetime | None = None
+    ChamberCode: str | None = None
+    LegislationTypeCode: str | None = None
+    LegislationClassID: int | None = None
+    LegislationClass: str | None = None
+    LegislationKey: int | None = None
+    LegislationStatus: str | None = None
+    EffectiveType: str | None = None
+    SessionID: int | None = None  # there is no SessionCode on this row
+    SessionName: str | None = None
+    IsPrefile: bool | None = None
+
+
+class LegislationIdEntry(LISModel):
+    """A bill reduced to its ids, from ``/Legislation/api/getlegislationidslistasync``.
+
+    The search result with everything but the identity removed: 228 rows and
+    30 KB for member 544 in 20261, where the full rows are 440 KB.
+
+    **The rows repeat as the search rows do.**  Those 228 rows held 203
+    unique ``LegislationID`` values.  ``LegislationStatusID`` and
+    ``SessionCode`` were null on all of them.
+
+    A list of these is also the request body of
+    :meth:`~va_lis_client.client.LISClient.get_legislation_by_ids`, where
+    ``SessionID`` is mandatory on every entry.
+
+    Example::
+
+        {"LegislationID": 98525, "LegislationStatusID": null,
+         "LegislationNumber": "HB1", "SessionID": 59, "SessionCode": null,
+         "SearchText": []}
+    """
+
+    LegislationID: int
+    LegislationNumber: str | None = None
+    SessionID: int | None = None
+    SessionCode: str | None = None  # null on every observed row
+    LegislationStatusID: int | None = None  # null on every observed row
+    SearchText: list = []
+
+
+class Subject(LISModel):
+    """A subject index heading, from ``/LegislationSubject/api/getsubjectreferencesasync``.
+
+    Key: ``SubjectIndexID``.
+
+    506 headings for 20261, session scoped.  **The vocabulary joins to
+    nothing a public key can reach.**  No bill row carries a
+    ``SubjectIndexID``, and passing one to the advanced search answers 204
+    with either session parameter.  It is the list of headings and no more.
+
+    Example::
+
+        {"SubjectIndexID": 502, "Subject": "Abortion", "SubjectNumber": "3005"}
+    """
+
+    SubjectIndexID: int
+    Subject: str | None = None
+    SubjectNumber: str | None = None  # a string of digits, e.g. "3005"

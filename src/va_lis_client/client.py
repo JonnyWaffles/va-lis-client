@@ -66,6 +66,7 @@ from va_lis_client.models import (
     ActionReferenceType,
     ActorType,
     Agency,
+    AmendedLegislation,
     BillVersion,
     CalendarAction,
     CalendarCategoryType,
@@ -74,6 +75,7 @@ from va_lis_client.models import (
     CalendarType,
     CategoryType,
     ChamberStatistic,
+    ChamberType,
     Committee,
     CommitteeAction,
     CommitteeMember,
@@ -83,6 +85,7 @@ from va_lis_client.models import (
     CommunicationCategoryType,
     CommunicationFile,
     CommunicationListItem,
+    ConferenceLegislation,
     Contact,
     ContactType,
     District,
@@ -94,6 +97,7 @@ from va_lis_client.models import (
     LegislationCategory,
     LegislationEvent,
     LegislationEventType,
+    LegislationIdEntry,
     LegislationNumberEntry,
     LegislationSearchResult,
     LegislationStatus,
@@ -104,10 +108,13 @@ from va_lis_client.models import (
     LegislationVersion,
     MeetingRoom,
     Member,
+    MemberContact,
     MemberLegislation,
+    MemberStatusType,
     MemberVoteResult,
     MinutesBook,
     MinutesBookListItem,
+    Organization,
     OwnerType,
     PagedList,
     Pagination,
@@ -120,8 +127,19 @@ from va_lis_client.models import (
     Schedule,
     ScheduleType,
     Session,
+    SessionEventType,
+    SessionType,
+    ShallowSession,
+    ShallowVote,
+    SponsorType,
     StaffRoleType,
+    Subject,
+    SummaryVersion,
+    TextAction,
+    TextDisposition,
+    TextHitCount,
     Vote,
+    VoteLink,
     VoteType,
     page_request_header,
 )
@@ -198,6 +216,7 @@ class LISClient:
         *,
         page_header: dict[str, str] | None = None,
         capture: dict | None = None,
+        raw: bool = False,
         **kwargs,
     ):
         """Send an HTTP request with exponential backoff on transient failures.
@@ -211,6 +230,8 @@ class LISClient:
                 :func:`page_request_header`, merged over the auth header.
             capture: A dict to fill with the response headers, so a caller can
                 read ``X-Pagination`` back off a successful response.
+            raw: Return the body as text.  A few paths answer with HTML,
+                plain text or iCalendar instead of JSON.
         """
         url = f"{BASE_URL}{path}"
         headers = self._headers()
@@ -245,7 +266,8 @@ class LISClient:
                 resp.raise_for_status()
                 if capture is not None:
                     capture.update(resp.headers)
-                return resp.json()
+
+                return resp.text if raw else resp.json()
 
             # Retryable HTTP error
             if attempt == self._max_retries:
@@ -300,6 +322,10 @@ class LISClient:
 
     def _post(self, path: str, json: dict | None = None):
         return self._request("POST", path, json=json)
+
+    def _get_text(self, path: str, params: dict | None = None) -> str | None:
+        """GET a path whose body is text, not JSON.  ``None`` on a 204."""
+        return self._request("GET", path, params=params, raw=True)
 
     # ------------------------------------------------------------------
     # Health / auth verification
@@ -387,6 +413,117 @@ class LISClient:
             return None
         sessions = data.get("Sessions", [])
         return Session.model_validate(sessions[0]) if sessions else None
+
+    def get_sessions_by_year(self, year: int | str) -> list[Session]:
+        """Sessions for one year, with the year in the path.
+
+        The same rows as :meth:`get_sessions` with a year: two for 2026.  A
+        year with no session answers 204 and gives ``[]`` (``1990``).
+
+        Envelope key: ``Sessions``.
+        """
+        data = self._get(f"/Session/api/getsessionsbyyearasync/{year}")
+        if data is None:
+            return []
+
+        return [Session.model_validate(s) for s in data.get("Sessions", [])]
+
+    def get_session(self, session_id: int) -> Session | None:
+        """One session by its ``SessionID``, with its events.  ``None`` if unknown.
+
+        ``59`` is the 2026 Regular Session.  An unknown id answers 204.
+
+        Envelope key: ``Sessions`` (single-element list).
+        """
+        data = self._get(f"/Session/api/getsessionbyidasync/{session_id}")
+        if data is None:
+            return None
+
+        sessions = data.get("Sessions", [])
+        return Session.model_validate(sessions[0]) if sessions else None
+
+    def get_session_by_code(self, session_code: int | str) -> Session | None:
+        """One session by its ``SessionCode``, with its events.  ``None`` if unknown.
+
+        The one request that turns a code into a ``SessionID``: ``20261``
+        gives ``59``.  An unknown code answers 204.
+
+        Envelope key: ``Sessions`` (single-element list).
+        """
+        data = self._get(f"/Session/api/getsessionbycodeasync/{session_code}")
+        if data is None:
+            return None
+
+        sessions = data.get("Sessions", [])
+        return Session.model_validate(sessions[0]) if sessions else None
+
+    def get_sessions_shallow(
+        self,
+        *,
+        session_type_id: int | None = None,
+        session_year: int | None = None,
+        is_active: bool | None = None,
+    ) -> list[ShallowSession]:
+        """Every session without its events, newest first.
+
+        59 sessions back to 1994 in 9 KB with no argument (measured
+        2026-10-12).  ``session_year=2026`` gave 2 rows,
+        ``session_type_id=2`` gave the 25 special sessions, and
+        ``is_active=True`` gave 3.
+
+        **``is_active=False`` filters nothing.**  It returned all 59 rows,
+        the three active ones among them.  Filter on ``IsActive`` yourself
+        for the inactive sessions.
+
+        **``IsActive`` is not "in session".**  The three active sessions in
+        October 2026 were 20271, 20261 and 20262, and only 20271 was the
+        default.  Use :meth:`get_default_session` for the working session.
+
+        Args:
+            session_type_id: ``1`` regular, ``2`` special.
+            session_year: e.g. ``2026``.
+            is_active: ``True`` keeps the sessions LIS flags active.
+                ``False`` is sent and ignored.
+
+        Envelope key: ``Sessions``.
+        """
+        params: dict = {}
+        if session_type_id is not None:
+            params["sessionTypeID"] = session_type_id
+
+        if session_year is not None:
+            params["sessionYear"] = session_year
+
+        if is_active is not None:
+            params["IsActive"] = "true" if is_active else "false"
+
+        data = self._get("/Session/api/getsessionshallowlistasync", params=params or None)
+        if data is None:
+            return []
+
+        return [ShallowSession.model_validate(s) for s in data.get("Sessions", [])]
+
+    def get_session_event_types(self) -> list[SessionEventType]:
+        """Reference list of the 11 session milestone types.
+
+        The vocabulary behind ``SessionEvent.EventTypeID``.  Its labels and
+        the labels on the events disagree; see :class:`SessionEventType`.
+
+        Envelope key: ``SessionEventTypes``.
+        """
+        data = self._get("/Session/api/getsessioneventtypereferencesasync")
+        if data is None:
+            return []
+
+        return [SessionEventType.model_validate(t) for t in data.get("SessionEventTypes", [])]
+
+    def get_session_types(self) -> list[SessionType]:
+        """Reference list of the 2 session types.  Envelope key: ``SessionTypes``."""
+        data = self._get("/Session/api/getsessiontypereferencesasync")
+        if data is None:
+            return []
+
+        return [SessionType.model_validate(t) for t in data.get("SessionTypes", [])]
 
     # ------------------------------------------------------------------
     # Legislation
@@ -519,6 +656,201 @@ class LISClient:
             return []
         return [LegislationStatus.model_validate(r) for r in data.get("References", [])]
 
+    def get_amended_legislation(
+        self,
+        *,
+        session_code: int | None = None,
+        session_id: int | None = None,
+        chamber_code: str | None = None,
+    ) -> list[AmendedLegislation]:
+        """Every bill in a session that has an amendment, with the amendments.
+
+        The only list of amendments in LIS.  Every other route starts from
+        one bill.
+
+        **A session is required.**  With none LIS answers 400, "Must provide
+        either a valid Session ID or Session Code".
+
+        **``chamber_code`` picks the amendments, not the bills.**  ``"H"``
+        returns the bills that carry a House amendment, 71 Senate bills among
+        them, and only their House amendments.  For 20261 that was 278 rows
+        and 391 KB; ``"S"`` was 229 rows; neither was 462 rows and 691 KB
+        (measured 2026-10-12).
+
+        **A bill repeats once per summary version.**  The House rows held 263
+        unique bills.  See :class:`AmendedLegislation`.
+
+        Args:
+            session_code: e.g. ``20261``.
+            session_id: e.g. ``59``.  An alternative to ``session_code``.
+            chamber_code: ``"H"`` or ``"S"``, the chamber that offered the
+                amendments.  Omit for both.
+
+        Envelope key: ``LegislationAmendmentList``.
+        """
+        params: dict = {}
+        if session_code is not None:
+            params["sessionCode"] = session_code
+
+        if session_id is not None:
+            params["sessionID"] = session_id
+
+        if chamber_code is not None:
+            params["chamberCode"] = chamber_code
+
+        data = self._get("/Legislation/api/getlegislationamendmentlistasync", params=params)
+        if data is None:
+            return []
+
+        return [
+            AmendedLegislation.model_validate(r) for r in data.get("LegislationAmendmentList", [])
+        ]
+
+    def get_conference_legislation(
+        self,
+        session_id: int | None = None,
+        *,
+        chamber_code: str | None = None,
+        member_id: int | None = None,
+    ) -> list[ConferenceLegislation]:
+        """Bills that went to a conference committee.
+
+        170 for the 2026 Regular Session (``session_id=59``), 85 from each
+        chamber (measured 2026-10-12).
+
+        **This path takes a ``sessionID`` and no session code.**  LIS ignores
+        ``sessionCode`` here without an error, and a request with no session
+        it understands returns every session at once: 2,826 rows and 1.5 MB,
+        back to 1994.  That is why this method has no ``session_code``
+        argument.  Turn a code into an id with :meth:`get_session_by_code`.
+
+        ``member_id`` narrows to the conferences a member sat on.  Member 544
+        returned five bills, two of them Senate bills, and the events of one
+        (HB361) name that member among the House conferees.
+
+        Args:
+            session_id: e.g. ``59``.  Omit for every session.
+            chamber_code: ``"H"`` or ``"S"``, the bill's chamber.
+            member_id: A conferee's ``MemberID``.
+
+        Envelope key: ``ConferenceLegislationList``.
+        """
+        params: dict = {}
+        if session_id is not None:
+            params["sessionID"] = session_id
+
+        if chamber_code is not None:
+            params["chamberCode"] = chamber_code
+
+        if member_id is not None:
+            params["memberID"] = member_id
+
+        data = self._get(
+            "/Legislation/api/getconferencelegislationlistasync", params=params or None
+        )
+        if data is None:
+            return []
+
+        return [
+            ConferenceLegislation.model_validate(r)
+            for r in data.get("ConferenceLegislationList", [])
+        ]
+
+    def get_legislation_list(self, **criteria) -> list[LegislationSearchResult]:
+        """Search bills through the Legislation service.  Rows arrive as sent.
+
+        The same request body and the same rows as :meth:`search_legislation`,
+        from ``/Legislation`` instead of ``/AdvancedLegislationSearch``.
+        Member 544 in 20261 returned 236 rows on both.  Every warning on
+        :meth:`search_legislation` applies: no paging, and a bill arrives more
+        than once.
+
+        Only ``session_code`` and ``member_id`` were exercised on this path
+        (2026-10-12).  Prefer :meth:`search_legislation`, whose criteria were
+        each probed.
+
+        Args:
+            **criteria: The keyword arguments of :meth:`search_legislation`.
+
+        Envelope key: ``Legislations``.
+        """
+        data = self._post("/Legislation/api/getlegislationlistasync", json=_search_body(**criteria))
+        if data is None:
+            return []
+
+        return [LegislationSearchResult.model_validate(row) for row in data.get("Legislations", [])]
+
+    def get_legislation_ids(self, **criteria) -> list[LegislationIdEntry]:
+        """Search bills and get back only their ids.
+
+        The cheap form of :meth:`get_legislation_list`: 30 KB where the full
+        rows are 440 KB, for member 544 in 20261 (measured 2026-10-12).
+
+        **The ids repeat.**  Those 228 rows held 203 unique bills, because
+        the search behind it emits a row per summary version and exact
+        duplicates as well.  Collapse on ``LegislationID``.
+
+        Args:
+            **criteria: The keyword arguments of :meth:`search_legislation`.
+
+        Envelope key: ``LegislationIds``.
+        """
+        data = self._post(
+            "/Legislation/api/getlegislationidslistasync", json=_search_body(**criteria)
+        )
+        if data is None:
+            return []
+
+        return [LegislationIdEntry.model_validate(row) for row in data.get("LegislationIds", [])]
+
+    def get_legislation_by_ids(
+        self,
+        legislation_ids: list[int | dict | LegislationIdEntry],
+        session_id: int | None = None,
+    ) -> list[LegislationSearchResult]:
+        """Search rows for a set of bills you already hold the ids of.
+
+        The second half of :meth:`get_legislation_ids`: pass its rows straight
+        back in.  The rows that return are the search rows, repeats included.
+
+        **Every entry needs a ``SessionID``.**  ``{"LegislationID": 98525}``
+        alone answers 204, and the same entry with ``"SessionID": 59``
+        returns the bill (checked 2026-10-12).  ``session_id`` fills it in on
+        any entry that lacks one.
+
+        Args:
+            legislation_ids: ``LegislationID`` values, or
+                :class:`LegislationIdEntry` rows, or the raw entry dicts.
+            session_id: The session for entries that do not name their own.
+
+        Envelope key: ``Legislations``.
+        """
+        entries = []
+        for item in legislation_ids:
+            if isinstance(item, LegislationIdEntry):
+                entry = {"LegislationID": item.LegislationID, "SessionID": item.SessionID}
+            elif isinstance(item, dict):
+                entry = dict(item)
+            else:
+                entry = {"LegislationID": item}
+
+            if entry.get("SessionID") is None and session_id is not None:
+                entry["SessionID"] = session_id
+
+            entries.append(entry)
+
+        if not entries:
+            return []
+
+        data = self._post(
+            "/Legislation/api/getlegislationbylegislationidsasync",
+            json={"LegislationIds": entries},
+        )
+        if data is None:
+            return []
+
+        return [LegislationSearchResult.model_validate(row) for row in data.get("Legislations", [])]
+
     # ------------------------------------------------------------------
     # Legislation text
     # ------------------------------------------------------------------
@@ -612,6 +944,193 @@ class LISClient:
         if data is None:
             return []
         return [LegislationTextDetail.model_validate(t) for t in data.get("TextsList", [])]
+
+    def get_text_dispositions(self) -> list[TextDisposition]:
+        """Reference list of the 13 text dispositions, e.g. 6 ``Adopted``.
+
+        The vocabulary behind ``TextDispositionID`` on text rows, bill
+        versions and amendments.
+
+        Envelope key: ``TextDispositionList``.
+        """
+        data = self._get("/LegislationText/api/gettextdispositionsreferenceasync")
+        if data is None:
+            return []
+
+        return [TextDisposition.model_validate(r) for r in data.get("TextDispositionList", [])]
+
+    def get_text_actions(self) -> list[TextAction]:
+        """Reference list of the 31 actions that produce a text.
+
+        The vocabulary behind ``LegislationTextActionID``.  Most of its
+        ``EventCode`` values lack the chamber letter; see :class:`TextAction`.
+
+        Envelope key: ``LegislationTextActions``.
+        """
+        data = self._get("/LegislationText/api/getlegislationtextactionlistasync")
+        if data is None:
+            return []
+
+        return [TextAction.model_validate(r) for r in data.get("LegislationTextActions", [])]
+
+    def get_sponsor_types(self) -> list[SponsorType]:
+        """Reference list of the 6 sponsor types, e.g. 4 ``Member``.
+
+        Envelope key: ``SponsorTypes``.
+        """
+        data = self._get("/LegislationText/api/getsponsortypelistasync")
+        if data is None:
+            return []
+
+        return [SponsorType.model_validate(r) for r in data.get("SponsorTypes", [])]
+
+    def get_draft_text(self, legislation_text_id: int) -> str | None:
+        """The HTML body of one text, by its ``LegislationTextID`` alone.
+
+        The lightest route to a bill's words: 3 KB for HB1's introduced text
+        (``257719``), with no record around it.  It needs no session, where
+        :meth:`get_bill_text_detail` answers 400 without one.  The id comes
+        from :meth:`get_bill_texts`, a :class:`BillVersion`, or an
+        :class:`Amendment`.
+
+        The body starts at the enacting clause.  It has no session line, no
+        bill number and no patron block; :meth:`get_bill_html` returns the
+        page as printed.
+
+        The ids are one sequence across every session: ``1`` is a 1994
+        chapter.
+
+        Returns:
+            The HTML, or ``None`` when LIS answers 204.
+
+        Envelope key: ``TextsList`` (single-element list holding ``DraftText``).
+        """
+        data = self._get(
+            "/LegislationText/api/getdrafttextbylegislationtextidasync",
+            params={"legislationTextID": legislation_text_id},
+        )
+        if data is None:
+            return None
+
+        texts = data.get("TextsList", [])
+        return texts[0].get("DraftText") if texts else None
+
+    def get_bill_html(
+        self,
+        session_code: int,
+        document_code: str,
+        *,
+        hilite: bool = False,
+    ) -> str | None:
+        """One text as the printed page, in HTML.  Not JSON.
+
+        LIS answers ``text/html``: a fragment with inline styles that opens
+        with the session line ("2026 SESSION", "INTRODUCED") and runs through
+        the bill, 6 KB for HB1.  There is no ``<html>`` wrapper.
+
+        **The spec calls the parameter ``documentNumber`` and it takes a
+        document code.**  ``"HB1"`` is the introduced text and ``"HB1ER"`` the
+        enrolled one.  Take the code from :meth:`get_bill_texts`.
+
+        ``hilite=True`` colors the changes to existing law, and has nothing
+        to do with search keywords: struck text gains ``color:red`` and new
+        text gains ``background-color:yellow``.
+
+        Args:
+            session_code: e.g. ``20261``.  Required.
+            document_code: e.g. ``"HB1"`` or ``"HB1ER"``.
+            hilite: Color the struck and the new language.
+
+        Raises:
+            requests.HTTPError: 400 for a code that session does not hold,
+                "There is no draft text for the provided document code and
+                session code".
+        """
+        params: dict = {"sessionCode": session_code, "documentNumber": document_code}
+        if hilite:
+            params["hilite"] = "true"
+
+        return self._get_text("/LegislationText/api/getlegislationhtmlcontentasync", params=params)
+
+    def get_bill_pdf_url(
+        self,
+        session_code: int,
+        document_code: str,
+        *,
+        reference_number: str | None = None,
+    ) -> str | None:
+        """The URL of one text's PDF.  A string, not the file.
+
+        Despite the path name ``getpdfasync``, the body is a JSON string
+        holding a blob address such as
+        ``https://lis.blob.core.windows.net/files/1081188.PDF``.  It is the
+        same address as the ``PdfFile`` entry on a :class:`BillVersion`
+        fetched by single id, at the price of knowing the document code and
+        not the id.
+
+        Args:
+            session_code: e.g. ``20261``.  Required.
+            document_code: e.g. ``"HB1"`` or ``"HB1ER"``.
+            reference_number: The spec offers this to reach an impact
+                statement.  Not exercised: no payload this client reads
+                carries a value to send.
+
+        Raises:
+            requests.HTTPError: 400 for a code that session does not hold.
+        """
+        params: dict = {"sessionCode": session_code, "documentCode": document_code}
+        if reference_number is not None:
+            params["referenceNumber"] = reference_number
+
+        return self._get("/LegislationText/api/getpdfasync", params=params)
+
+    def get_text_hit_counts(
+        self,
+        legislation_text_ids: list[int],
+        keyword: str | None = None,
+        *,
+        words: list[str] | None = None,
+        location: str | None = None,
+    ) -> list[TextHitCount]:
+        """Count a keyword in a set of texts, one count per text.
+
+        The counting half of a keyword search: it tells you how often the
+        term occurs in texts you already chose, and finds nothing itself.
+        ``"wage"`` over HB1's three texts returned 11, 12 and 12.
+
+        ``keyword`` and ``words`` are two ways to send the term, and
+        ``"wage"`` counted the same through either.  Several terms add up:
+        ``"minimum"`` counts 12 and ``"wage"`` 11 in HB1's introduced text,
+        and both together count 23 as a word list or as ``"minimum AND
+        wage"``.
+
+        **Send a term, and send real ids.**  With neither ``keyword`` nor
+        ``words`` LIS answers 204, and it answers 204 as well when a text id
+        does not exist.  Both come back as ``[]``.
+
+        Args:
+            legislation_text_ids: ``LegislationTextID`` values.
+            keyword: Sent as ``KeywordExpression``.
+            words: Sent as ``WordList``, one ``Hitword`` each.
+            location: Sent as ``Location``.  Not exercised.
+
+        Envelope key: ``HitCounts``.
+        """
+        body: dict = {"Documents": [{"LegislationTextID": i} for i in legislation_text_ids]}
+        if keyword is not None:
+            body["KeywordExpression"] = keyword
+
+        if words:
+            body["WordList"] = [{"Hitword": w} for w in words]
+
+        if location is not None:
+            body["Location"] = location
+
+        data = self._post("/LegislationText/api/getlegislationtextshitcountsasync", json=body)
+        if data is None:
+            return []
+
+        return [TextHitCount.model_validate(r) for r in data.get("HitCounts", [])]
 
     # ------------------------------------------------------------------
     # Legislation versions (one bill's published versions, and a bulk form)
@@ -786,6 +1305,21 @@ class LISClient:
             return []
         return [LegislationSummary.model_validate(s) for s in data.get("LegislationSummaries", [])]
 
+    def get_summary_versions(self) -> list[SummaryVersion]:
+        """Reference list of the 4 summary stages, in progression order.
+
+        The official order of the ``SummaryVersion`` labels, and the
+        vocabulary behind ``LegislationSummary.SummaryVersionID``.  See
+        :class:`SummaryVersion`.
+
+        Envelope key: ``SummaryVersions``.
+        """
+        data = self._get("/LegislationSummary/api/getsummaryversionsreferenceasync")
+        if data is None:
+            return []
+
+        return [SummaryVersion.model_validate(r) for r in data.get("SummaryVersions", [])]
+
     # ------------------------------------------------------------------
     # Legislation events (bill action history)
     # ------------------------------------------------------------------
@@ -863,6 +1397,25 @@ class LISClient:
             return []
         return [ActorType.model_validate(a) for a in data.get("ActorTypes", [])]
 
+    def get_event(self, legislation_event_id: int) -> LegislationEvent | None:
+        """One bill event by its ``LegislationEventID``.  ``None`` on a 204.
+
+        The same row :meth:`get_bill_events` returns, for when an event id is
+        all you hold: a minutes activity, a vote, and a communication each
+        carry one.  The ids are one sequence back to 1994; ``1`` is HJ30 on
+        1994-01-07.
+
+        Envelope key: ``LegislationEvents`` (single-element list).
+        """
+        data = self._get(
+            f"/LegislationEvent/api/getlegislationeventbyidasync/{legislation_event_id}"
+        )
+        if data is None:
+            return None
+
+        events = data.get("LegislationEvents", [])
+        return LegislationEvent.model_validate(events[0]) if events else None
+
     # ------------------------------------------------------------------
     # Votes (per-member roll calls)
     # ------------------------------------------------------------------
@@ -926,6 +1479,109 @@ class LISClient:
             return []
         return [VoteType.model_validate(t) for t in data.get("VoteTypes", [])]
 
+    def get_shallow_votes(
+        self,
+        chamber_code: str,
+        *,
+        session_code: int | None = None,
+        session_id: int | None = None,
+        legislation_id: int | None = None,
+        member_id: int | None = None,
+        start_date: str | date | datetime | None = None,
+        end_date: str | date | datetime | None = None,
+        vote_classification_id: int | None = None,
+    ) -> list[ShallowVote]:
+        """Votes without their members, filtered by bill, member, or date.
+
+        The one vote endpoint that takes a ``legislationID``.  HB1 in 20261
+        returned 3 House votes and 4 Senate votes, the tally and the
+        committee on each, in two requests.  The roll call behind a row is
+        :meth:`get_vote`.
+
+        **A chamber and a session are both required.**  Without the chamber
+        LIS answers 400, "The chamberCode field is required."  Without a
+        session it answers 400, "Must provide either a valid Session ID or
+        Session Code".  The chamber is the one that voted, so a bill costs
+        one request per chamber.
+
+        **``member_id`` and ``legislation_id`` together are an OR, not an
+        AND.**  The answer is every vote on the bill plus every vote the
+        member took part in: 1,911 rows and 1.5 MB for member 544 with HB1
+        in 20261, including two HB1 committee votes that member had no part
+        in.  It is not that member's votes on the bill.  Send one or the
+        other.
+
+        **``end_date`` is exclusive.**  A start and an end on the same day
+        answer 204.  ``"2026-01-20"`` to ``"2026-01-21"`` returned the 49
+        House votes of the 20th.  With ``member_id`` added, that became the
+        one vote the member took part in.  The dates narrow whatever the
+        other filters select.
+
+        Read :class:`ShallowVote` before you filter the rows: ``IsBlock`` is
+        false on a block vote, and most voice votes are missing.
+
+        Not offered: ``voteNumber``.  LIS answers 500 to it, "Please specify
+        a Floor Vote number", for a committee number and for a floor number
+        alike, and this client retries a 500 for minutes before it gives up.
+
+        Args:
+            chamber_code: ``"H"`` or ``"S"``, the chamber that voted.
+            session_code: e.g. ``20261``.
+            session_id: e.g. ``59``.  An alternative to ``session_code``.
+            legislation_id: Every vote that chamber took on one bill.
+            member_id: Every vote one member took part in.
+            start_date: Inclusive; a ``date``, ``datetime``, or
+                ``"YYYY-MM-DD"``.
+            end_date: Exclusive, same forms.
+            vote_classification_id: ``2`` returned ``Attendance`` votes only.
+
+        Envelope key: ``ShallowVotes``.
+        """
+        params: dict = {"chamberCode": chamber_code}
+        if session_code is not None:
+            params["sessionCode"] = session_code
+
+        if session_id is not None:
+            params["sessionID"] = session_id
+
+        if legislation_id is not None:
+            params["legislationID"] = legislation_id
+
+        if member_id is not None:
+            params["memberID"] = member_id
+
+        if start_date is not None:
+            params["startDate"] = _date_param(start_date)
+
+        if end_date is not None:
+            params["endDate"] = _date_param(end_date)
+
+        if vote_classification_id is not None:
+            params["voteClassificationID"] = vote_classification_id
+
+        data = self._get("/Vote/api/getshallowvoteasync", params=params)
+        if data is None:
+            return []
+
+        return [ShallowVote.model_validate(v) for v in data.get("ShallowVotes", [])]
+
+    def get_vote_links(self, legislation_event_id: int) -> list[VoteLink]:
+        """The vote behind one bill event, without the roster.
+
+        One row for an event that recorded a vote, and ``[]`` for one that
+        did not, which answers 204.  See :class:`VoteLink`.
+
+        Envelope key: ``VoteLinks``.
+        """
+        data = self._get(
+            "/Vote/api/getvotelinksasync",
+            params={"legislationEventID": legislation_event_id},
+        )
+        if data is None:
+            return []
+
+        return [VoteLink.model_validate(v) for v in data.get("VoteLinks", [])]
+
     # ------------------------------------------------------------------
     # Members (the roster behind a roll call)
     # ------------------------------------------------------------------
@@ -951,9 +1607,9 @@ class LISClient:
         The undocumented ``chamberCode`` parameter works: it returns 106 House
         or 42 Senate rows against 148 unfiltered (measured 2026-09-08).
 
-        ``/Member/api/getmemberlistasync`` returns the same rows under
-        ``ShallowMembers`` with a strict subset of the fields — it drops
-        ``DistrictID`` and ``DistrictName`` — so this client does not wire it.
+        :meth:`get_member_list` returns the same members with fewer fields.
+        It drops ``DistrictID`` and ``DistrictName``, so it cannot back a
+        voting record.
 
         Args:
             session_code: Required.  Omitting it returns HTTP 400.
@@ -1065,6 +1721,206 @@ class LISClient:
         if data is None:
             return []
         return [District.model_validate(d) for d in data.get("Districts", [])]
+
+    def get_active_members(
+        self,
+        session_code: int | None = None,
+        session_id: int | None = None,
+    ) -> list[Member]:
+        """A session's members with the fields the roster leaves null.
+
+        Both chambers in one request: 146 rows for 20261, 104 House and 42
+        Senate (measured 2026-10-12).  Every row fills ``MemberDetailID``,
+        ``ChamberName`` and ``SessionID``, and most fill ``SeatNumber`` and
+        ``VotingSequence``, all of which :meth:`get_members` sends null.
+
+        **"Active" is not "sitting".**  Those 146 included 5 ``Outgoing`` and
+        3 ``Inactive`` members, and 8 carried a ``ServiceEndDate``.
+
+        **It is two short of the roster.**  :meth:`get_members` returned 148
+        for the same session, and the two missing here were one ``Active``
+        and one ``Outgoing`` member.  Build a roll call join on the roster,
+        and use this list for the extra fields.
+
+        **A session is required.**  With none LIS answers 400.
+
+        Args:
+            session_code: e.g. ``20261``.
+            session_id: e.g. ``59``.  An alternative to ``session_code``.
+
+        Envelope key: ``Members``.
+        """
+        params: dict = {}
+        if session_code is not None:
+            params["sessionCode"] = session_code
+
+        if session_id is not None:
+            params["sessionID"] = session_id
+
+        data = self._get("/Member/api/getactivemembersasync", params=params)
+        if data is None:
+            return []
+
+        return [Member.model_validate(m) for m in data.get("Members", [])]
+
+    def get_member_list(
+        self,
+        *,
+        session_code: int | None = None,
+        session_id: int | None = None,
+        chamber_code: str | None = None,
+        member_number: str | None = None,
+        party_code: str | None = None,
+    ) -> list[Member]:
+        """The roster with 16 fields, and the only one that filters on party.
+
+        The 148 members :meth:`get_members` returns for 20261, in 64 KB, with
+        no district and no room on any row.  Prefer :meth:`get_members` for a
+        roll call join.  What this path adds is its filters: ``party_code``
+        and ``member_number`` both work here, and the roster takes neither.
+        The Senate's Republicans came back as 19 rows and ``"H0402"`` as one
+        (measured 2026-10-12).
+
+        **``MemberStatusID`` disagrees with ``MemberStatus`` here too.**  61
+        of the 148 rows said ``0`` beside ``"Active"``.  Read the name.
+
+        ``ServiceEndDate`` is a key only on a member who left: 9 of 148.
+
+        **A session is required.**  With none LIS answers 400, "Request
+        requires valid Session Code".
+
+        Not offered: ``statuses``.  LIS ignored it as ``3``, as
+        ``"Outgoing"`` and as a repeated key, and returned all 148 each time.
+
+        Args:
+            session_code: e.g. ``20261``.
+            session_id: e.g. ``59``.  An alternative to ``session_code``.
+            chamber_code: ``"H"`` or ``"S"``.
+            member_number: e.g. ``"H0402"``.  The number, not the ``MemberID``.
+            party_code: ``"D"``, ``"R"`` or ``"I"``.
+
+        Envelope key: ``ShallowMembers``.
+        """
+        params: dict = {}
+        if session_code is not None:
+            params["sessionCode"] = session_code
+
+        if session_id is not None:
+            params["sessionID"] = session_id
+
+        if chamber_code is not None:
+            params["chamberCode"] = chamber_code
+
+        if member_number is not None:
+            params["memberNumber"] = member_number
+
+        if party_code is not None:
+            params["partyCode"] = party_code
+
+        data = self._get("/Member/api/getmemberlistasync", params=params)
+        if data is None:
+            return []
+
+        return [Member.model_validate(m) for m in data.get("ShallowMembers", [])]
+
+    def get_member_contacts(
+        self,
+        *,
+        session_code: int | None = None,
+        session_id: int | None = None,
+        chamber_code: str | None = None,
+        member_number: str | None = None,
+        party_code: str | None = None,
+        contact_type_id: int | None = None,
+        effective_date: str | date | datetime | None = None,
+    ) -> list[MemberContact]:
+        """Members with their Capitol and district addresses in one row each.
+
+        106 rows and 120 KB for the 20261 House.  The only member endpoint
+        that splits the name into first, middle and last.
+
+        **A session is required.**  With none LIS answers 400, "Request
+        requires valid Session Code".
+
+        **The bill counts on a row are session totals unless you name one
+        member.**  See :class:`MemberContact`.
+
+        ``chamber_code``, ``party_code`` and ``member_number`` all filter:
+        the Senate's Republicans came back as 19 rows, and ``"H0402"`` as
+        one.  ``contact_type_id=9`` changed nothing; the Senate rows still
+        carried both address kinds.
+
+        Args:
+            session_code: e.g. ``20261``.
+            session_id: e.g. ``59``.  An alternative to ``session_code``.
+            chamber_code: ``"H"`` or ``"S"``.
+            member_number: e.g. ``"H0402"``.  The number, not the ``MemberID``.
+            party_code: ``"D"``, ``"R"`` or ``"I"``.
+            contact_type_id: Sent as ``contactTypeID``; no effect observed.
+            effective_date: Sent as ``effectiveDate``.  Not exercised.
+
+        Envelope key: ``MemberContactInformationList``.
+        """
+        params: dict = {}
+        if session_code is not None:
+            params["sessionCode"] = session_code
+
+        if session_id is not None:
+            params["sessionID"] = session_id
+
+        if chamber_code is not None:
+            params["chamberCode"] = chamber_code
+
+        if member_number is not None:
+            params["memberNumber"] = member_number
+
+        if party_code is not None:
+            params["partyCode"] = party_code
+
+        if contact_type_id is not None:
+            params["contactTypeID"] = contact_type_id
+
+        if effective_date is not None:
+            params["effectiveDate"] = _date_param(effective_date)
+
+        data = self._get("/Member/api/getmemberscontactinformationlistasync", params=params)
+        if data is None:
+            return []
+
+        return [
+            MemberContact.model_validate(m) for m in data.get("MemberContactInformationList", [])
+        ]
+
+    def get_member_status_types(self) -> list[MemberStatusType]:
+        """Reference list of the 4 member statuses.  Envelope key: ``MemberStatuses``."""
+        data = self._get("/Member/api/getmemberstatustypereferencesasync")
+        if data is None:
+            return []
+
+        return [MemberStatusType.model_validate(r) for r in data.get("MemberStatuses", [])]
+
+    def get_chamber_types(self) -> list[ChamberType]:
+        """Reference list of the 2 chambers.  Envelope key: ``ChamberTypes``."""
+        data = self._get("/Member/api/getchambertypereferencesasync")
+        if data is None:
+            return []
+
+        return [ChamberType.model_validate(r) for r in data.get("ChamberTypes", [])]
+
+    def get_member_owner_types(self) -> list[OwnerType]:
+        """The owner types again, from the Member service.
+
+        The six rows of :meth:`get_owner_types`.  LIS sends ``OwnerTypeID``
+        as a string here (``"4"``) and as a number there; the model reads
+        both as an ``int``.
+
+        Envelope key: ``OwnerTypes``.
+        """
+        data = self._get("/Member/api/getownertypereferencesasync")
+        if data is None:
+            return []
+
+        return [OwnerType.model_validate(r) for r in data.get("OwnerTypes", [])]
 
     # ------------------------------------------------------------------
     # Bills by member (the member-first bill axis)
@@ -1199,6 +2055,46 @@ class LISClient:
         if data is None:
             return []
         return [PatronRole.model_validate(r) for r in data.get("PatronRolesList", [])]
+
+    def get_member_patron_types(
+        self,
+        member_id: int,
+        *,
+        session_code: int | None = None,
+        session_id: int | None = None,
+    ) -> list[PatronRole]:
+        """The patron roles one member holds in a session.
+
+        A cheap test of what a member has to show before you fetch their
+        bills.  Member 544 held four in 20261: ``1`` Chief Patron, ``2``
+        Chief Co-Patron, ``4`` Co-Patron, and ``0``.  Member 308 held ``1``,
+        ``3``, ``4``, ``5`` and ``0``.
+
+        **``PatronTypeID`` 0 is not a patron role.**  It is "Budget Amendment
+        Requests", it came back for both members, and
+        :meth:`get_patron_roles` does not list it.
+
+        **A session is required.**  With none LIS answers 400.
+
+        Args:
+            member_id: e.g. ``544``.
+            session_code: e.g. ``20261``.
+            session_id: e.g. ``59``.  An alternative to ``session_code``.
+
+        Envelope key: ``MemberPatronTypes``.
+        """
+        params: dict = {"memberID": member_id}
+        if session_code is not None:
+            params["sessionCode"] = session_code
+
+        if session_id is not None:
+            params["sessionID"] = session_id
+
+        data = self._get("/LegislationPatron/api/getmemberpatrontypelistasync", params=params)
+        if data is None:
+            return []
+
+        return [PatronRole.model_validate(r) for r in data.get("MemberPatronTypes", [])]
 
     # ------------------------------------------------------------------
     # Committees and seats
@@ -1355,6 +2251,45 @@ class LISClient:
             return []
         return [CommitteeAction.model_validate(a) for a in data.get("CommitteeActions", [])]
 
+    def get_committee_members_text(
+        self,
+        committee_id: int,
+        *,
+        session_code: int | None = None,
+        session_id: int | None = None,
+    ) -> str | None:
+        """A committee's roster as one line of surnames.  Plain text, not JSON.
+
+        The line LIS prints under a committee name: ``"Aird (Chair), Stanley,
+        McPike, ..."`` for Senate committee 28 in 20261, 17 names in 180
+        bytes.  It carries surnames and the chair only, so reach for
+        :meth:`get_committee_members` when you need a ``MemberID``.
+
+        **A session is required, and its absence is a 406.**  Not the 400
+        the other paths give.  An unknown committee answers 204.
+
+        Args:
+            committee_id: e.g. ``28``.
+            session_code: e.g. ``20261``.
+            session_id: e.g. ``59``.  An alternative to ``session_code``.
+
+        Returns:
+            The text, or ``None`` on a 204.
+
+        Raises:
+            requests.HTTPError: 406 when no session is sent.
+        """
+        params: dict = {"CommitteeID": committee_id}
+        if session_code is not None:
+            params["sessionCode"] = session_code
+
+        if session_id is not None:
+            params["sessionID"] = session_id
+
+        return self._get_text(
+            "/MembersByCommittee/api/getcommitteememberslisttextasync", params=params
+        )
+
     # ------------------------------------------------------------------
     # Meetings: the master schedule (when and where)
     # ------------------------------------------------------------------
@@ -1435,6 +2370,64 @@ class LISClient:
         if data is None:
             return []
         return [MeetingRoom.model_validate(r) for r in data.get("MeetingRooms", [])]
+
+    def get_schedule_vcal(
+        self,
+        start_date: str | date | datetime | None = None,
+        end_date: str | date | datetime | None = None,
+        *,
+        owner_id: int | None = None,
+        schedule_type_id: int | None = None,
+        vote_room_id: int | None = None,
+        schedule_ids: list[int] | None = None,
+    ) -> str | None:
+        """The master schedule as an iCalendar feed.  Text, not JSON.
+
+        LIS answers ``text/calendar``: a ``VCALENDAR`` holding one ``VEVENT``
+        per meeting, ready for a calendar application.  2026-02-02 to
+        2026-02-03 returned 32 events in 13 KB, where :meth:`get_schedules`
+        returned 34 rows for the same dates.  The filters are those of
+        :meth:`get_schedules`, and a list of two ``schedule_ids`` returned
+        exactly those two events.
+
+        **The id filter is ``scheduleIDs``, plural.**  LIS ignores an unknown
+        parameter such as ``scheduleID`` without an error and returns its
+        default feed, so a misspelled filter looks like it worked.
+
+        This method never sends ``writeToAzureCDN``, which the spec also
+        offers.  That flag publishes a file and is not a read.
+
+        Args:
+            start_date: A ``date``, ``datetime``, or ``"YYYY-MM-DD"``.
+            end_date: Same forms.
+            owner_id: ``CommitteeID`` of the meeting's owner.
+            schedule_type_id: See :meth:`get_schedule_types`.
+            vote_room_id: A room from :meth:`get_meeting_rooms`.
+            schedule_ids: ``ScheduleID`` values, sent as repeated keys.
+
+        Returns:
+            The iCalendar text, or ``None`` on a 204.
+        """
+        params: dict = {}
+        if start_date is not None:
+            params["startDate"] = _date_param(start_date)
+
+        if end_date is not None:
+            params["endDate"] = _date_param(end_date)
+
+        if owner_id is not None:
+            params["ownerID"] = owner_id
+
+        if schedule_type_id is not None:
+            params["scheduleTypeID"] = schedule_type_id
+
+        if vote_room_id is not None:
+            params["voteRoomID"] = vote_room_id
+
+        if schedule_ids:
+            params["scheduleIDs"] = list(schedule_ids)
+
+        return self._get_text("/Schedule/api/previewvcalfileasync", params=params or None)
 
     # ------------------------------------------------------------------
     # Meetings: floor calendars and Senate dockets (what is up)
@@ -1659,10 +2652,10 @@ class LISClient:
         ``effective_begin_date`` is the only real time filter and it works:
         ``"2026-01-01"`` cut the clerk list from 54 to 44.
 
-        Two sibling paths are redundant and are not wired.
-        ``getclerkpersonnellistasync`` is byte-identical to this call with
-        ``staff_role_type_id=1``, and ``getreferencesasync`` is
-        byte-identical to the unfiltered call.
+        Three sibling paths return slices of this list:
+        :meth:`get_clerk_personnel` is this call with
+        ``staff_role_type_id=1``, :meth:`get_staff_personnel` is it with
+        ``2``, and :meth:`get_personnel_references` is the unfiltered call.
 
         Args:
             staff_role_type_id: ``1`` clerks, ``2`` staff. See
@@ -1801,6 +2794,116 @@ class LISClient:
         if data is None:
             return []
         return [Agency.model_validate(a) for a in data.get("Agencies", [])]
+
+    def get_clerk_personnel(
+        self,
+        *,
+        affiliation_id: int | None = None,
+        effective_begin_date: str | date | datetime | None = None,
+    ) -> list[Personnel]:
+        """Committee clerks, from their own path.
+
+        The rows of :meth:`get_personnel` with ``staff_role_type_id=1``: 54
+        with no argument, 44 from ``effective_begin_date="2026-01-01"``, and
+        2 for committee 28 (measured 2026-10-12).  All 11 fields arrive even
+        with no argument, where the general list drops four.
+
+        Args:
+            affiliation_id: A ``CommitteeID``.
+            effective_begin_date: Keep only assignments starting on or after
+                this date.
+
+        Envelope key: ``Personnels``.
+        """
+        return self._personnel("getclerkpersonnellistasync", affiliation_id, effective_begin_date)
+
+    def get_staff_personnel(
+        self,
+        *,
+        affiliation_id: int | None = None,
+        effective_begin_date: str | date | datetime | None = None,
+    ) -> list[Personnel]:
+        """Committee DLS staff, from their own path.
+
+        The rows of :meth:`get_personnel` with ``staff_role_type_id=2``: 59
+        with no argument, 47 from ``effective_begin_date="2026-01-01"``,
+        and 2 for committee 28 (measured 2026-10-12).  All 11 fields arrive
+        even with no argument.
+
+        Args:
+            affiliation_id: A ``CommitteeID``.
+            effective_begin_date: Keep only assignments starting on or after
+                this date.
+
+        Envelope key: ``Personnels``.
+        """
+        return self._personnel("getstaffpersonnellistasync", affiliation_id, effective_begin_date)
+
+    def get_personnel_references(
+        self,
+        effective_begin_date: str | date | datetime | None = None,
+    ) -> list[Personnel]:
+        """The unfiltered personnel list under a second path.
+
+        Byte for byte the answer of :meth:`get_personnel` with no argument:
+        33 rows of seven keys that name people and no committee.  LIS ignores
+        ``affiliationID`` here.  Prefer :meth:`get_personnel` with a filter.
+
+        Args:
+            effective_begin_date: Sent as ``effectiveBeginDate``.  Not
+                exercised.
+
+        Envelope key: ``Personnels``.
+        """
+        return self._personnel("getreferencesasync", None, effective_begin_date)
+
+    def _personnel(
+        self,
+        tail: str,
+        affiliation_id: int | None,
+        effective_begin_date: str | date | datetime | None,
+    ) -> list[Personnel]:
+        params: dict = {}
+        if affiliation_id is not None:
+            params["affiliationID"] = affiliation_id
+
+        if effective_begin_date is not None:
+            params["effectiveBeginDate"] = _date_param(effective_begin_date)
+
+        data = self._get(f"/Personnel/api/{tail}", params=params or None)
+        if data is None:
+            return []
+
+        return [Personnel.model_validate(p) for p in data.get("Personnels", [])]
+
+    def get_organizations(self) -> list[Organization]:
+        """Every organization as an id and a name, 296 rows in 19 KB.
+
+        The budget agencies of :meth:`get_agencies` without their branch or
+        number, plus the General Assembly itself as ``749``.
+
+        Envelope key: ``Organizations``.
+        """
+        data = self._get("/Organization/api/getorganizationlistasync")
+        if data is None:
+            return []
+
+        return [Organization.model_validate(o) for o in data.get("Organizations", [])]
+
+    def get_organization(self, organization_id: int) -> Organization | None:
+        """One organization's name by ``IdentityID``.  ``None`` if unknown.
+
+        ``749`` is the General Assembly.  An unknown id answers 204 with an
+        empty body, not 404.
+
+        Envelope key: ``Organizations`` (single-element list).
+        """
+        data = self._get(f"/Organization/api/getorganizationbyidasync/{organization_id}")
+        if data is None:
+            return None
+
+        rows = data.get("Organizations", [])
+        return Organization.model_validate(rows[0]) if rows else None
 
     # ------------------------------------------------------------------
     # Communications (what one chamber formally told the other)
@@ -2244,58 +3347,29 @@ class LISClient:
 
         Envelope key: ``Legislations``.
         """
-        body: dict = {}
-        if session_code is not None:
-            body["SessionCode"] = session_code
-        if session_id is not None:
-            body["SessionID"] = session_id
-        if keyword is not None:
-            body["KeywordExpression"] = keyword
-        if keyword_location is not None:
-            body["KeywordLocation"] = keyword_location
-        if keyword_all_sessions is not None:
-            body["KeywordUseGlobalSessionSearch"] = keyword_all_sessions
-        if chamber_code is not None:
-            body["Chambercode"] = chamber_code  # lowercase "c" — LIS spells it this way
-        if status_id is not None:
-            body["LegislationStatusID"] = status_id
-        if category_id is not None:
-            body["LegislationCategoryID"] = category_id
-        if committee_id is not None:
-            body["CommitteeID"] = committee_id
-        if member_id is not None:
-            body["MemberID"] = member_id
-        if patron_types:
-            body["PatronTypes"] = patron_types
-        if subject_index_id is not None:
-            body["SubjectIndexID"] = subject_index_id
-        if chapter_number is not None:
-            body["ChapterNumber"] = chapter_number
-        if legislation_numbers:
-            # LIS rejects a flat list of strings with 400; each entry has to
-            # be its own object.  Accept either shape and wrap the scalars.
-            body["LegislationNumbers"] = [
-                n if isinstance(n, dict) else {"LegislationNumber": n} for n in legislation_numbers
-            ]
-        if legislation_ids:
-            # Same wrapper, and the key inside is "LegislationId" — lowercase
-            # "d", unlike the "LegislationIDs" that holds it.
-            body["LegislationIDs"] = [
-                i if isinstance(i, dict) else {"LegislationId": i} for i in legislation_ids
-            ]
-        if start_date is not None:
-            body["StartDate"] = _date_param(start_date)
-        if end_date is not None:
-            body["EndDate"] = _date_param(end_date)
-        if exclude_failed is not None:
-            body["ExcludeFailed"] = exclude_failed
-        if current_status is not None:
-            body["CurrentStatus"] = current_status
-        if summary_length is not None:
-            body["SummaryLength"] = summary_length
-
-        if extra:
-            body.update(extra)
+        body = _search_body(
+            session_code=session_code,
+            session_id=session_id,
+            keyword=keyword,
+            keyword_location=keyword_location,
+            keyword_all_sessions=keyword_all_sessions,
+            chamber_code=chamber_code,
+            status_id=status_id,
+            category_id=category_id,
+            committee_id=committee_id,
+            member_id=member_id,
+            patron_types=patron_types,
+            subject_index_id=subject_index_id,
+            chapter_number=chapter_number,
+            legislation_numbers=legislation_numbers,
+            legislation_ids=legislation_ids,
+            start_date=start_date,
+            end_date=end_date,
+            exclude_failed=exclude_failed,
+            current_status=current_status,
+            summary_length=summary_length,
+            extra=extra,
+        )
 
         data = self._post("/AdvancedLegislationSearch/api/getlegislationlistasync", json=body)
         if data is None:
@@ -2404,9 +3478,8 @@ class LISClient:
 
         The vocabulary behind :meth:`search_legislation`'s ``category_id``.
 
-        The sibling ``getstatusreferencesasync`` is not wired: it returns the
-        same 52 rows under the same ``References`` key as
-        :meth:`get_legislation_statuses`.  Use that one.
+        The sibling status vocabulary is :meth:`get_search_statuses`, which
+        returns the same 52 rows as :meth:`get_legislation_statuses`.
 
         Envelope key: ``LegislationCategoriesList``.
         """
@@ -2418,6 +3491,53 @@ class LISClient:
             LegislationCategory.model_validate(row)
             for row in data.get("LegislationCategoriesList", [])
         ]
+
+    def get_search_statuses(self) -> list[LegislationStatus]:
+        """The legislation statuses again, from the search service.
+
+        The 52 rows of :meth:`get_legislation_statuses` under the same
+        ``References`` key.  Use either.
+
+        Envelope key: ``References``.
+        """
+        data = self._get("/AdvancedLegislationSearch/api/getstatusreferencesasync")
+        if data is None:
+            return []
+
+        return [LegislationStatus.model_validate(r) for r in data.get("References", [])]
+
+    def get_subjects(
+        self,
+        session_code: int | None = None,
+        session_id: int | None = None,
+    ) -> list[Subject]:
+        """A session's subject index headings, 506 for 20261.
+
+        **The headings join to nothing.**  No bill row carries a
+        ``SubjectIndexID``, and :meth:`search_legislation` answers 204 to
+        one.  See :class:`Subject`.
+
+        **A session is required.**  With none LIS answers 400.  The two
+        session forms returned the same 506 rows (checked 2026-10-12).
+
+        Args:
+            session_code: e.g. ``20261``.
+            session_id: e.g. ``59``.  An alternative to ``session_code``.
+
+        Envelope key: ``SubjectsReference``.
+        """
+        params: dict = {}
+        if session_code is not None:
+            params["sessionCode"] = session_code
+
+        if session_id is not None:
+            params["sessionID"] = session_id
+
+        data = self._get("/LegislationSubject/api/getsubjectreferencesasync", params=params)
+        if data is None:
+            return []
+
+        return [Subject.model_validate(r) for r in data.get("SubjectsReference", [])]
 
     # ------------------------------------------------------------------
     # Statistics (counts LIS aggregates; they do not always add up)
@@ -2513,3 +3633,89 @@ def _date_param(value: str | date | datetime) -> str:
         return value.isoformat()
 
     return value
+
+
+def _search_body(
+    *,
+    session_code: int | None = None,
+    session_id: int | None = None,
+    keyword: str | None = None,
+    keyword_location: str | None = None,
+    keyword_all_sessions: bool | None = None,
+    chamber_code: str | None = None,
+    status_id: int | None = None,
+    category_id: int | None = None,
+    committee_id: int | None = None,
+    member_id: int | None = None,
+    patron_types: list[int] | None = None,
+    subject_index_id: int | None = None,
+    chapter_number: str | None = None,
+    legislation_numbers: list[str] | None = None,
+    legislation_ids: list[int] | None = None,
+    start_date: str | date | datetime | None = None,
+    end_date: str | date | datetime | None = None,
+    exclude_failed: bool | None = None,
+    current_status: bool | None = None,
+    summary_length: int | None = None,
+    extra: dict | None = None,
+) -> dict:
+    """The JSON body the advanced search paths share, built from keyword criteria.
+
+    ``/AdvancedLegislationSearch`` and three ``/Legislation`` POST paths take
+    the same ``AdvancedSearch`` schema.  :meth:`LISClient.search_legislation`
+    documents each criterion.
+    """
+    body: dict = {}
+    if session_code is not None:
+        body["SessionCode"] = session_code
+    if session_id is not None:
+        body["SessionID"] = session_id
+    if keyword is not None:
+        body["KeywordExpression"] = keyword
+    if keyword_location is not None:
+        body["KeywordLocation"] = keyword_location
+    if keyword_all_sessions is not None:
+        body["KeywordUseGlobalSessionSearch"] = keyword_all_sessions
+    if chamber_code is not None:
+        body["Chambercode"] = chamber_code  # lowercase "c" — LIS spells it this way
+    if status_id is not None:
+        body["LegislationStatusID"] = status_id
+    if category_id is not None:
+        body["LegislationCategoryID"] = category_id
+    if committee_id is not None:
+        body["CommitteeID"] = committee_id
+    if member_id is not None:
+        body["MemberID"] = member_id
+    if patron_types:
+        body["PatronTypes"] = patron_types
+    if subject_index_id is not None:
+        body["SubjectIndexID"] = subject_index_id
+    if chapter_number is not None:
+        body["ChapterNumber"] = chapter_number
+    if legislation_numbers:
+        # LIS rejects a flat list of strings with 400; each entry has to
+        # be its own object.  Accept either shape and wrap the scalars.
+        body["LegislationNumbers"] = [
+            n if isinstance(n, dict) else {"LegislationNumber": n} for n in legislation_numbers
+        ]
+    if legislation_ids:
+        # Same wrapper, and the key inside is "LegislationId" — lowercase
+        # "d", unlike the "LegislationIDs" that holds it.
+        body["LegislationIDs"] = [
+            i if isinstance(i, dict) else {"LegislationId": i} for i in legislation_ids
+        ]
+    if start_date is not None:
+        body["StartDate"] = _date_param(start_date)
+    if end_date is not None:
+        body["EndDate"] = _date_param(end_date)
+    if exclude_failed is not None:
+        body["ExcludeFailed"] = exclude_failed
+    if current_status is not None:
+        body["CurrentStatus"] = current_status
+    if summary_length is not None:
+        body["SummaryLength"] = summary_length
+
+    if extra:
+        body.update(extra)
+
+    return body

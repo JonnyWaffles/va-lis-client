@@ -6,13 +6,16 @@ Built from live API responses — the OpenAPI specs are unreliable
 
 Modules:
     common       — Heartbeat, Partner
-    session      — SessionEvent, Session
+    session      — SessionEvent, Session, ShallowSession, SessionEventType,
+                   SessionType
     legislation  — Patron, PatronRole, PatronBill, PatronLegislation,
                    LegislationSession, LegislationSummaryItem, Legislation,
                    MemberLegislation, LegislationStatus, LegislationVersion,
-                   PATRON_ROLES
+                   Amendment, AmendedLegislation, ConferenceLegislation,
+                   LegislationIdEntry, Subject, PATRON_ROLES
     text         — TextFile, LegislationTextItem, LegislationTextDetail,
-                   LegislationSummary
+                   LegislationSummary, SummaryVersion, TextDisposition,
+                   TextAction, SponsorType, TextHitCount
     bill_version — BillVersion (one bill's versions; not LegislationVersion,
                    which is the version type vocabulary)
     statistics   — ChamberStatistic, CommitteeStatistic
@@ -30,7 +33,7 @@ Modules:
                    CalendarType, CalendarCategoryType, CategoryType,
                    CalendarAction
     vote         — VoteMember, VoteLegislation, VoteStatement, VoteFile,
-                   VoteType, Vote
+                   VoteType, Vote, ShallowVote, VoteLink
     docket       — DocketItem, DocketCategory, DocketListItem, CalendarDisplay,
                    DocketDetail
     minutes      — MinutesFile, MinutesCalendar, ActivityReference,
@@ -40,8 +43,9 @@ Modules:
     event        — EventReference, LegislationEvent, LegislationEventType,
                    ActorType
     directory    — Personnel, StaffRoleType, Contact, ContactType,
-                   OwnerType, Agency
-    member       — Member, Party, District
+                   OwnerType, Agency, Organization
+    member       — Member, Party, District, MemberStatusType, ChamberType,
+                   MemberContact, MemberContactAddress
     member_vote  — MemberVoteResult
     pagination   — Pagination, PagedList, page_request_header
 """
@@ -81,6 +85,7 @@ from va_lis_client.models.directory import (
     Agency,
     Contact,
     ContactType,
+    Organization,
     OwnerType,
     Personnel,
     StaffRoleType,
@@ -103,7 +108,11 @@ from va_lis_client.models.legislation import (
     CHIEF_PATRON,
     CO_PATRON,
     PATRON_ROLES,
+    AmendedLegislation,
+    Amendment,
+    ConferenceLegislation,
     Legislation,
+    LegislationIdEntry,
     LegislationSession,
     LegislationStatus,
     LegislationSummaryItem,
@@ -113,8 +122,17 @@ from va_lis_client.models.legislation import (
     PatronBill,
     PatronLegislation,
     PatronRole,
+    Subject,
 )
-from va_lis_client.models.member import District, Member, Party
+from va_lis_client.models.member import (
+    ChamberType,
+    District,
+    Member,
+    MemberContact,
+    MemberContactAddress,
+    MemberStatusType,
+    Party,
+)
 from va_lis_client.models.member_vote import MemberVoteResult
 from va_lis_client.models.minutes import (
     ActionReferenceType,
@@ -144,18 +162,31 @@ from va_lis_client.models.search import (
     SearchTextMatch,
     summary_version_rank,
 )
-from va_lis_client.models.session import Session, SessionEvent
+from va_lis_client.models.session import (
+    Session,
+    SessionEvent,
+    SessionEventType,
+    SessionType,
+    ShallowSession,
+)
 from va_lis_client.models.statistics import ChamberStatistic, CommitteeStatistic
 from va_lis_client.models.text import (
     LegislationSummary,
     LegislationTextDetail,
     LegislationTextItem,
+    SponsorType,
+    SummaryVersion,
+    TextAction,
+    TextDisposition,
     TextFile,
+    TextHitCount,
 )
 from va_lis_client.models.vote import (
+    ShallowVote,
     Vote,
     VoteFile,
     VoteLegislation,
+    VoteLink,
     VoteMember,
     VoteStatement,
     VoteType,
@@ -168,12 +199,19 @@ __all__ = [
     # session
     "Session",
     "SessionEvent",
+    "SessionEventType",
+    "SessionType",
+    "ShallowSession",
     # legislation
     "CHIEF_CO_PATRON",
     "CHIEF_PATRON",
     "CO_PATRON",
     "PATRON_ROLES",
+    "AmendedLegislation",
+    "Amendment",
+    "ConferenceLegislation",
     "Legislation",
+    "LegislationIdEntry",
     "LegislationSession",
     "LegislationStatus",
     "LegislationSummaryItem",
@@ -183,11 +221,17 @@ __all__ = [
     "PatronBill",
     "PatronLegislation",
     "PatronRole",
+    "Subject",
     # text
     "LegislationSummary",
     "LegislationTextDetail",
     "LegislationTextItem",
+    "SponsorType",
+    "SummaryVersion",
+    "TextAction",
+    "TextDisposition",
     "TextFile",
+    "TextHitCount",
     # bill_version
     "BillVersion",
     # statistics
@@ -234,9 +278,11 @@ __all__ = [
     "CategoryType",
     "Staff",
     # vote
+    "ShallowVote",
     "Vote",
     "VoteFile",
     "VoteLegislation",
+    "VoteLink",
     "VoteMember",
     "VoteStatement",
     "VoteType",
@@ -261,6 +307,7 @@ __all__ = [
     "Agency",
     "Contact",
     "ContactType",
+    "Organization",
     "OwnerType",
     "Personnel",
     "StaffRoleType",
@@ -269,8 +316,12 @@ __all__ = [
     "Pagination",
     "page_request_header",
     # member
+    "ChamberType",
     "District",
     "Member",
+    "MemberContact",
+    "MemberContactAddress",
+    "MemberStatusType",
     "MemberVoteResult",
     "Party",
     # event
