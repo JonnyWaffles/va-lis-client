@@ -1,3 +1,18 @@
+"""Python client for the Virginia Legislative Information System (LIS) REST API.
+
+There are two entry points:
+
+- :class:`LISService` is the one to reach for first.  It takes bill numbers
+  and committee names, joins the reference vocabularies, and caches the large
+  lists.
+- :class:`LISClient` is transport: one method per endpoint, and no
+  interpretation.
+
+The docstring of each method records the traps of its endpoint.  The guides
+that cross endpoints live in the repository, not in the installed package:
+https://github.com/JonnyWaffles/va-lis-client/tree/main/docs
+"""
+
 from va_lis_client.client import LISClient
 from va_lis_client.exceptions import (
     BillNotFoundError,
