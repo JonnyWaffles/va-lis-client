@@ -94,6 +94,7 @@ from va_lis_client.models import (
     MinutesEntry,
     Patron,
     Personnel,
+    ShallowVote,
     Vote,
     VoteMember,
     VoteStatement,
@@ -754,8 +755,10 @@ class LISService:
         """Every recorded vote on a bill, in both chambers, with the members.
 
         This walks the bill's events, takes each ``VoteID``, and fetches the
-        roll call behind it.  Events are the only bill-first route to votes,
-        because no vote endpoint accepts a ``legislationID``.
+        roll call behind it.  The members cost one request per vote whatever
+        the route, because only the single vote record carries them.  When
+        the tallies are enough, :meth:`bill_shallow_votes` lists the same
+        votes in two requests.
 
         Committee, subcommittee, and floor votes all come back, from whichever
         chamber cast them.  HB1 in session 20261 returns 8: two House
@@ -801,6 +804,48 @@ class LISService:
             results.append(record)
 
         return results
+
+    def bill_shallow_votes(self, bill_number: str, session_code: int) -> list[ShallowVote]:
+        """A bill's votes in both chambers without the members, in two requests.
+
+        The cheap sibling of :meth:`bill_votes`.  Each row has the tally, the
+        vote type and the committee, and no roll call, so a bill costs one
+        request per chamber however many times it was voted on.  HB1 in
+        session 20261 returns 7: three House and four Senate.
+
+        **Voice votes are mostly absent.**  :meth:`bill_votes` returns 8 for
+        that bill, and the eighth is a voice vote this list leaves out.  A
+        bill decided by voice alone returns nothing here.
+
+        **Read** :attr:`~va_lis_client.models.vote.ShallowVote.is_block`,
+        **not** ``IsBlock``.  The flag is false on every row; a block vote
+        names itself in ``LegislationNumber``.
+
+        Args:
+            bill_number: Any case, padded or not.  ``hb0001`` resolves ``HB1``.
+            session_code: e.g. ``20261``.
+
+        Returns:
+            :class:`~va_lis_client.models.vote.ShallowVote` rows from both
+            chambers, oldest first.
+
+        Raises:
+            InvalidBillNumberError: The string does not parse as a bill number.
+            BillNotFoundError: The bill is not in that session.
+        """
+        legislation_id = self.resolve_bill_id(bill_number, session_code)
+
+        votes = []
+        for chamber_code in ("H", "S"):
+            votes.extend(
+                self.client.get_shallow_votes(
+                    chamber_code,
+                    session_code=session_code,
+                    legislation_id=legislation_id,
+                )
+            )
+
+        return sorted(votes, key=lambda v: (v.VoteDate is None, v.VoteDate, v.VoteID))
 
     def roll_call(
         self,

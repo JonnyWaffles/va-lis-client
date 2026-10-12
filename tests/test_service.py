@@ -13,7 +13,7 @@ from datetime import date, datetime
 
 import requests
 
-from va_lis_client.client import LISClient, _date_param
+from va_lis_client.client import LISClient, _date_param, _search_body
 from va_lis_client.exceptions import (
     BillNotFoundError,
     CommitteeNotFoundError,
@@ -24,6 +24,7 @@ from va_lis_client.exceptions import (
 )
 from va_lis_client.models import (
     CHIEF_PATRON,
+    AmendedLegislation,
     BillVersion,
     CalendarAction,
     CalendarDetail,
@@ -36,6 +37,7 @@ from va_lis_client.models import (
     Legislation,
     LegislationEvent,
     LegislationEventType,
+    LegislationIdEntry,
     LegislationNumberEntry,
     LegislationSearchResult,
     LegislationStatus,
@@ -43,6 +45,7 @@ from va_lis_client.models import (
     LegislationTextDetail,
     LegislationTextItem,
     Member,
+    MemberContact,
     MemberLegislation,
     MemberVoteResult,
     MinutesActivity,
@@ -50,10 +53,14 @@ from va_lis_client.models import (
     MinutesBookListItem,
     MinutesEntry,
     MinutesSummary,
+    OwnerType,
     Patron,
     Schedule,
     Session,
+    ShallowSession,
+    ShallowVote,
     Vote,
+    VoteLink,
 )
 from va_lis_client.models.search import UNKNOWN_SUMMARY_RANK, summary_version_rank
 from va_lis_client.service import (
@@ -2620,3 +2627,649 @@ class VersionAndStatisticsShapesTest(unittest.TestCase):
         self.assertEqual(row.CommitteeNumber, "H01")
         self.assertEqual(row.SReferred, 18)
         self.assertIsNone(row.SFailed)
+
+
+class ShallowVoteClient(FakeClient):
+    """FakeClient plus the shallow vote list, keyed by the chamber asked for."""
+
+    def __init__(self, by_chamber, **kwargs):
+        super().__init__(**kwargs)
+        self.by_chamber = by_chamber
+        self.shallow_requests = []
+
+    def get_shallow_votes(self, chamber_code, **filters):
+        self.shallow_requests.append((chamber_code, filters))
+        return self.by_chamber.get(chamber_code, [])
+
+
+def shallow_vote(vote_id, chamber="H", when="2026-01-20T12:30:00", number="HB1"):
+    return ShallowVote(VoteID=vote_id, ChamberCode=chamber, VoteDate=when, LegislationNumber=number)
+
+
+class BillShallowVotesTest(unittest.TestCase):
+    def test_asks_each_chamber_once_for_the_resolved_bill(self):
+        client = ShallowVoteClient({"H": [shallow_vote(291609)], "S": [shallow_vote(300418, "S")]})
+
+        LISService(client).bill_shallow_votes("hb0001", 20261)
+
+        expected = {"session_code": 20261, "legislation_id": 98525}
+        self.assertEqual(client.shallow_requests, [("H", expected), ("S", expected)])
+
+    def test_merges_the_chambers_oldest_first(self):
+        """A bill can return to its first chamber after the second has voted."""
+        client = ShallowVoteClient(
+            {
+                "H": [
+                    shallow_vote(291609, when="2026-01-20T12:30:00"),
+                    shallow_vote(301500, when="2026-03-10T09:00:00"),
+                ],
+                "S": [shallow_vote(300418, "S", when="2026-03-04T13:44:15")],
+            }
+        )
+
+        votes = LISService(client).bill_shallow_votes("HB1", 20261)
+
+        self.assertEqual([v.VoteID for v in votes], [291609, 300418, 301500])
+
+    def test_a_bill_decided_by_voice_alone_returns_nothing(self):
+        """HB9 in 20261: two voice votes on its events, and a 204 from both chambers."""
+        self.assertEqual(LISService(ShallowVoteClient({})).bill_shallow_votes("HB1", 20261), [])
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, text="", payload=None):
+        self.status_code = status_code
+        self.text = text
+        self.payload = payload
+        self.headers = {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(response=self)
+
+    def json(self):
+        if self.payload is None:
+            raise ValueError("not JSON")
+
+        return self.payload
+
+
+class TextResponseTest(unittest.TestCase):
+    """Three paths answer with HTML, plain text or iCalendar, never JSON."""
+
+    def client_answering(self, response):
+        client = LISClient(api_key="not-a-real-key", max_retries=0)
+
+        class Session:
+            def request(self, method, url, **kwargs):
+                self.last = (method, url, kwargs)
+                return response
+
+        client.session = Session()
+        return client
+
+    def test_a_text_body_comes_back_unparsed(self):
+        client = self.client_answering(FakeResponse(text="Aird (Chair), Stanley"))
+
+        text = client.get_committee_members_text(28, session_code=20261)
+
+        self.assertEqual(text, "Aird (Chair), Stanley")
+        self.assertEqual(
+            client.session.last[2]["params"], {"CommitteeID": 28, "sessionCode": 20261}
+        )
+
+    def test_a_204_is_none_not_an_empty_string(self):
+        client = self.client_answering(FakeResponse(status_code=204))
+
+        self.assertIsNone(client.get_committee_members_text(999999, session_code=20261))
+        self.assertIsNone(client.get_schedule_vcal("2026-02-02", "2026-02-03"))
+
+    def test_a_missing_session_raises_the_406(self):
+        client = self.client_answering(FakeResponse(status_code=406))
+
+        with self.assertRaises(requests.HTTPError):
+            client.get_committee_members_text(28)
+
+    def test_json_paths_still_parse(self):
+        client = self.client_answering(
+            FakeResponse(payload={"SessionTypes": [{"SessionTypeID": 1}]})
+        )
+
+        self.assertEqual(client.get_session_types()[0].SessionTypeID, 1)
+
+
+class RemainingReadPathsRequestTest(unittest.TestCase):
+    """What each of the last read paths sends, with the transport replaced."""
+
+    def setUp(self):
+        self.client = LISClient(api_key="not-a-real-key")
+        self.sent = []
+        self.answer = None
+
+        def fake_get(path, params=None, **kwargs):
+            self.sent.append(("GET", path, params))
+            return self.answer
+
+        def fake_post(path, json=None):
+            self.sent.append(("POST", path, json))
+            return self.answer
+
+        def fake_get_text(path, params=None):
+            self.sent.append(("TEXT", path, params))
+            return self.answer
+
+        self.client._get = fake_get
+        self.client._post = fake_post
+        self.client._get_text = fake_get_text
+
+    def test_ids_ride_the_path_on_five_methods(self):
+        self.client.get_sessions_by_year(2026)
+        self.client.get_session(59)
+        self.client.get_session_by_code(20261)
+        self.client.get_event(1568490)
+        self.client.get_organization(749)
+
+        self.assertEqual(
+            [path for _, path, _ in self.sent],
+            [
+                "/Session/api/getsessionsbyyearasync/2026",
+                "/Session/api/getsessionbyidasync/59",
+                "/Session/api/getsessionbycodeasync/20261",
+                "/LegislationEvent/api/getlegislationeventbyidasync/1568490",
+                "/Organization/api/getorganizationbyidasync/749",
+            ],
+        )
+
+    def test_is_active_goes_out_lowercase(self):
+        self.client.get_sessions_shallow(is_active=True, session_year=2026)
+        self.client.get_sessions_shallow()
+
+        self.assertEqual(self.sent[0][2], {"sessionYear": 2026, "IsActive": "true"})
+        self.assertIsNone(self.sent[1][2])
+
+    def test_the_conference_list_has_no_session_code_to_send(self):
+        """LIS ignores sessionCode there and answers with every session."""
+        self.client.get_conference_legislation(59, chamber_code="H", member_id=544)
+        self.client.get_conference_legislation()
+
+        self.assertEqual(self.sent[0][2], {"sessionID": 59, "chamberCode": "H", "memberID": 544})
+        self.assertIsNone(self.sent[1][2])
+
+        with self.assertRaises(TypeError):
+            self.client.get_conference_legislation(session_code=20261)
+
+    def test_the_amendment_list_sends_what_it_is_given(self):
+        self.client.get_amended_legislation(session_code=20261, chamber_code="H")
+
+        self.assertEqual(
+            self.sent[0],
+            (
+                "GET",
+                "/Legislation/api/getlegislationamendmentlistasync",
+                {"sessionCode": 20261, "chamberCode": "H"},
+            ),
+        )
+
+    def test_the_legislation_posts_share_the_search_body(self):
+        criteria = {"session_code": 20261, "chamber_code": "H", "legislation_numbers": ["HB1"]}
+        body = {
+            "SessionCode": 20261,
+            "Chambercode": "H",
+            "LegislationNumbers": [{"LegislationNumber": "HB1"}],
+        }
+
+        self.client.get_legislation_list(**criteria)
+        self.client.get_legislation_ids(**criteria)
+        self.client.search_legislation(**criteria)
+
+        self.assertEqual(
+            self.sent,
+            [
+                ("POST", "/Legislation/api/getlegislationlistasync", body),
+                ("POST", "/Legislation/api/getlegislationidslistasync", body),
+                ("POST", "/AdvancedLegislationSearch/api/getlegislationlistasync", body),
+            ],
+        )
+
+    def test_the_search_body_keeps_every_spelling(self):
+        body = _search_body(
+            session_id=59,
+            keyword="firearm",
+            keyword_location="Summary",
+            member_id=544,
+            patron_types=[1],
+            legislation_ids=[98525, {"LegislationId": 98631}],
+            start_date=date(2026, 1, 14),
+            exclude_failed=True,
+            extra={"SummaryLength": 200},
+        )
+
+        self.assertEqual(
+            body,
+            {
+                "SessionID": 59,
+                "KeywordExpression": "firearm",
+                "KeywordLocation": "Summary",
+                "MemberID": 544,
+                "PatronTypes": [1],
+                "LegislationIDs": [{"LegislationId": 98525}, {"LegislationId": 98631}],
+                "StartDate": "2026-01-14",
+                "ExcludeFailed": True,
+                "SummaryLength": 200,
+            },
+        )
+
+    def test_an_unknown_criterion_is_refused(self):
+        with self.assertRaises(TypeError):
+            self.client.get_legislation_ids(sessionCode=20261)
+
+    def test_by_ids_gives_every_bare_entry_the_session(self):
+        """An entry without a SessionID answers 204."""
+        self.client.get_legislation_by_ids(
+            [
+                98525,
+                {"LegislationID": 98631, "SessionID": 61},
+                LegislationIdEntry(LegislationID=98529, LegislationNumber="HB5", SessionID=59),
+                LegislationIdEntry(LegislationID=98530),
+            ],
+            session_id=59,
+        )
+
+        self.assertEqual(
+            self.sent[0],
+            (
+                "POST",
+                "/Legislation/api/getlegislationbylegislationidsasync",
+                {
+                    "LegislationIds": [
+                        {"LegislationID": 98525, "SessionID": 59},
+                        {"LegislationID": 98631, "SessionID": 61},
+                        {"LegislationID": 98529, "SessionID": 59},
+                        {"LegislationID": 98530, "SessionID": 59},
+                    ]
+                },
+            ),
+        )
+
+    def test_by_ids_with_no_ids_sends_nothing(self):
+        self.assertEqual(self.client.get_legislation_by_ids([], session_id=59), [])
+        self.assertEqual(self.sent, [])
+
+    def test_shallow_votes_always_send_the_chamber(self):
+        self.client.get_shallow_votes(
+            "H",
+            session_code=20261,
+            legislation_id=98525,
+            start_date=date(2026, 1, 20),
+            end_date="2026-01-21",
+        )
+
+        self.assertEqual(
+            self.sent[0],
+            (
+                "GET",
+                "/Vote/api/getshallowvoteasync",
+                {
+                    "chamberCode": "H",
+                    "sessionCode": 20261,
+                    "legislationID": 98525,
+                    "startDate": "2026-01-20",
+                    "endDate": "2026-01-21",
+                },
+            ),
+        )
+
+    def test_shallow_votes_do_not_offer_the_vote_number(self):
+        """LIS answers 500 to it, and this client retries a 500 for minutes."""
+        with self.assertRaises(TypeError):
+            self.client.get_shallow_votes("H", session_code=20261, vote_number="2619916")
+
+    def test_the_html_path_takes_the_code_as_document_number(self):
+        self.client.get_bill_html(20261, "HB1ER", hilite=True)
+        self.client.get_bill_html(20261, "HB1")
+
+        path = "/LegislationText/api/getlegislationhtmlcontentasync"
+        self.assertEqual(
+            self.sent[0],
+            ("TEXT", path, {"sessionCode": 20261, "documentNumber": "HB1ER", "hilite": "true"}),
+        )
+        self.assertEqual(
+            self.sent[1], ("TEXT", path, {"sessionCode": 20261, "documentNumber": "HB1"})
+        )
+
+    def test_the_pdf_path_returns_its_bare_string(self):
+        self.answer = "https://lis.blob.core.windows.net/files/1081188.PDF"
+
+        url = self.client.get_bill_pdf_url(20261, "HB1")
+
+        self.assertEqual(url, self.answer)
+        self.assertEqual(self.sent[0][2], {"sessionCode": 20261, "documentCode": "HB1"})
+
+    def test_hit_counts_wrap_the_ids_and_the_words(self):
+        self.client.get_text_hit_counts([257719, 266240], "wage", words=["minimum"])
+
+        self.assertEqual(
+            self.sent[0][2],
+            {
+                "Documents": [{"LegislationTextID": 257719}, {"LegislationTextID": 266240}],
+                "KeywordExpression": "wage",
+                "WordList": [{"Hitword": "minimum"}],
+            },
+        )
+
+    def test_the_vcal_feed_never_sends_the_publish_flag(self):
+        self.client.get_schedule_vcal(date(2026, 2, 2), "2026-02-03", schedule_ids=[2908, 2410])
+
+        self.assertEqual(
+            self.sent[0],
+            (
+                "TEXT",
+                "/Schedule/api/previewvcalfileasync",
+                {"startDate": "2026-02-02", "endDate": "2026-02-03", "scheduleIDs": [2908, 2410]},
+            ),
+        )
+
+        with self.assertRaises(TypeError):
+            self.client.get_schedule_vcal(write_to_azure_cdn=True)
+
+    def test_the_personnel_siblings_use_their_own_paths(self):
+        self.client.get_clerk_personnel(affiliation_id=28)
+        self.client.get_staff_personnel(effective_begin_date=date(2026, 1, 1))
+        self.client.get_personnel_references()
+
+        self.assertEqual(
+            [(path, params) for _, path, params in self.sent],
+            [
+                ("/Personnel/api/getclerkpersonnellistasync", {"affiliationID": 28}),
+                ("/Personnel/api/getstaffpersonnellistasync", {"effectiveBeginDate": "2026-01-01"}),
+                ("/Personnel/api/getreferencesasync", None),
+            ],
+        )
+
+    def test_member_filters_use_the_number_not_the_id(self):
+        self.client.get_member_contacts(session_code=20261, member_number="H0402", party_code="D")
+        self.client.get_member_patron_types(544, session_id=59)
+
+        self.assertEqual(
+            self.sent[0][2], {"sessionCode": 20261, "memberNumber": "H0402", "partyCode": "D"}
+        )
+        self.assertEqual(self.sent[1][2], {"memberID": 544, "sessionID": 59})
+
+    def test_the_shallow_roster_filters_on_party_and_not_on_status(self):
+        """LIS ignores ``statuses`` in every form tried, so it is not a parameter."""
+        self.answer = {"ShallowMembers": [{"MemberID": 544, "MemberStatusID": 0}]}
+
+        rows = self.client.get_member_list(session_id=59, chamber_code="S", party_code="R")
+
+        self.assertEqual([m.MemberID for m in rows], [544])
+        self.assertEqual(
+            self.sent[0],
+            (
+                "GET",
+                "/Member/api/getmemberlistasync",
+                {"sessionID": 59, "chamberCode": "S", "partyCode": "R"},
+            ),
+        )
+
+        with self.assertRaises(TypeError):
+            self.client.get_member_list(session_code=20261, statuses=3)
+
+    def test_a_204_gives_empty_values(self):
+        client = self.client
+
+        for rows in (
+            client.get_sessions_by_year(1990),
+            client.get_sessions_shallow(),
+            client.get_amended_legislation(session_code=20261),
+            client.get_conference_legislation(59),
+            client.get_legislation_ids(session_code=20261),
+            client.get_legislation_by_ids([98525]),
+            client.get_shallow_votes("H", session_code=20261, legislation_id=98631),
+            client.get_vote_links(1561089),
+            client.get_text_hit_counts([1], "wage"),
+            client.get_member_contacts(session_code=20261),
+            client.get_subjects(session_code=20261),
+        ):
+            self.assertEqual(rows, [])
+
+        for single in (
+            client.get_session(9999),
+            client.get_session_by_code(99999),
+            client.get_event(999999999),
+            client.get_organization(1),
+            client.get_draft_text(999999999),
+            client.get_bill_pdf_url(20261, "HB1"),
+        ):
+            self.assertIsNone(single)
+
+    def test_the_envelope_keys_are_read(self):
+        """Not one of these is the ``ListItems`` the spec promises."""
+        self.answer = {
+            "Sessions": [{"SessionID": 59, "SessionCode": "20261"}],
+            "SessionEventTypes": [{"EventTypeID": 5}],
+            "LegislationAmendmentList": [{"LegislationID": 99829}],
+            "ConferenceLegislationList": [{"LegislationID": 98529}],
+            "LegislationIds": [{"LegislationID": 98525}],
+            "LegislationEvents": [{"LegislationEventID": 1568490}],
+            "MemberPatronTypes": [{"PatronTypeID": 0, "Name": "Budget Amendment Requests"}],
+            "SubjectsReference": [{"SubjectIndexID": 502}],
+            "SummaryVersions": [{"SummaryVersionID": 1}],
+            "References": [{"LegislationStatusID": 1, "Name": "Introduced", "DisplayName": "x"}],
+            "TextDispositionList": [{"TextDispositionID": 6}],
+            "LegislationTextActions": [{"LegislationTextActionID": 2}],
+            "SponsorTypes": [{"SponsorTypeID": 4}],
+            "HitCounts": [{"LegislationTextID": 257719, "HitCount": 11}],
+            "MemberStatuses": [{"MemberStatusID": 4}],
+            "ChamberTypes": [{"ChamberCode": "H"}],
+            "OwnerTypes": [{"OwnerTypeID": "4"}],
+            "MemberContactInformationList": [{"MemberID": 544}],
+            "Members": [{"MemberID": 308}],
+            "Personnels": [{"IdentityID": 681}],
+            "Organizations": [{"IdentityID": 749}],
+            "ShallowVotes": [{"VoteID": 291609}],
+            "VoteLinks": [{"VoteID": 291609}],
+        }
+        client = self.client
+
+        for rows in (
+            client.get_sessions_shallow(),
+            client.get_session_event_types(),
+            client.get_amended_legislation(session_code=20261),
+            client.get_conference_legislation(59),
+            client.get_legislation_ids(session_code=20261),
+            client.get_member_patron_types(544, session_code=20261),
+            client.get_subjects(session_code=20261),
+            client.get_summary_versions(),
+            client.get_search_statuses(),
+            client.get_text_dispositions(),
+            client.get_text_actions(),
+            client.get_sponsor_types(),
+            client.get_text_hit_counts([257719], "wage"),
+            client.get_member_status_types(),
+            client.get_chamber_types(),
+            client.get_member_owner_types(),
+            client.get_member_contacts(session_code=20261),
+            client.get_active_members(session_code=20261),
+            client.get_clerk_personnel(),
+            client.get_staff_personnel(),
+            client.get_personnel_references(),
+            client.get_organizations(),
+            client.get_shallow_votes("H", session_code=20261),
+            client.get_vote_links(1568490),
+        ):
+            self.assertEqual(len(rows), 1)
+
+        self.assertEqual(client.get_event(1568490).LegislationEventID, 1568490)
+        self.assertEqual(client.get_organization(749).IdentityID, 749)
+
+    def test_draft_text_unwraps_its_single_row(self):
+        self.answer = {"TextsList": [{"DraftText": '<p class="enactstm">Be it enacted</p>'}]}
+        self.assertEqual(
+            self.client.get_draft_text(257719), '<p class="enactstm">Be it enacted</p>'
+        )
+
+        self.answer = {"TextsList": []}
+        self.assertIsNone(self.client.get_draft_text(257719))
+
+
+class RemainingReadPathsShapesTest(unittest.TestCase):
+    def test_a_block_vote_names_itself_in_the_bill_number(self):
+        """Vote 300173: the full record says IsBlock, the shallow row does not."""
+        block = ShallowVote.model_validate(
+            {
+                "VoteID": 300173,
+                "ChamberCode": "S",
+                "LegislationNumber": "BLOCK",
+                "VoteNumber": "SV866",
+                "IsVoice": False,
+                "IsBlock": False,
+                "VoteType": "Floor",
+                "VoteTally": "(40-Y 0-N 0-A)",
+            }
+        )
+
+        self.assertFalse(block.IsBlock)
+        self.assertTrue(block.is_block)
+        self.assertFalse(shallow_vote(291609).is_block)
+        self.assertFalse(ShallowVote(VoteID=1, LegislationNumber=None).is_block)
+        self.assertTrue(ShallowVote(VoteID=2, IsBlock=True).is_block)
+
+    def test_a_referring_vote_carries_one_more_key(self):
+        row = ShallowVote.model_validate(
+            {
+                "VoteID": 291609,
+                "VoteDate": "2026-01-20T12:30:00",
+                "ReferToCommitteeID": 2,
+                "ReferToCommitteeNumber": "H02",
+                "ReferToCommitteeName": "Appropriations",
+            }
+        )
+
+        self.assertEqual(row.ReferToCommitteeName, "Appropriations")
+        self.assertEqual(row.VoteDate, datetime(2026, 1, 20, 12, 30))
+        self.assertIsNone(shallow_vote(1).ReferToCommitteeName)
+
+    def test_a_vote_link_parses_without_the_file_url_the_spec_lists(self):
+        link = VoteLink.model_validate(
+            {
+                "VoteID": 294006,
+                "VoteNumber": "2619916",
+                "ChamberCode": "H",
+                "CommitteeID": None,
+                "VoteFileID": 1114666,
+                "ReferenceType": "Vote",
+                "ReferenceID": 294006,
+            }
+        )
+
+        self.assertIsNone(link.CommitteeID)
+        self.assertIsNone(link.FileURL)
+
+    def test_the_member_service_sends_owner_type_ids_as_strings(self):
+        row = OwnerType.model_validate({"OwnerTypeID": "4", "OwnerType": "Chamber"})
+
+        self.assertEqual(row.OwnerTypeID, 4)
+
+    def test_a_member_contact_holds_a_placeholder_and_a_real_address(self):
+        row = MemberContact.model_validate(
+            {
+                "MemberID": 503,
+                "MemberNumber": "H0362",
+                "MemberDisplayName": " Bonita G. Anthony",
+                "MemberStatusID": 0,
+                "MemberStatus": "Active",
+                "PrefiledCount": 2306,
+                "ContactInformation": [
+                    {
+                        "OwnerID": 0,
+                        "ContactTypeID": 0,
+                        "ContactType": "GA",
+                        "Address1": "General Assembly Building",
+                        "IsActive": False,
+                        "IsPublic": False,
+                    },
+                    {
+                        "ContactInformationID": 373,
+                        "OwnerID": 503,
+                        "ContactTypeID": 9,
+                        "ContactType": "Mailing",
+                        "Address1": "P.O. Box 1853",
+                        "StateCode": "VA ",
+                        "PhoneNumber": "(757) 204-5492",
+                        "IsActive": True,
+                        "IsPublic": True,
+                    },
+                ],
+            }
+        )
+
+        capitol, district = row.ContactInformation
+        self.assertEqual(row.MemberDisplayName, "Bonita G. Anthony")
+        self.assertIsNone(capitol.ContactInformationID)
+        self.assertEqual(district.OwnerID, row.MemberID)
+        self.assertEqual(district.StateCode, "VA")
+        self.assertIsNone(row.ServiceEndDate)
+
+    def test_an_amended_bill_parses_with_its_amendments(self):
+        row = AmendedLegislation.model_validate(
+            {
+                "LegislationID": 99829,
+                "LegislationNumber": "HB1005",
+                "ChamberCode": "H",
+                "SummaryVersion": "SUMMARY AS PASSED",
+                "CommitteeID": 0,
+                "LegislationSummary": None,
+                "Amendments": [
+                    {
+                        "LegislationTextID": 261928,
+                        "TextDisposition": "Adopted",
+                        "DocumentCode": "HB1005AH1 ",
+                        "ChamberCode": "H",
+                        "LDNumber": None,
+                        "VersionDate": "2026-02-03T18:15:00",
+                    }
+                ],
+                "Patrons": [{"MemberID": 400, "PatronTypeID": 1, "Name": "Chief Patron"}],
+            }
+        )
+
+        self.assertEqual(row.Amendments[0].DocumentCode, "HB1005AH1")
+        self.assertEqual(row.Amendments[0].VersionDate, datetime(2026, 2, 3, 18, 15))
+        self.assertEqual(row.Patrons[0].MemberID, 400)
+
+    def test_a_shallow_session_has_no_type_id_and_no_events(self):
+        row = ShallowSession.model_validate(
+            {
+                "SessionID": 60,
+                "SessionCode": "20262",
+                "DisplayName": "Special Session I",
+                "SessionYear": 2026,
+                "SessionType": "Special",
+                "IsDefault": False,
+                "IsActive": True,
+            }
+        )
+
+        self.assertEqual(row.SessionType, "Special")
+        self.assertFalse(hasattr(row, "SessionEvents"))
+
+    def test_the_active_list_names_the_speaker(self):
+        row = Member.model_validate({"MemberID": 1, "VotingTitle": "Mr. Speaker"})
+
+        self.assertEqual(row.VotingTitle, "Mr. Speaker")
+        self.assertIsNone(member(2).VotingTitle)
+
+    def test_the_summary_vocabulary_agrees_with_the_rank_table(self):
+        """The four rows LIS returned on 2026-10-12, in id order."""
+        names = [
+            "SUMMARY AS INTRODUCED",
+            "SUMMARY AS PASSED CHAMBER",
+            "SUMMARY AS PASSED",
+            "SUMMARY AS ENACTED WITH GOVERNOR'S RECOMMENDATION",
+        ]
+
+        ranks = [summary_version_rank(name) for name in names]
+
+        self.assertEqual(ranks, sorted(ranks))
+        self.assertEqual(len(set(ranks)), 4)
+        self.assertNotIn(UNKNOWN_SUMMARY_RANK, ranks)

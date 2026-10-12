@@ -201,9 +201,9 @@ class VoteType(LISModel):
 class Vote(LISModel):
     """A vote record from ``/Vote/api/getvotebyidasync``.
 
-    Key: ``VoteID``.  Reach one from ``LegislationEvent.VoteID``; no
-    endpoint accepts a ``legislationID``, so events are the only bill-first
-    way in.
+    Key: ``VoteID``.  Reach one from ``LegislationEvent.VoteID``, or from a
+    :class:`ShallowVote`, which is the list of a bill's votes without their
+    members.  This endpoint takes a ``voteID`` and nothing else.
 
     **Three traps decide whether this is a usable roll call:**
 
@@ -283,3 +283,131 @@ class Vote(LISModel):
     vote_legislation: list[VoteLegislation] = Field(default=[], alias="VoteLegislation")
     VoteStatements: list[VoteStatement] = []
     VoteFiles: list[VoteFile] = []
+
+
+class ShallowVote(LISModel):
+    """A vote without its members, from ``/Vote/api/getshallowvoteasync``.
+
+    Key: ``VoteID``, which resolves to the full :class:`Vote`.
+
+    This is the list form of the vote service: one row per vote with its
+    tally, type and committee, and no roll call.  It is the one vote endpoint
+    that filters by bill, by member, and by date.
+
+    **``IsBlock`` is false on every row, block votes included.**  Vote 300173
+    is a 50 bill block: its full record says ``IsBlock: true``, and its
+    shallow row says ``IsBlock: false``.  The shallow row marks a block in
+    ``LegislationNumber`` instead, with the literal string ``"BLOCK"``.  Read
+    :attr:`is_block`, which tests both.
+
+    **Voice votes are mostly missing.**  Across five bills in 20261 the
+    events named nine voice votes and this list returned one of them.  A bill
+    whose only votes were voice votes answers 204: HB9 has two on its events
+    and none here (measured 2026-10-12).  Every roll call and block vote on
+    those five bills' events was here, and nothing was here that the events
+    lacked.
+
+    ``LegislationNumber`` is null on a vote about no bill, such as a quorum
+    call, whose ``ClassificationName`` is ``"Attendance"``.
+
+    ``PassFail``, ``CommitteeNumber``, ``Sequence``, ``VoteRoomID``,
+    ``RoomDescription``, ``BatchNumber``, ``ReferenceID``,
+    ``ReferenceNumber``, ``CalendarCategoryTypeID`` and ``VoteComment`` were
+    null on all 1,911 rows of one member's session.  The outcome is in
+    ``VoteTally`` and ``Description``.  ``ReferToCommitteeName`` is a key
+    only on a vote that refers the bill onward.
+
+    Example (truncated)::
+
+        {"VoteID": 291609, "ChamberCode": "H", "CommitteeID": 14,
+         "CommitteeName": "Labor and Commerce", "LegislationNumber": "HB1",
+         "VoteNumber": "H14V2610034", "IsVoice": false, "IsBlock": false,
+         "SessionID": 59, "SessionCode": "20261",
+         "VoteDate": "2026-01-20T12:30:00", "VoteTypeID": 1,
+         "VoteType": "Committee", "VoteTally": "(15-Y 7-N)",
+         "EventCode": "H1405", "ClassificationName": "Legislation",
+         "ReferToCommitteeID": 2, "ReferToCommitteeNumber": "H02"}
+    """
+
+    VoteID: int
+    VoteNumber: str | None = None  # e.g. "H14V2610034", "SV899", "2619916"
+    SessionID: int | None = None
+    SessionCode: str | None = None
+    VoteDate: datetime | None = None
+    ChamberCode: str | None = None  # the chamber that voted
+    VoteTypeID: int | None = None  # 1=Committee, 2=Subcommittee, 3=Floor
+    VoteType: str | None = None
+    CommitteeID: int | None = None  # null on a floor vote
+    CommitteeName: str | None = None
+    CommitteeNumber: str | None = None  # null on every observed row
+    LegislationNumber: str | None = None  # a bill number, "BLOCK", or null
+    Description: str | None = None
+    VoteTally: str | None = None  # e.g. "(15-Y 7-N)"
+    PassFail: str | None = None  # null on every observed row
+    IsVoice: bool = False
+    IsBlock: bool = False  # false even on a block vote; read is_block
+    IsPublic: bool = True
+    EventCode: str | None = None
+    VoteActionID: int | None = None
+    VoteActionDescription: str | None = None
+    VoteClassificationID: int | None = None
+    ClassificationName: str | None = None  # "Legislation", "Attendance", or null
+    ReferToCommitteeID: int | None = None
+    ReferToCommitteeNumber: str | None = None
+    ReferToCommitteeName: str | None = None  # omitted unless the vote refers
+    CalendarCategoryTypeID: int | None = None
+    ReferenceID: str | None = None
+    ReferenceNumber: str | None = None
+    VoteRoomID: int | None = None
+    RoomDescription: str | None = None
+    BatchNumber: str | None = None
+    Sequence: int | None = None
+    VoteComment: str | None = None
+
+    @property
+    def is_block(self) -> bool:
+        """True when this vote disposed of many bills at once.
+
+        ``IsBlock`` alone never says so on this endpoint, so this also reads
+        the ``"BLOCK"`` that LIS writes where a bill number belongs.
+        """
+        return self.IsBlock or (self.LegislationNumber or "").upper() == "BLOCK"
+
+
+class VoteLink(LISModel):
+    """The vote behind one bill event, from ``/Vote/api/getvotelinksasync``.
+
+    Key: ``VoteID``.  Asked by ``LegislationEventID``.
+
+    The cheap answer to "which vote is this event's": 290 bytes, where the
+    full vote is a roster.  It adds two things the event lacks, the
+    ``VoteNumber`` and the ``VoteFileID`` of the vote sheet.  An event with
+    no vote answers 204.
+
+    **``ReferenceID`` is not one thing.**  On a floor vote it equalled the
+    ``VoteID`` (294006); on a committee vote it was ``2``, that vote's
+    ``ReferToCommitteeID``.  Do not join on it.
+
+    ``CommitteeID`` is null on a floor vote.  The spec lists a ``FileURL``
+    that LIS does not send.
+
+    Example::
+
+        {"VoteID": 291609, "VoteNumber": "H14V2610034", "ChamberCode": "H",
+         "CommitteeID": 14, "ParentCommitteeID": null, "VoteFileID": 1092426,
+         "ReferenceType": "Vote", "ReferenceID": 2, "SessionID": 59,
+         "SessionCode": "20261", "IsPublic": true}
+    """
+
+    VoteID: int
+    VoteNumber: str | None = None
+    ChamberCode: str | None = None
+    CommitteeID: int | None = None  # null on a floor vote
+    ParentCommitteeID: int | None = None
+    VoteFileID: int | None = None
+    ReferenceType: str | None = None  # "Vote"
+    ReferenceID: int | None = None  # the VoteID on a floor vote, not on a committee one
+    SessionID: int | None = None
+    SessionCode: str | None = None
+    IsPublic: bool = True
+    FileURL: str | None = None  # in the spec, never sent

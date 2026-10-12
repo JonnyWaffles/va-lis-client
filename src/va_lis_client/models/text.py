@@ -165,3 +165,107 @@ class LegislationSummary(LISModel):
     SummaryVersionID: int | None = None  # 1=Introduced, 3=Enrolled/Passed
     IsPublic: bool = True
     IsActive: bool = True  # True for the current/latest summary
+
+
+class SummaryVersion(LISModel):
+    """A summary stage, from ``/LegislationSummary/api/getsummaryversionsreferenceasync``.
+
+    Key: ``SummaryVersionID``, which is ``LegislationSummary.SummaryVersionID``.
+
+    Four rows, and the id is the progression order:
+
+    ==  ================================================  ====
+    ID  Name                                              Code
+    ==  ================================================  ====
+    1   SUMMARY AS INTRODUCED                             S
+    2   SUMMARY AS PASSED CHAMBER                         SE
+    3   SUMMARY AS PASSED                                 SER
+    4   SUMMARY AS ENACTED WITH GOVERNOR'S RECOMMENDATION SCH
+    ==  ================================================  ====
+
+    This is the official order behind
+    :data:`~va_lis_client.models.search.SUMMARY_VERSION_RANK`.  It names the
+    chamber stage ``PASSED CHAMBER`` only; the ``PASSED HOUSE`` and ``PASSED
+    SENATE`` spellings that the advanced search sends are not in it.
+
+    ``VersionCode`` is the suffix on a summary's ``DocumentCode``: HB1's
+    passed summary is ``HB1SER``.
+    """
+
+    SummaryVersionID: int
+    Name: str | None = None
+    VersionCode: str | None = None
+
+
+class TextDisposition(LISModel):
+    """What became of a text, from ``gettextdispositionsreferenceasync``.
+
+    Key: ``TextDispositionID``, carried by text rows, bill versions and
+    amendments.
+
+    13 rows, and the ids skip 9: 1 ``Offered``, 2 ``Recommended``, 3
+    ``Reported``, 4 ``Rejected by Senate``, 5 ``Not Adopted``, 6 ``Adopted``,
+    7 ``Adopted In-Part``, 8 ``Hold``, 10 ``Rejected by House``, 11
+    ``Posted``, 12 ``Engrossed``, 13 ``Removed``, 14 ``Receded``.
+    """
+
+    TextDispositionID: int
+    Name: str | None = None
+
+
+class TextAction(LISModel):
+    """An action that produces a text, from ``getlegislationtextactionlistasync``.
+
+    Key: ``LegislationTextActionID``, which is
+    ``LegislationTextDetail.LegislationTextActionID``.
+
+    31 rows.  **Most ``EventCode`` values have no chamber prefix here.**  17
+    of the 31 are four bare digits: the row says ``"4020"`` where a bill
+    event says ``"H4020"`` or ``"S4020"``, so prepend the chamber before you
+    join one to an event.  The other 14 are complete as sent, 2 with ``G``
+    for the Governor (``"G9998"``) and 12 with ``C`` for a conference
+    committee (``"C6038"``).
+
+    Example::
+
+        {"LegislationTextActionID": 2,
+         "Description": "Prefiled and ordered printed", "EventCode": "4020"}
+    """
+
+    LegislationTextActionID: int
+    Description: str | None = None
+    EventCode: str | None = None  # "4020" with no chamber letter, or "G9998", "C6038"
+
+
+class SponsorType(LISModel):
+    """Who offered a text, from ``/LegislationText/api/getsponsortypelistasync``.
+
+    Key: ``SponsorTypeID``, which is ``LegislationTextDetail.SponsorTypeID``.
+
+    Six rows, sent in name order and not id order: 1 ``Governor``, 2
+    ``Conference``, 3 ``Committee``, 4 ``Member``, 5 ``House``, 6 ``Senate``.
+    """
+
+    SponsorTypeID: int
+    Name: str | None = None
+
+
+class TextHitCount(LISModel):
+    """How often a keyword occurs in one text.
+
+    From ``/LegislationText/api/getlegislationtextshitcountsasync``.
+
+    Key: ``LegislationTextID``.
+
+    ``"wage"`` counted 11 in HB1's introduced text and 12 in each of its
+    enrolled and chaptered texts (measured 2026-10-12).  An expression is a
+    sum and not an intersection: ``"minimum AND wage"`` counted 23 in the
+    introduced text, more than either word can reach alone.
+
+    Example::
+
+        {"LegislationTextID": 257719, "HitCount": 11}
+    """
+
+    LegislationTextID: int
+    HitCount: int = 0

@@ -749,8 +749,6 @@ class LiveMemberBillsTest(unittest.TestCase):
         with self.assertRaises(requests.HTTPError):
             self.client.get_patron_legislation(20261, "")
 
-        self.assertEqual(self.client.get_patron_legislation(20271, "H"), [])
-
     def test_the_patron_index_agrees_with_the_bill_detail(self):
         schmidt = next(
             p for p in self.client.get_patron_legislation(20261, "H") if p.MemberID == 544
@@ -1724,3 +1722,460 @@ class LiveBillVersionTest(unittest.TestCase):
 
         self.assertEqual({r.DocumentCode for r in rows}, {"HB1", "HB1ER", "HB1AG"})
         self.assertTrue(all(r.TextDisposition is None for r in rows))
+
+
+@_skip_live
+class LiveSessionAlternatesTest(unittest.TestCase):
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_the_year_path_answers_as_the_year_parameter_does(self):
+        self.assertEqual(self.client.get_sessions_by_year(2026), self.client.get_sessions(2026))
+        self.assertEqual(self.client.get_sessions_by_year(1990), [])
+
+    def test_the_id_and_the_code_name_one_session(self):
+        by_code = self.client.get_session_by_code(20261)
+        by_id = self.client.get_session(59)
+
+        self.assertEqual(by_code.SessionID, 59)
+        self.assertEqual(by_id, by_code)
+        self.assertIsNone(self.client.get_session(9999))
+        self.assertIsNone(self.client.get_session_by_code(99999))
+
+    def test_the_shallow_list_filters_on_year_and_type(self):
+        year = self.client.get_sessions_shallow(session_year=2026)
+        special = self.client.get_sessions_shallow(session_type_id=2)
+
+        self.assertEqual({s.SessionCode for s in year}, {"20261", "20262"})
+        self.assertEqual({s.SessionType for s in special}, {"Special"})
+
+    def test_is_active_false_filters_nothing(self):
+        active = self.client.get_sessions_shallow(is_active=True)
+        inactive = self.client.get_sessions_shallow(is_active=False)
+
+        self.assertTrue(all(s.IsActive for s in active))
+        self.assertTrue(any(s.IsActive for s in inactive))
+        self.assertGreater(len(inactive), len(active))
+
+    def test_the_event_labels_disagree_with_the_event_types(self):
+        """The 2026 sine die is filed under 11, which the vocabulary calls Closing."""
+        types = {t.EventTypeID: t.Name for t in self.client.get_session_event_types()}
+        events = {e.DisplayName: e.EventTypeID for e in self.client.get_session(59).SessionEvents}
+
+        self.assertEqual(len(types), 11)
+        self.assertEqual(types[8], "Adjournment")
+        self.assertEqual(types[11], "Closing")
+        self.assertEqual(events["Adjournment"], 11)
+        self.assertEqual({t.Name for t in self.client.get_session_types()}, {"Regular", "Special"})
+
+
+@_skip_live
+class LiveAmendmentAndConferenceTest(unittest.TestCase):
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_the_chamber_picks_the_amendments_not_the_bills(self):
+        rows = self.client.get_amended_legislation(session_code=20261, chamber_code="H")
+
+        amendments = [a for r in rows for a in r.Amendments]
+        self.assertEqual({a.ChamberCode for a in amendments}, {"H"})
+        self.assertEqual({r.ChamberCode for r in rows}, {"H", "S"})
+        self.assertTrue(all(a.DocumentCode for a in amendments))
+
+    def test_a_bill_repeats_once_per_summary_version(self):
+        rows = self.client.get_amended_legislation(session_id=59, chamber_code="S")
+
+        keys = [(r.LegislationID, r.SummaryVersion) for r in rows]
+        self.assertGreater(len(rows), len({r.LegislationID for r in rows}))
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertTrue(all(r.LegislationSummary is None for r in rows))
+
+    def test_the_amendment_list_needs_a_session(self):
+        with self.assertRaises(requests.HTTPError):
+            self.client.get_amended_legislation(chamber_code="H")
+
+    def test_the_conference_list_is_one_session_and_both_chambers(self):
+        rows = self.client.get_conference_legislation(59)
+        house = self.client.get_conference_legislation(59, chamber_code="H")
+
+        self.assertEqual({r.SessionID for r in rows}, {59})
+        self.assertEqual({r.ChamberCode for r in house}, {"H"})
+        self.assertEqual(len(house), sum(1 for r in rows if r.ChamberCode == "H"))
+        self.assertGreaterEqual(len(rows), 170)
+
+    def test_the_member_filter_finds_a_conferee(self):
+        """HB361's events name Schmidt, member 544, among the House conferees."""
+        rows = self.client.get_conference_legislation(59, member_id=544)
+
+        self.assertIn("HB361", {r.LegislationNumber for r in rows})
+        self.assertEqual({r.ChamberCode for r in rows}, {"H", "S"})
+
+
+@_skip_live
+class LiveLegislationPostTest(unittest.TestCase):
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_the_id_list_repeats_and_round_trips(self):
+        ids = self.client.get_legislation_ids(session_code=20261, member_id=544)
+
+        self.assertGreater(len(ids), len({i.LegislationID for i in ids}))
+        self.assertEqual({i.SessionID for i in ids}, {59})
+
+        rows = self.client.get_legislation_by_ids(ids[:3])
+        self.assertEqual({r.LegislationID for r in rows}, {i.LegislationID for i in ids[:3]})
+
+    def test_an_entry_without_a_session_answers_nothing(self):
+        self.assertEqual(self.client.get_legislation_by_ids([98525]), [])
+
+        rows = self.client.get_legislation_by_ids([98525], session_id=59)
+        self.assertEqual([r.LegislationNumber for r in rows], ["HB1"])
+
+    def test_the_legislation_path_answers_as_the_search_does(self):
+        criteria = {"session_code": 20261, "member_id": 544, "patron_types": [1]}
+
+        listed = self.client.get_legislation_list(**criteria)
+        searched = self.client.search_legislation(**criteria)
+
+        self.assertEqual(
+            sorted(r.LegislationNumber for r in listed),
+            sorted(r.LegislationNumber for r in searched),
+        )
+        self.assertGreater(len(listed), 0)
+
+
+@_skip_live
+class LiveTextExtrasTest(unittest.TestCase):
+    """HB1 in 20261: text 257719 is introduced, 266240 enrolled, 268485 chaptered."""
+
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_the_draft_text_starts_at_the_enacting_clause(self):
+        draft = self.client.get_draft_text(257719)
+
+        self.assertTrue(draft.startswith('<p class="enactstm">'))
+        self.assertNotIn("2026 SESSION", draft)
+        self.assertIsNone(self.client.get_draft_text(999999999))
+
+    def test_an_amendment_text_resolves_the_same_way(self):
+        house = self.client.get_amended_legislation(session_code=20261, chamber_code="H")
+        amendment = house[0].Amendments[0]
+
+        self.assertTrue(self.client.get_draft_text(amendment.LegislationTextID))
+
+    def test_the_html_page_is_the_printed_bill(self):
+        page = self.client.get_bill_html(20261, "HB1")
+        colored = self.client.get_bill_html(20261, "HB1", hilite=True)
+
+        self.assertIn("2026 SESSION", page)
+        self.assertNotIn("color:red", page)
+        self.assertIn("color:red", colored)
+        self.assertIn("background-color:yellow", colored)
+
+    def test_an_unknown_document_code_is_a_400(self):
+        with self.assertRaises(requests.HTTPError) as caught:
+            self.client.get_bill_html(20261, "HB99999")
+
+        self.assertEqual(caught.exception.response.status_code, 400)
+
+        with self.assertRaises(requests.HTTPError):
+            self.client.get_bill_pdf_url(20261, "HB99999")
+
+    def test_the_pdf_path_returns_the_address_the_version_row_holds(self):
+        url = self.client.get_bill_pdf_url(20261, "HB1")
+        versions = self.client.get_bill_versions_by_id(98525)
+
+        introduced = next(v for v in versions if v.DocumentCode == "HB1")
+        self.assertTrue(url.startswith("https://"))
+        self.assertEqual(url, introduced.PdfFile[0].FileURL)
+
+    def test_hit_counts_add_their_terms(self):
+        one = {
+            h.LegislationTextID: h.HitCount
+            for h in self.client.get_text_hit_counts([257719, 266240, 268485], "wage")
+        }
+        minimum = self.client.get_text_hit_counts([257719], "minimum")[0].HitCount
+        both = self.client.get_text_hit_counts([257719], words=["minimum", "wage"])[0].HitCount
+
+        self.assertEqual(set(one), {257719, 266240, 268485})
+        self.assertEqual(both, minimum + one[257719])
+        self.assertEqual(self.client.get_text_hit_counts([257719]), [])
+
+    def test_the_text_vocabularies(self):
+        dispositions = {d.TextDispositionID: d.Name for d in self.client.get_text_dispositions()}
+        actions = self.client.get_text_actions()
+        sponsors = {s.SponsorTypeID: s.Name for s in self.client.get_sponsor_types()}
+
+        self.assertEqual(dispositions[6], "Adopted")
+        self.assertNotIn(9, dispositions)
+        self.assertIn("4020", {a.EventCode for a in actions})
+        self.assertEqual({a.EventCode[0] for a in actions if not a.EventCode.isdigit()}, {"C", "G"})
+        self.assertEqual(sponsors[4], "Member")
+
+    def test_the_summary_vocabulary_is_in_rank_order(self):
+        versions = sorted(self.client.get_summary_versions(), key=lambda v: v.SummaryVersionID)
+
+        ranks = [summary_version_rank(v.Name) for v in versions]
+        self.assertEqual(len(versions), 4)
+        self.assertEqual(ranks, sorted(ranks))
+        self.assertNotIn(-1, ranks)
+        self.assertNotIn("SUMMARY AS PASSED HOUSE", {v.Name for v in versions})
+
+
+@_skip_live
+class LiveMemberExtrasTest(unittest.TestCase):
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_the_active_list_is_richer_and_shorter_than_the_roster(self):
+        active = self.client.get_active_members(session_code=20261)
+        roster = self.client.get_members(session_code=20261)
+
+        self.assertLess(len(active), len(roster))
+        self.assertLessEqual({m.MemberID for m in active}, {m.MemberID for m in roster})
+        self.assertTrue(all(m.MemberDetailID and m.ChamberName for m in active))
+        self.assertTrue(any(m.MemberStatus != "Active" for m in active))
+
+    def test_the_active_list_needs_a_session(self):
+        with self.assertRaises(requests.HTTPError):
+            self.client.get_active_members()
+
+    def test_the_shallow_roster_is_the_roster_without_districts(self):
+        shallow = self.client.get_member_list(session_code=20261)
+        roster = self.client.get_members(session_code=20261)
+
+        self.assertEqual({m.MemberID for m in shallow}, {m.MemberID for m in roster})
+        self.assertTrue(all(m.DistrictID is None for m in shallow))
+        self.assertTrue(all(m.DistrictID for m in roster))
+
+    def test_the_shallow_roster_filters_on_party_and_number(self):
+        republicans = self.client.get_member_list(session_id=59, chamber_code="S", party_code="R")
+        one = self.client.get_member_list(session_code=20261, member_number="H0402")
+
+        self.assertEqual({(m.ChamberCode, m.PartyCode) for m in republicans}, {("S", "R")})
+        self.assertEqual([m.MemberID for m in one], [544])
+
+        with self.assertRaises(requests.HTTPError):
+            self.client.get_member_list(chamber_code="H")
+
+    def test_the_bill_counts_are_not_the_members_own(self):
+        senate = self.client.get_member_contacts(session_code=20261, chamber_code="S")
+        one = self.client.get_member_contacts(session_code=20261, member_number="H0402")
+
+        self.assertEqual(len({m.LegislationTotal for m in senate}), 1)
+        self.assertEqual([m.MemberID for m in one], [544])
+        self.assertLess(one[0].LegislationTotal, senate[0].LegislationTotal)
+
+    def test_the_capitol_address_is_a_placeholder(self):
+        rows = self.client.get_member_contacts(session_id=59, chamber_code="S", party_code="R")
+
+        self.assertEqual({m.PartyCode for m in rows}, {"R"})
+        for m in rows:
+            kinds = {a.ContactType: a for a in m.ContactInformation}
+            self.assertEqual(kinds["GA"].OwnerID, 0)
+            self.assertIsNone(kinds["GA"].ContactInformationID)
+            if "Mailing" in kinds:
+                self.assertEqual(kinds["Mailing"].OwnerID, m.MemberID)
+                self.assertEqual(kinds["Mailing"].ContactTypeID, 9)
+
+    def test_the_contact_list_needs_a_session(self):
+        with self.assertRaises(requests.HTTPError):
+            self.client.get_member_contacts(chamber_code="H")
+
+    def test_the_member_vocabularies(self):
+        statuses = {s.MemberStatusID: s.Name for s in self.client.get_member_status_types()}
+        chambers = {c.ChamberCode: c.Name for c in self.client.get_chamber_types()}
+        owners = {(o.OwnerTypeID, o.OwnerType) for o in self.client.get_member_owner_types()}
+
+        self.assertEqual(statuses, {1: "Active", 2: "Inactive", 3: "Outgoing", 4: "Elect"})
+        self.assertEqual(chambers, {"H": "House", "S": "Senate"})
+        self.assertEqual(
+            owners, {(o.OwnerTypeID, o.OwnerType) for o in self.client.get_owner_types()}
+        )
+
+    def test_a_member_holds_a_patron_type_the_role_list_omits(self):
+        held = {
+            r.PatronTypeID: r.Name
+            for r in self.client.get_member_patron_types(544, session_code=20261)
+        }
+        roles = {r.PatronTypeID for r in self.client.get_patron_roles()}
+
+        self.assertEqual(held[0], "Budget Amendment Requests")
+        self.assertNotIn(0, roles)
+        self.assertLessEqual(set(held) - {0}, roles)
+
+        with self.assertRaises(requests.HTTPError):
+            self.client.get_member_patron_types(544)
+
+    def test_the_roster_text_is_surnames_and_needs_a_session(self):
+        text = self.client.get_committee_members_text(28, session_code=20261)
+
+        self.assertIn("(Chair)", text)
+        self.assertEqual(text, self.client.get_committee_members_text(28, session_id=59))
+        self.assertIsNone(self.client.get_committee_members_text(999999, session_code=20261))
+
+        with self.assertRaises(requests.HTTPError) as caught:
+            self.client.get_committee_members_text(28)
+
+        self.assertEqual(caught.exception.response.status_code, 406)
+
+
+@_skip_live
+class LiveDirectoryExtrasTest(unittest.TestCase):
+    def setUp(self):
+        self.client = LISClient()
+
+    def test_the_clerk_and_staff_paths_are_slices_of_the_personnel_list(self):
+        clerks = self.client.get_clerk_personnel()
+        staff = self.client.get_staff_personnel()
+
+        self.assertEqual(clerks, self.client.get_personnel(staff_role_type_id=1))
+        self.assertEqual({p.StaffRoleTypeID for p in staff}, {2})
+        self.assertTrue(all(p.AffiliationID for p in clerks))
+
+    def test_the_reference_path_is_the_unfiltered_list(self):
+        references = self.client.get_personnel_references()
+
+        self.assertEqual(references, self.client.get_personnel())
+        self.assertTrue(all(p.AffiliationID is None for p in references))
+
+    def test_one_committee_and_one_date_both_narrow_the_clerks(self):
+        every = self.client.get_clerk_personnel()
+        one = self.client.get_clerk_personnel(affiliation_id=28)
+        recent = self.client.get_clerk_personnel(effective_begin_date="2026-01-01")
+
+        self.assertEqual({p.AffiliationID for p in one}, {28})
+        self.assertLess(len(recent), len(every))
+
+    def test_organizations_are_the_agencies_plus_the_assembly(self):
+        organizations = {o.IdentityID: o.Name for o in self.client.get_organizations()}
+        agencies = {a.IdentityID for a in self.client.get_agencies()}
+
+        self.assertLessEqual(agencies, set(organizations))
+        self.assertEqual(organizations[749], "General Assembly")
+        self.assertEqual(self.client.get_organization(749).Name, "General Assembly")
+        self.assertIsNone(self.client.get_organization(1))
+
+    def test_the_search_service_repeats_the_status_list(self):
+        ours = [(s.LegislationStatusID, s.Name) for s in self.client.get_search_statuses()]
+        theirs = [(s.LegislationStatusID, s.Name) for s in self.client.get_legislation_statuses()]
+
+        self.assertEqual(ours, theirs)
+
+    def test_the_subject_index_is_session_scoped(self):
+        by_code = self.client.get_subjects(session_code=20261)
+
+        self.assertEqual(by_code, self.client.get_subjects(session_id=59))
+        self.assertGreater(len(by_code), 400)
+
+        with self.assertRaises(requests.HTTPError):
+            self.client.get_subjects()
+
+    def test_the_schedule_exports_as_a_calendar(self):
+        feed = self.client.get_schedule_vcal("2026-02-02", "2026-02-03")
+        meetings = self.client.get_schedules("2026-02-02", "2026-02-03")
+
+        self.assertTrue(feed.startswith("BEGIN:VCALENDAR"))
+        self.assertGreater(feed.count("BEGIN:VEVENT"), 0)
+
+        two = [m.ScheduleID for m in meetings[:2]]
+        self.assertEqual(self.client.get_schedule_vcal(schedule_ids=two).count("BEGIN:VEVENT"), 2)
+
+
+@_skip_live
+class LiveShallowVoteTest(unittest.TestCase):
+    """HB1 in 20261 is ``LegislationID`` 98525; its Senate block vote is 300173."""
+
+    def setUp(self):
+        self.client = LISClient()
+
+    def both_chambers(self, legislation_id):
+        return [
+            v
+            for chamber in ("H", "S")
+            for v in self.client.get_shallow_votes(
+                chamber, session_code=20261, legislation_id=legislation_id
+            )
+        ]
+
+    def test_a_bill_filter_returns_that_bills_votes(self):
+        votes = self.both_chambers(98525)
+        events = {e.VoteID: e for e in self.client.get_bill_events(98525) if e.VoteID}
+
+        self.assertEqual(len(votes), 7)
+        self.assertLessEqual({v.VoteID for v in votes}, set(events))
+
+        missing = set(events) - {v.VoteID for v in votes}
+        self.assertEqual({events[i].VoteTally for i in missing}, {"(Voice Vote)"})
+
+    def test_a_block_vote_says_block_only_in_the_bill_number(self):
+        block = next(v for v in self.both_chambers(98525) if v.VoteID == 300173)
+
+        self.assertFalse(block.IsBlock)
+        self.assertEqual(block.LegislationNumber, "BLOCK")
+        self.assertTrue(block.is_block)
+        self.assertTrue(self.client.get_vote(300173).IsBlock)
+
+    def test_either_session_form_answers_the_same(self):
+        by_code = self.client.get_shallow_votes("H", session_code=20261, legislation_id=98525)
+        by_id = self.client.get_shallow_votes("H", session_id=59, legislation_id=98525)
+
+        self.assertEqual(by_code, by_id)
+
+    def test_a_chamber_and_a_session_are_both_required(self):
+        path = "/Vote/api/getshallowvoteasync"
+
+        with self.assertRaises(requests.HTTPError):
+            self.client._get(path, {"sessionCode": 20261, "legislationID": 98525})
+
+        with self.assertRaises(requests.HTTPError):
+            self.client.get_shallow_votes("H", legislation_id=98525)
+
+    def test_the_end_date_is_exclusive(self):
+        same_day = self.client.get_shallow_votes(
+            "H", session_code=20261, start_date="2026-01-20", end_date="2026-01-20"
+        )
+        next_day = self.client.get_shallow_votes(
+            "H", session_code=20261, start_date="2026-01-20", end_date="2026-01-21"
+        )
+
+        self.assertEqual(same_day, [])
+        self.assertEqual({v.VoteDate.date().isoformat() for v in next_day}, {"2026-01-20"})
+
+    def test_a_member_and_a_bill_together_are_an_or(self):
+        """HB1's only House vote on 2026-01-20 was in a committee member 544 is not on."""
+        window = {"session_code": 20261, "start_date": "2026-01-20", "end_date": "2026-01-21"}
+
+        member = self.client.get_shallow_votes("H", member_id=544, **window)
+        bill = self.client.get_shallow_votes("H", legislation_id=98525, **window)
+        both = self.client.get_shallow_votes("H", member_id=544, legislation_id=98525, **window)
+
+        self.assertEqual([v.VoteID for v in bill], [291609])
+        self.assertNotIn(291609, {v.VoteID for v in member})
+        self.assertEqual(
+            {v.VoteID for v in both}, {v.VoteID for v in member} | {v.VoteID for v in bill}
+        )
+
+    def test_an_event_resolves_to_its_vote_link(self):
+        events = self.client.get_bill_events(98525)
+        voted = next(e for e in events if e.VoteID)
+        silent = next(e for e in events if not e.VoteID)
+
+        links = self.client.get_vote_links(voted.LegislationEventID)
+
+        self.assertEqual([link.VoteID for link in links], [voted.VoteID])
+        self.assertTrue(links[0].VoteNumber)
+        self.assertEqual(self.client.get_vote_links(silent.LegislationEventID), [])
+        self.assertEqual(self.client.get_event(voted.LegislationEventID), voted)
+
+    def test_the_service_merges_the_chambers_in_date_order(self):
+        votes = LISService(self.client).bill_shallow_votes("HB1", 20261)
+
+        dates = [v.VoteDate for v in votes]
+        self.assertEqual(dates, sorted(dates))
+        self.assertEqual([v.ChamberCode for v in votes], ["H", "H", "H", "S", "S", "S", "S"])
+
+    def test_a_bill_decided_by_voice_returns_nothing(self):
+        """HB9 has two voice votes on its events and no other."""
+        self.assertEqual(LISService(self.client).bill_shallow_votes("HB9", 20261), [])

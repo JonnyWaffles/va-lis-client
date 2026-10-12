@@ -192,3 +192,23 @@ class Agency(LISModel):
     Abbreviation: str | None = None
     AgencyNumber: str | None = None  # a string, not an int
     Branch: str | None = None  # e.g. "Education", "Public Safety"
+
+
+class Organization(LISModel):
+    """An organization name, from ``/Organization/api/getorganizationlistasync``.
+
+    Key: ``IdentityID``, shared with :class:`Agency`.
+
+    296 rows (measured 2026-10-12): the budget agencies that
+    :meth:`~va_lis_client.client.LISClient.get_agencies` returns, with only a
+    name, plus ``749`` for the General Assembly itself.  The agency list is
+    the richer of the two; this one exists to resolve an ``IdentityID`` to a
+    name in one small request.
+
+    Example::
+
+        {"IdentityID": 749, "Name": "General Assembly"}
+    """
+
+    IdentityID: int
+    Name: str | None = None

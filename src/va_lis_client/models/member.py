@@ -154,6 +154,7 @@ class Member(LISModel):
     SeatNumber: int | None = None  # null on list responses
     Seniority: int | None = None
     VotingSequence: int | None = None  # null on list responses
+    VotingTitle: str | None = None  # "Mr. Speaker"; the active list sends it for one member
     IsPublic: bool = True
     SessionCode: str | None = None  # null even on a session-scoped query
     SessionID: int | None = None  # null on list responses
@@ -181,3 +182,132 @@ class Member(LISModel):
         still cast the January votes.
         """
         return self.ServiceEndDate is None
+
+
+class MemberStatusType(LISModel):
+    """A member status, from ``/Member/api/getmemberstatustypereferencesasync``.
+
+    Key: ``MemberStatusID``.  Four rows: 1 ``Active``, 2 ``Inactive``, 3
+    ``Outgoing``, 4 ``Elect``.
+
+    Join it to a row's ``MemberStatus`` name, not to its ``MemberStatusID``.
+    The roster's id is the member's previous status, and the contact list
+    sends ``0``, which is not in this vocabulary, beside ``"Active"``.
+    """
+
+    MemberStatusID: int
+    Name: str | None = None
+
+
+class ChamberType(LISModel):
+    """A chamber, from ``/Member/api/getchambertypereferencesasync``.
+
+    Two rows: ``H`` is ``House`` and ``S`` is ``Senate``.
+    """
+
+    ChamberCode: str
+    Name: str | None = None
+
+
+class MemberContactAddress(LISModel):
+    """One address on a :class:`MemberContact` row.
+
+    Two kinds arrive.  Every member has a ``"GA"`` address, the General
+    Assembly Building, with no phone and no email.  83 of 106 House members
+    in 20261 also had a ``"Mailing"`` address, their district office, and 80
+    of those carry the district phone (measured 2026-10-12).
+
+    **The ``"GA"`` row is a placeholder, not a Contact record.**  All 106 of
+    them carried ``OwnerID`` 0 and ``ContactTypeID`` 0, omitted
+    ``ContactInformationID``, and said false for both ``IsActive`` and
+    ``IsPublic``, which says nothing about the member.  A ``"Mailing"`` row
+    is the real thing: ``OwnerID`` is the ``MemberID``, ``ContactTypeID`` is
+    9, and the shape is the :class:`~va_lis_client.models.directory.Contact`
+    that ``get_contacts`` returns.
+
+    Example::
+
+        {"ContactInformationID": 373, "OwnerID": 503, "ContactTypeID": 9,
+         "ContactType": "Mailing", "Address1": "P.O. Box 1853",
+         "City": "Norfolk", "StateCode": "VA", "ZipCode": "23501",
+         "PhoneNumber": "(757) 204-5492", "IsActive": true, "IsPublic": true}
+    """
+
+    ContactInformationID: int | None = None  # "Mailing" rows only
+    OwnerID: int | None = None  # the MemberID on "Mailing"; 0 on "GA"
+    ContactTypeID: int | None = None  # 9 on "Mailing"; 0 on "GA"
+    ContactType: str | None = None  # "GA" or "Mailing"
+    Address1: str | None = None
+    Address2: str | None = None
+    Address3: str | None = None
+    City: str | None = None
+    StateCode: str | None = None
+    ZipCode: str | None = None
+    PhoneNumber: str | None = None  # the district phone, on "Mailing" rows
+    EmailAddress: str | None = None
+    IsActive: bool = False
+    IsPublic: bool = False
+
+
+class MemberContact(LISModel):
+    """A member with their addresses in one row.
+
+    From ``/Member/api/getmemberscontactinformationlistasync``.
+
+    Key: ``MemberID``.
+
+    This is the one member endpoint that splits the name into ``FirstName``,
+    ``MiddleName`` and ``LastName``, and the one that returns the Capitol and
+    district addresses together.  106 rows for the 20261 House.
+
+    **The three bill counts are not the member's unless you asked for one
+    member.**  ``PrefiledCount``, ``NotPrefiledCount`` and
+    ``LegislationTotal`` were 2,306, 1,600 and 3,906 on all 106 House rows,
+    and the same on the 19 Senate Republicans.  A request that names a
+    ``member_number`` returns that member's own counts: 0, 11 and 11 for
+    H0402 (measured 2026-10-12).
+
+    **``MemberStatusID`` disagrees with ``MemberStatus``.**  50 of the 106
+    rows said ``0`` beside ``"Active"`` and 49 said ``1``; three said ``1``
+    beside ``"Outgoing"``.  Read the name.
+
+    ``ServiceEndDate`` is a key only on a member who left: 7 of 106 rows.
+
+    Example (truncated)::
+
+        {"MemberID": 544, "MemberNumber": "H0402", "FullName": "Charlie Schmidt",
+         "FirstName": "Charlie", "MiddleName": null, "LastName": "Schmidt",
+         "RoomNumber": "916", "GABPhoneNumber": "(804) 698-1077",
+         "ChamberCode": "H", "PartyCode": "D", "PartyName": "Democrat",
+         "DistrictID": 77, "DistrictName": "77th", "MemberStatus": "Active",
+         "PrefiledCount": 0, "NotPrefiledCount": 11, "LegislationTotal": 11,
+         "ContactInformation": [{"ContactType": "GA", ...}]}
+    """
+
+    MemberID: int
+    IdentityID: int | None = None
+    MemberNumber: str | None = None  # e.g. "H0402"
+    FullName: str | None = None  # first and last, no middle
+    FirstName: str | None = None
+    MiddleName: str | None = None
+    LastName: str | None = None
+    MemberDisplayName: str | None = None  # LIS pads this; LISModel strips it
+    RoomNumber: str | None = None
+    IsPublic: bool = True
+    GABPhoneNumber: str | None = None  # two formats in one list
+    GABEmailAddress: str | None = None
+    ChamberCode: str | None = None
+    Chamber: str | None = None  # "House" or "Senate"
+    PartyCode: str | None = None
+    PartyName: str | None = None  # "Democrat", "Republican"
+    DistrictID: int | None = None
+    DistrictName: str | None = None
+    MemberStatusID: int | None = None  # unreliable; read MemberStatus
+    MemberStatus: str | None = None
+    ServiceBeginDate: datetime | None = None
+    ServiceEndDate: datetime | None = None  # omitted unless the member left
+    ServiceEndReason: str | None = None
+    PrefiledCount: int | None = None  # a session total unless one member is named
+    NotPrefiledCount: int | None = None  # the same
+    LegislationTotal: int | None = None  # the same
+    ContactInformation: list[MemberContactAddress] = []

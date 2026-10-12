@@ -135,11 +135,17 @@ label = service.bill_status_label(bill, item)  # best available status label
 ```
 
 **Voting records.** `bill_votes` walks a bill's events, takes each `VoteID`,
-and fetches the roll call behind it. Events are the only bill-first route,
-because no vote endpoint accepts a `legislationID`. HB1 in 20261 returns eight
-votes: two House committee, one House floor, two Senate committee, three
-Senate floor. Six of the eight are attributable to HB1 alone. See
-[Votes](#votes-per-member-roll-calls) for why the other two are not.
+and fetches the roll call behind it, one request per vote. HB1 in 20261
+returns eight votes: two House committee, one House floor, two Senate
+committee, three Senate floor. Six of the eight are attributable to HB1
+alone. See [Votes](#votes-per-member-roll-calls) for why the other two are
+not.
+
+**`bill_shallow_votes` lists the same votes without the members**, in two
+requests however often the bill was voted on. It returns seven for HB1,
+because it leaves out most voice votes. Read
+[A bill's votes without the rosters](#a-bills-votes-without-the-rosters)
+before you use it.
 
 **`roll_call` is `bill_votes` with the roster joined on.** A ballot from LIS
 names a member by `MemberID` and nothing else, so party and district take a
@@ -358,6 +364,23 @@ The docs say `ListItems` everywhere. Reality:
 | Bill versions (both calls) | `ListItems` | `LegislationsVersion` |
 | Chamber statistics | `ListItems` | `ChamberStatistics` |
 | Committee statistics | `ListItems` | `CommitteeStatistics` |
+| Session event types | `ListItems` | `SessionEventTypes` |
+| Amended legislation | `ListItems` | `LegislationAmendmentList` |
+| Conference legislation | `ListItems` | `ConferenceLegislationList` |
+| Legislation id list | `LegislationIds` | `LegislationIds` |
+| Member patron types | `ListItems` | `MemberPatronTypes` |
+| Subject index | `ListItems` | `SubjectsReference` |
+| Summary versions | `ListItems` | `SummaryVersions` |
+| Text dispositions | `ListItems` | `TextDispositionList` |
+| Text actions | `ListItems` | `LegislationTextActions` |
+| Sponsor types | `ListItems` | `SponsorTypes` |
+| Text hit counts | `HitCounts` | `HitCounts` |
+| Member statuses | `ListItems` | `MemberStatuses` |
+| Member contacts | `ListItems` | `MemberContactInformationList` |
+| Shallow member list | `ListItems` | `ShallowMembers` |
+| Organizations | `ListItems` | `Organizations` |
+| Shallow votes | `ListItems` | `ShallowVotes` |
+| Vote links | `ListItems` | `VoteLinks` |
 
 MinutesBook and LegislationCommunications each answer a list and a detail
 under *different* keys, so the spec is wrong twice for both.
@@ -431,16 +454,46 @@ the row count nor the unique bill count. See
 #### Session (`/Session/api/`)
 - `get_sessions(year)` → list of sessions for a year
 - `get_default_session()` → the current/active session
+- `get_sessions_by_year(year)` → the same rows with the year in the path
+- `get_session(session_id)` and `get_session_by_code(session_code)` → one session with its events; `None` if unknown
+- `get_sessions_shallow(session_type_id=None, session_year=None, is_active=None)` → every session back to 1994 without its events, 59 rows in 9 KB
+- `get_session_event_types()` → 11 milestone types
+- `get_session_types()` → 2 types (1 Regular, 2 Special)
+
+`get_session_by_code` is the one request that turns a session code into the
+`SessionID` that a few paths insist on. Two traps: `is_active=False` filters
+nothing and returns all 59 sessions, and the event type vocabulary calls 8
+`Adjournment` and 11 `Closing` while a session files its sine die under 11
+with the label `Adjournment`.
 
 #### Legislation (`/Legislation/api/`)
 - `get_session_bills(session_code)` → lightweight bill list for a session
 - `get_bill(legislation_id)` → full bill detail with all patrons
 - `get_legislation_statuses()` → all 52 status reference entries
+- `get_amended_legislation(session_code=None, session_id=None, chamber_code=None)` → every bill with an amendment, and the amendments; a session is required
+- `get_conference_legislation(session_id=None, chamber_code=None, member_id=None)` → bills that went to conference, 170 for 20261; **`session_id` only**
+- `get_legislation_list(**criteria)` → the advanced search from this service, same body and same rows
+- `get_legislation_ids(**criteria)` → the same search reduced to ids, 30 KB against 440 KB
+- `get_legislation_by_ids(legislation_ids, session_id=None)` → search rows for ids you already hold; every entry needs a `SessionID`
+
+Read [Amendments and conference bills](#amendments-and-conference-bills)
+before you count either list. The three search paths repeat bills exactly
+as [the advanced search](#searching-bills) does.
 
 #### LegislationText (`/LegislationText/api/`)
 - `get_legislation_versions()` → 13 version type references (Introduced, Enrolled, etc.), the vocabulary and not one bill's versions
 - `get_bill_texts(legislation_number, session_code)` → text version list
 - `get_bill_text_detail(legislation_id, session_code)` → full HTML bill text
+- `get_draft_text(legislation_text_id)` → one text's HTML body by text id alone, no session needed
+- `get_bill_html(session_code, document_code, hilite=False)` → the printed page as an HTML string
+- `get_bill_pdf_url(session_code, document_code)` → the address of the PDF, as a string
+- `get_text_hit_counts(legislation_text_ids, keyword=None, words=None)` → how often a term occurs in each text
+- `get_text_dispositions()` → 13 dispositions (6 Adopted, 5 Not Adopted, ...)
+- `get_text_actions()` → 31 actions that produce a text
+- `get_sponsor_types()` → 6 sponsor types
+
+Two of these do not answer JSON, and one is not what its name says. Read
+[Text that is not JSON](#text-that-is-not-json).
 
 #### LegislationVersion (`/LegislationVersion/api/`)
 - `get_bill_versions(legislation_number, session_code=None, session_id=None)` → one bill's published versions, oldest first; a session is required
@@ -457,9 +510,17 @@ Not wired: `clearpubliccache`, which changes server state.
 
 #### LegislationSummary (`/LegislationSummary/api/`)
 - `get_bill_summaries(legislation_number, session_code)` → bill summaries (HTML)
+- `get_summary_versions()` → the 4 summary stages in progression order
+
+The stage ids run 1 `SUMMARY AS INTRODUCED`, 2 `SUMMARY AS PASSED CHAMBER`,
+3 `SUMMARY AS PASSED`, 4 `SUMMARY AS ENACTED WITH GOVERNOR'S
+RECOMMENDATION`. That is the official order behind `SUMMARY_VERSION_RANK`.
+It has no `PASSED HOUSE` or `PASSED SENATE`, the spellings the advanced
+search sends.
 
 #### LegislationEvent (`/LegislationEvent/api/`)
 - `get_bill_events(legislation_id)` → chronological action history for a bill
+- `get_event(legislation_event_id)` → one event by its id; `None` if unknown
 - `get_event_types()` → 3,912 event type references
 - `get_actor_types()` → 5 actor types (House, Senate, Committee, etc.)
 
@@ -517,6 +578,8 @@ across the chamber pair far more often, in 148 codes.
 #### Vote (`/Vote/api/`)
 - `get_vote(vote_id)` → one vote with its per-member roll call
 - `get_vote_types()` → 3 vote types (1=Committee, 2=Subcommittee, 3=Floor)
+- `get_shallow_votes(chamber_code, session_code=None, session_id=None, legislation_id=None, member_id=None, start_date=None, end_date=None)` → votes without their members, by bill, member, or date; a chamber and a session are both required
+- `get_vote_links(legislation_event_id)` → the vote behind one event, 290 bytes
 
 **This service is absent from the LIS developer portal service list.** It is
 the only route to per-member votes. See [Votes](#votes-per-member-roll-calls).
@@ -526,6 +589,12 @@ the only route to per-member votes. See [Votes](#votes-per-member-roll-calls).
 - `get_member(member_id, session_code)` → one member, **204s for some sitting members**
 - `get_parties()` → 3 parties (D, I, R)
 - `get_districts()` → 140 districts (100 House, 40 Senate)
+- `get_member_list(session_code=None, session_id=None, chamber_code=None, member_number=None, party_code=None)` → the roster with 16 fields, and the only one that filters on party
+- `get_active_members(session_code=None, session_id=None)` → 146 of the 148, with the fields the roster leaves null
+- `get_member_contacts(session_code=None, session_id=None, chamber_code=None, member_number=None, party_code=None)` → members with their Capitol and district addresses, and the name split into parts
+- `get_member_status_types()` → 4 statuses (1 Active, 2 Inactive, 3 Outgoing, 4 Elect)
+- `get_chamber_types()` → 2 chambers
+- `get_member_owner_types()` → the 6 owner types of `get_owner_types`, with the id sent as a string
 
 `MemberID` is the join key from a ballot. See
 [Members](#members-the-roster-behind-a-roll-call).
@@ -556,8 +625,10 @@ chamber-wide index, not a route to co-patronage. Both arguments are
 required; without the chamber LIS answers 400 with "The chamberCode field is
 required."
 
-Not wired: `getmemberpatrontypelistasync` lists the roles one member holds,
-including a `PatronTypeID` of `0` for budget amendment requests.
+- `get_member_patron_types(member_id, session_code=None, session_id=None)` → the roles one member holds in a session; a session is required
+
+**`PatronTypeID` 0 is not a patron role.** `get_member_patron_types` returns
+it for budget amendment requests, and `get_patron_roles` does not list it.
 
 #### Committee (`/Committee/api/`)
 - `get_committees(chamber_code=None, include_subcommittees=False)` → 14 House and 11 Senate standing committees; 67 House rows with subcommittees
@@ -570,6 +641,7 @@ The list ignores the session it is sent. See
 #### MembersByCommittee (`/MembersByCommittee/api/`)
 - `get_committee_members(committee_id, session_code)` → who sits on a committee, with roles; session required
 - `get_committee_roles()` → 8 roles, with chamber specific IDs
+- `get_committee_members_text(committee_id, session_code=None, session_id=None)` → the roster as one line of surnames, plain text; **406** without a session
 
 #### CommitteeLegislationReferral (`/CommitteeLegislationReferral/api/`)
 - `get_committee_actions()` → 41 committee actions
@@ -582,11 +654,13 @@ committee. The action vocabulary is its only data operation.
 - `get_schedule_types()` → 6 types (1 Committee, 2 Chamber, 3 Conference, 4 Caucus, 5 Other, 6 Docket)
 - `get_meeting_rooms(chamber_code=None)` → room reference, 18 for the House
 
-Not wired yet: `previewvcalfileasync`, an iCalendar export of the schedule.
-It answers `text/calendar`, not JSON. Its filters are `scheduleIDs`
-(plural), `ownerID`, `scheduleTypeID`, `voteRoomID`, `startDate` and
-`endDate`; an unknown parameter such as `scheduleID` is silently ignored and
-returns a default feed.
+- `get_schedule_vcal(start_date=None, end_date=None, owner_id=None, schedule_type_id=None, vote_room_id=None, schedule_ids=None)` → the same meetings as an iCalendar feed, a string
+
+The feed answers `text/calendar`, not JSON: 32 events in 13 KB for
+2026-02-02 to 2026-02-03. Its id filter is `scheduleIDs`, plural. An unknown
+parameter such as `scheduleID` is silently ignored and returns a default
+feed, so a misspelled filter looks like it worked. The spec also offers
+`writeToAzureCDN`, which publishes a file; this client never sends it.
 
 #### Calendar (`/Calendar/api/`)
 - `get_calendars(chamber_code, session_code)` → a chamber's floor calendars, 56 for the 2026 House
@@ -622,9 +696,12 @@ members and **not at all to votes**. Read
 this committee". Not session scoped. See
 [Clerks, offices, and agencies](#clerks-offices-and-agencies).
 
-Not wired: `getclerkpersonnellistasync` is byte-identical to
-`staff_role_type_id=1`, and `getreferencesasync` is byte-identical to the
-unfiltered call.
+- `get_clerk_personnel(affiliation_id=None, effective_begin_date=None)` → the 54 clerks; the same rows as `staff_role_type_id=1`
+- `get_staff_personnel(affiliation_id=None, effective_begin_date=None)` → the 59 DLS staff; the same rows as `staff_role_type_id=2`
+- `get_personnel_references(effective_begin_date=None)` → byte for byte the unfiltered `get_personnel()`
+
+The clerk and staff paths send all 11 fields with no argument at all, where
+the general list drops four until you filter it.
 
 #### Contact (`/Contact/api/`)
 - `get_contacts(owner_id=None, owner_type_id=None)` → contact records for one owner, or every contact with neither; for a member pass `owner_type_id=3`
@@ -641,14 +718,12 @@ tried. See [Clerks, offices, and agencies](#clerks-offices-and-agencies).
 
 #### Organization (`/Organization/api/`)
 - `get_agencies()` → 295 state budget agencies, grouped by branch
+- `get_organizations()` → the same identities as an id and a name, plus `749` for the General Assembly
+- `get_organization(organization_id)` → one name by `IdentityID`; `None` if unknown
 
 Executive budget reference data that joins to nothing legislative. Wired for
-completeness.
-
-Not wired: `getorganizationlistasync` returns the same 295 identities with
-only a `Name` equal to `AgencyName`, plus one extra row for the General
-Assembly. `getorganizationbyidasync` answers 204 with an empty body for an
-unknown id rather than 404.
+completeness. `getorganizationbyidasync` answers 204 with an empty body for
+an unknown id rather than 404.
 
 #### MinutesBook (`/MinutesBook/api/`)
 - `get_minutes_books(session_code=..., committee_id=None, chamber_code=None, start_date=None, end_date=None)` → the published books for a session, 388 for 20261; a session is mandatory
@@ -666,17 +741,22 @@ beside it. Read [Minutes books](#minutes-books).
 - `get_legislative_numbers(session_code)` → 3,646 rows of bill number to `LegislationID` for 20261, 268 KB against roughly 3 MB for the bill list
 - `get_introduction_dates(session_code)` → the 91 distinct introduction dates in 20261
 - `get_legislation_categories()` → 30 categories, e.g. 1 `Introduced`
+- `get_search_statuses()` → the 52 rows of `get_legislation_statuses`, from this service
 
 This is the only keyword capable bill endpoint, and the only one that filters
 on status, category, committee, chapter number, and patron in one call. It
 has no paging and it repeats bills. Read
 [Searching bills](#searching-bills) before you use it.
 
-Not wired: `getstatusreferencesasync` returns the same 52 rows under the same
-`References` key as `get_legislation_statuses` (re-checked 2026-09-15), so use
-that one.
-`clearpubliccache` and `clearintroductiondatelistcacheasync` are cache
-management, not data.
+Not wired: `clearpubliccache` and `clearintroductiondatelistcacheasync`, which
+are cache management, not data.
+
+#### LegislationSubject (`/LegislationSubject/api/`)
+- `get_subjects(session_code=None, session_id=None)` → 506 subject index headings for 20261; a session is required
+
+**The headings join to nothing a public key can reach.** No bill row carries
+a `SubjectIndexID`, and passing one to the advanced search answers 204 every
+time, with either session parameter.
 
 #### Statistics (`/Statistics/api/`)
 - `get_chamber_statistics(session_code=None, session_id=None)` → bill counts per chamber and legislation type, 6 rows for 20261; a session is required
@@ -690,8 +770,9 @@ Not wired: `clearpubliccache`, which changes server state.
 
 ### Investigated and deliberately not wired
 
-Every service below was read from its OpenAPI spec and probed live on
-2026-09-15. Fetch any spec with
+**Every read path a public key can call has a method.** The list below is
+what is left, and why. Each service was read from its OpenAPI spec and
+probed live, on 2026-09-15 or 2026-10-12. Fetch any spec with
 `GET /ReportFileGeneration/api/getapidocumentationasync?ApiName=<Service>`.
 There is no per service `getapidocumentationasync`; that path returns 404 for
 every service. The `Documentation` field holds the OpenAPI document as a JSON
@@ -712,14 +793,17 @@ Personnel has the same spec defect and answers fine at `/Personnel/api/...`.
 **Already covered.** MemberVoteSearch holds only `getmembervotelistasync`,
 which `get_member_votes` already wires.
 
-**Vocabulary with nothing to search by.** LegislationSubject's
-`getsubjectreferencesasync` returns a 506 row subject index for 20261, but
-passing a `SubjectIndexID` to the advanced search answers 204 every time,
-with either session parameter. The vocabulary is real and unusable.
+**Answers nothing.** `Member`'s `getcommitteeslistasync`, "committees by
+member", answered 204 on every form tried on 2026-10-12: two members, the
+`MemberID` key in both spellings, three shapes of `effectiveDate`, an
+`IdentityID` and a `MemberDetailID` in place of the member id, and an added
+session. A method for it would return an empty list every time. The route
+to a member's committees is still `LISService.member_committees`.
 
-**Privileged.** `Contact`'s `getcontactlistasync` answers **401** with an
-empty body for a public key, bare and filtered. Everything else in that
-service is reachable.
+**Privileged, or gone.** `Contact`'s `getcontactlistasync` answers **401**
+with an empty body for a public key, bare and filtered.
+`getcontactsbystatusasync`, `getcontactbyidasync` and
+`getcontactsbycontacttypeidasync` answer **404** for every argument tried.
 
 **Out of scope: anything a public API key cannot use on its own.** This
 client covers only what a holder of a public `WebAPIKey` can call. So it
@@ -958,7 +1042,7 @@ of the two useful ones is simply the better one.
 |---|---|---|---|
 | Rows | **all 148** | 1, and **9 of 148 return nothing** | all 148 |
 | Fields | 28, nine always null | 29, five null | 16 |
-| Wired as | `get_members` | `get_member` | not wired |
+| Wired as | `get_members` | `get_member` | `get_member_list` |
 
 **The list is complete in rows and incomplete in fields.** It returns every
 member every time, but nine fields come back null on all 148 rows:
@@ -1014,12 +1098,28 @@ Bill detail pads patron names too: `getlegislationbyidasync` returned
 `" Charlie Schmidt"` as chief patron of HB1408 in 20261. Every response
 model therefore inherits `LISModel` now, not only the roster and vote models.
 
-**`getmemberlistasync` is strictly worse than both.** It returns the same 148
-rows under `ShallowMembers` with only 16 fields, dropping `DistrictID`,
-`DistrictName`, `RoomNumber`, and `ServiceEndDate`, so it can neither back a
-voting record nor tell you who left. It has no advantage over
-`getmembersasync`, which accepts the same undocumented `chamberCode` filter,
-so this client does not wire it.
+**`getmemberlistasync` cannot back a voting record.** It returns the same 148
+members under `ShallowMembers` with only 16 fields, dropping `DistrictID`,
+`DistrictName` and `RoomNumber`. Its one advantage is its filters:
+`get_member_list` takes a `party_code` and a `member_number`. It ignores the
+`statuses` parameter its spec lists, in every form tried.
+
+**Two more lists exist, and neither replaces the roster.**
+
+- `get_active_members` fills what the roster leaves null: `MemberDetailID`,
+  `ChamberName` and `SessionID` on every row, `SeatNumber` and
+  `VotingSequence` on most. But it returned 146 of the 148 for 20261, and
+  "active" is loose: 5 of the 146 were `Outgoing` and 3 `Inactive`.
+- `get_member_contacts` is the only list with `FirstName`, `MiddleName` and
+  `LastName`, and it nests each member's addresses. Its `PrefiledCount`,
+  `NotPrefiledCount` and `LegislationTotal` are **session totals, the same
+  on every row**, unless the request names one `member_number`. Its
+  `MemberStatusID` said `0` beside `"Active"` on 50 of 106 House rows.
+
+Every member has a `"GA"` address in the contact list, and it is a
+placeholder: `OwnerID` 0, `ContactTypeID` 0, no id, no phone. The
+`"Mailing"` address beside it is the real district office record, with
+`OwnerID` equal to the `MemberID`.
 
 **A district labels itself `Title`; a member calls the same value
 `DistrictName`.** Both read `"71st"`.
@@ -1228,8 +1328,11 @@ holds a `MemberID` like everywhere else.
 The `/Vote` service is the only route to who voted how. It covers **both
 chambers**, and **committee, subcommittee, and floor** votes alike.
 
-**There is no bill-first endpoint.** Every `getvotesby...legislation...` name
-returns 404. Reach a vote through an event:
+**One vote endpoint takes a bill, and it leaves out the members.** That is
+the shallow list, described under
+[A bill's votes without the rosters](#a-bills-votes-without-the-rosters).
+Every `getvotesby...legislation...` name returns 404. Reach a roll call
+through an event:
 
 ```
 Legislation ──→ LegislationEvent.VoteID ──→ /Vote/api/getvotebyidasync
@@ -1328,7 +1431,8 @@ Each member carries `MemberID`, `MemberNumber` (e.g. `H0206`),
 dirt on some rows, 2 of the 100 on vote 294006.
 
 Party and district are **not** in the roll call. They live in the `Member`
-service, which is probed but not yet wired.
+service: join `MemberID` to the roster from `get_members`, which is what
+`LISService.roll_call` does.
 
 ```
 HB1  House floor  2026-02-03  (64-Y 34-N 0-A)
@@ -1358,6 +1462,49 @@ no, nor the abstentions the tally counts.
 vote nay." The member rows are **not** amended. Both facts are true, and only
 the recorded one counts. Surface the statements alongside any voting record
 you publish.
+
+### A bill's votes without the rosters
+
+`get_shallow_votes` returns a vote's tally, type, committee and date, and no
+members. It is the one vote endpoint that filters by bill, by member and by
+date. `LISService.bill_shallow_votes(bill_number, session_code)` asks both
+chambers and merges them, oldest first.
+
+Measured on five 20261 bills on 2026-10-12, against the `VoteID` values on
+each bill's events:
+
+| Bill | Votes on its events | Shallow rows | Missing |
+|---|---|---|---|
+| HB1 | 8 | 7 | 1 voice vote |
+| HB1503 | 7 | 7 | none |
+| SB1 | 8 | 6 | 2 voice votes |
+| HB361 | 16 | 13 | 3 voice votes |
+| HB9 | 2 | 0 | 2 voice votes |
+
+Every roll call and every block vote was there, and nothing was there that
+the events lacked. Four traps:
+
+- **Most voice votes are missing.** Eight of the nine across those bills.
+  A bill decided by voice alone, like HB9, answers 204 from both chambers.
+- **`IsBlock` is false on every row.** Vote 300173 is a 50 bill block. Its
+  full record says `IsBlock: true` and its shallow row says `false`. The
+  shallow row puts the literal `"BLOCK"` where the bill number belongs.
+  Read `ShallowVote.is_block`, which tests both.
+- **`member_id` and `legislation_id` together are an OR.** The answer is
+  every vote on the bill plus every vote the member took part in, 1,911
+  rows and 1.5 MB for one delegate's session. It is not that member's
+  votes on the bill. Send one or the other.
+- **`end_date` is exclusive.** A start and an end on the same day answer
+  204.
+
+A chamber and a session are both required, so a bill costs one request per
+chamber. `voteNumber` is in the spec and not in the method: LIS answers 500
+to it for a committee number and a floor number alike, and this client
+retries a 500.
+
+`get_vote_links(legislation_event_id)` is the smallest piece: the `VoteID`,
+`VoteNumber` and `VoteFileID` behind one event, or an empty list for an
+event with no vote.
 
 ### The `VoteStatement.VoteMemberID` trap
 
@@ -1660,7 +1807,7 @@ three levels: the communication holds categories, a category holds bills,
 and a bill holds patrons.
 
 ```python
-rows = client.get_communications(session_code=20261)     # 131, shallow
+rows = client.get_communications(session_code=20261)  # 131, shallow
 detail = client.get_communication(rows[0].CommunicationID)
 
 for category in detail.categories:
@@ -1910,6 +2057,85 @@ in 20251 returns the same single row as in 20241, with `SessionID` 55.
   keys (145 of 147 rows sampled). Some send `DraftDate` null, and their dates
   can run backwards: SJ76 was enrolled on 2024-02-06 and introduced on
   2024-02-15.
+
+## Amendments and conference bills
+
+Two lists in `/Legislation` answer questions no other path does: which
+bills were amended, and which went to conference.
+
+### The chamber filter picks the amendments, not the bills
+
+`get_amended_legislation(session_code=20261, chamber_code="H")` returns the
+bills that carry a **House amendment**. That list held 207 House bills and
+71 Senate bills, and all 379 of its amendments were House amendments
+(measured 2026-10-12). `ChamberCode` on a row is the bill's chamber;
+`ChamberCode` on an amendment is the chamber that offered it.
+
+| `chamber_code` | Rows | Unique bills | Amendments |
+|---|---|---|---|
+| `"H"` | 278 | 263 | 379 |
+| `"S"` | 229 | 221 | 362 |
+| omitted | 462 | | |
+
+### A bill repeats once per summary version
+
+The rows outnumber the bills because each published summary version gets
+its own row, with the same amendments on every copy. HB18 arrived three
+times. `LegislationSummary` itself is null on every row, so the repeat
+carries a label and no text. Collapse on `LegislationID` before you count.
+
+An amendment's `TextDisposition` says what became of it: 268 `Adopted`, 66
+`Engrossed`, 21 `Not Adopted`, 13 `Removed` and 11 `Posted` in the House
+list. Its `LegislationTextID` resolves through `get_draft_text`.
+
+### The conference list takes a session id, and only that
+
+`get_conference_legislation(59)` returns the 170 bills of the 2026 Regular
+Session that went to conference, 85 from each chamber. **A `sessionCode`
+is silently ignored**, and a request with no session LIS understands
+returns every session at once: 2,826 rows and 1.5 MB, back to 1994. That is
+why the method has no `session_code` argument. Turn a code into an id with
+`get_session_by_code`.
+
+`member_id` narrows the list to a conferee. Member 544 returned five bills,
+two of them Senate bills, and the events of HB361 name that member among
+the House conferees. The row itself names no conferee, no patron and no
+committee.
+
+## Text that is not JSON
+
+Four paths answer with something other than a JSON envelope. The client
+returns each as a `str`, and `None` on a 204.
+
+| Method | LIS sends | What it is |
+|---|---|---|
+| `get_bill_html` | `text/html` | One text as the printed page, a fragment with inline styles |
+| `get_committee_members_text` | `text/plain` | `"Aird (Chair), Stanley, McPike, ..."` |
+| `get_schedule_vcal` | `text/calendar` | A `VCALENDAR` with one `VEVENT` per meeting |
+| `get_bill_pdf_url` | a JSON string | The address of the PDF |
+
+**`getpdfasync` does not return a PDF.** It returns the blob address, such
+as `https://lis.blob.core.windows.net/files/1081188.PDF`, the same address
+a bill version fetched by single id carries in `PdfFile`.
+
+**The HTML path calls its parameter `documentNumber` and wants a document
+code.** `"HB1"` is the introduced text and `"HB1ER"` the enrolled one. A
+code the session does not hold answers 400, not 204.
+
+**`hilite` marks changes to the law, not search hits.** It adds
+`color:red` to struck text and `background-color:yellow` to new text.
+
+**The roster text answers 406 without a session**, where every JSON path
+answers 400.
+
+`get_draft_text` is JSON, and belongs beside these: it returns one text's
+HTML body from its `LegislationTextID` alone, with no session, starting at
+the enacting clause. `get_bill_html` returns the same bill with its session
+line, number and patrons on top.
+
+`get_text_hit_counts` counts a term in texts you name. Several terms add
+up: `"minimum"` counts 12 and `"wage"` 11 in HB1's introduced text, and
+`"minimum AND wage"` counts 23.
 
 ## Session statistics
 
