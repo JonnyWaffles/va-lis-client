@@ -1143,6 +1143,21 @@ class LISService:
         **Warning:** the endpoint has no paging, so an unfiltered search
         fetches the whole session.  20261 measured 5.7 MB.  Send a filter.
 
+        **Warning:** a keyword needs ``keyword_location``.  Without it LIS
+        answers nothing and this returns ``[]``; no default is added here.
+        ``keyword="firearm"`` in 20261 found 0 bills alone, 50 with
+        ``"Summary"`` and 129 with ``"Bill Text"`` (measured 2026-10-13).
+
+        **Warning:** a criterion beside the keyword drops failed and
+        incorporated bills.  Those 50 bills fell to 37 once a chamber, a
+        category or a summary length went with the keyword, and the 13
+        missing were the 10 ``Failed`` and the 3 ``Incorporated``.
+        ``exclude_failed=False`` does not bring them back.  ``member_id``
+        drops them too, so call :meth:`member_bills` for everything a member
+        patrons.  ``committee_id`` does not select the bills a committee
+        holds.  :meth:`LISClient.search_legislation` carries the
+        measurements.
+
         Args:
             dedupe: Collapse to one row per bill.  Set ``False`` to get the
                 rows exactly as LIS sent them, duplicates and all, which is
@@ -1153,7 +1168,9 @@ class LISService:
 
         Example::
 
-            hits = service.search_bills(session_code=20261, keyword="firearm")
+            hits = service.search_bills(
+                session_code=20261, keyword="firearm", keyword_location="Summary"
+            )
         """
         rows = self.client.search_legislation(**criteria)
         if not dedupe:
@@ -1193,6 +1210,17 @@ class LISService:
 
         **Warning:** the endpoint has no paging, so an unfiltered search
         fetches the whole session.  20261 measured 5.7 MB.  Send a filter.
+
+        **Warning:** a keyword needs ``keyword_location``.  Without it LIS
+        answers nothing and this returns ``[]``; no default is added here.
+        ``keyword="firearm"`` with ``keyword_location="Summary"`` returned
+        53 rows for 20261, and they settle to 51 here: 50 bills, one of them
+        with two summary versions (measured 2026-10-13).
+
+        **Warning:** a criterion beside the keyword drops failed and
+        incorporated bills, ``exclude_failed`` changes nothing, and
+        ``committee_id`` does not select the bills a committee holds.  See
+        :meth:`search_bills` and :meth:`LISClient.search_legislation`.
 
         Args:
             dedupe: Drop exact duplicate rows.  Set ``False`` to get the rows

@@ -130,8 +130,10 @@ staff = service.committee_staff("Courts of Justice", chamber_code="H")
 office = service.member_office(503)  # the district address; None for many members
 
 # Keyword search, in two grains. Both drop the duplicate rows LIS emits.
-hits = service.search_bills(session_code=20261, keyword="firearm")  # one row per bill
-every = service.search_bill_summaries(session_code=20261, keyword="firearm")  # one row per summary
+# A keyword needs keyword_location: without one LIS answers nothing.
+firearm = dict(session_code=20261, keyword="firearm", keyword_location="Summary")
+hits = service.search_bills(**firearm)  # one row per bill
+every = service.search_bill_summaries(**firearm)  # one row per summary
 
 # Every vote including the ones no member can be credited with.
 for record in service.bill_votes("HB1", 20261):
