@@ -10,7 +10,8 @@ summaries, and the only one that filters on status, category, committee,
 chapter number, and patron at once. Criteria ride a JSON body, not the query
 string. It is also the roughest endpoint in LIS, in four separate ways.
 
-Every count below comes from session 20261, measured 2026-09-15.
+Every count below comes from session 20261, measured 2026-09-15, except
+where a passage gives its own session or date.
 
 ### A bill arrives more than once, for two unrelated reasons
 
@@ -78,16 +79,22 @@ answer can have it. The service layer picks a grain, and both methods take
 
 ```python
 service = LISService(LISClient())
+firearm = dict(session_code=20261, keyword="firearm", keyword_location="Summary")
 
-# One row per bill.  The furthest-along summary wins.
-bills = service.search_bills(session_code=20261, keyword="firearm")
+# One row per bill.  The furthest-along summary wins.  50 bills.
+bills = service.search_bills(**firearm)
 
-# One row per published summary version.  Only the exact duplicates go.
-versions = service.search_bill_summaries(session_code=20261, keyword="firearm")
+# One row per published summary version.  Only the exact duplicates go.  51 rows.
+versions = service.search_bill_summaries(**firearm)
 
-# Exactly what LIS sent, on either method.
-raw = service.search_bills(dedupe=False, session_code=20261, keyword="firearm")
+# Exactly what LIS sent, on either method.  53 rows.
+raw = service.search_bills(dedupe=False, **firearm)
 ```
+
+**The location is not optional.** Leave `keyword_location` out and LIS
+answers 204, so all three calls return `[]`. Neither method adds a default;
+see [Criteria traps](#criteria-traps). Those three counts were measured
+2026-10-13.
 
 `search_bills` groups on `LegislationID`, which absorbs both duplication
 causes at once, and keeps the order each bill first appeared in.
@@ -112,11 +119,97 @@ a distinct count equal to 2,836 and none matches. Count the rows yourself.
 - **`Chambercode` has a lowercase `c`**, alone among the body keys. The
   client spells it correctly; only a raw caller or the `extra=` escape hatch
   can get it wrong.
-- **A common word finds nothing.** `KeywordExpression: "the"` returned 204
-  while `"firearm"` returned 50 bills. LIS drops stop words. This is not a
-  result cap.
+- **A keyword with no location finds nothing.** `KeywordExpression:
+  "firearm"` on its own answered 204, and so did `"wage"`. With
+  `KeywordLocation: "Summary"` the same word returned 53 rows holding 50
+  bills, and with `"Bill Text"` 140 rows holding 129. The client sends no
+  default, so pass `keyword_location` with every keyword. The two locations
+  are two different searches: SB307 and HB1082 matched in the summary and not
+  in the text. Measured 2026-10-13.
+- **A common word finds nothing.** `KeywordExpression: "the"` in summaries
+  returned 204 while `"firearm"` returned 50 bills. LIS drops stop words.
+  This is not a result cap.
 - **`SubjectIndexID` always returns 204**, with `SessionCode` or `SessionID`.
   The `/LegislationSubject` vocabulary is not searchable.
+- **`ExcludeFailed` and `SummaryLength` do not do what their names say**, and
+  **`CommitteeID` does not pick the bills a committee holds.** The next two
+  sections carry the measurements.
+
+### A criterion beside the keyword drops failed and incorporated bills
+
+A keyword and its location return every matching bill. Add a chamber, a
+category, a patron, or a summary length, and every `Failed` and
+`Incorporated` bill leaves the result. Nothing in the response says so.
+
+Keyword `firearm` in summaries, session 20261, measured 2026-10-13. The table
+counts bills, not rows:
+
+| Sent beside the keyword | Bills | Acts of Assembly Chapter | Continued | Failed | Incorporated |
+|---|---|---|---|---|---|
+| nothing | 50 | 33 | 4 | 10 | 3 |
+| `exclude_failed=True` | 50 | 33 | 4 | 10 | 3 |
+| `exclude_failed=False` | 50 | 33 | 4 | 10 | 3 |
+| `chamber_code="H"` | 22 | 19 | 3 | 0 | 0 |
+| `chamber_code="S"` | 15 | 14 | 1 | 0 | 0 |
+| `chamber_code="H"` and `exclude_failed=False` | 22 | 19 | 3 | 0 | 0 |
+| `category_id=1` (Introduced) | 37 | 33 | 4 | 0 | 0 |
+| `summary_length=120` | 37 | 33 | 4 | 0 | 0 |
+| `status_id=9` (Failed) | 0 | | | | |
+| `category_id=12` (Failed) | 0 | | | | |
+
+- **The two chambers do not add up to the whole.** 22 and 15 make 37. The 13
+  missing bills are exactly the 10 failed and the 3 incorporated.
+- **`exclude_failed` changes nothing in either direction.** `True` kept all
+  10 failed bills. `False` did not bring them back beside a chamber.
+- **You cannot ask for the failed bills.** `status_id=9` and
+  `category_id=12` both answered 204, although 10 failed bills match the
+  keyword.
+- **`summary_length` shortens nothing.** All 38 rows carried the same summary
+  text as the search without it, the shortest of them 418 characters. The
+  criterion still set off the drop.
+- **Category 1 is not a stage.** `category_id=1` returned the same 37 bills
+  as the two chambers together, 33 of them already chaptered. "Introduced"
+  matched every bill the drop left.
+
+**The drop needs no keyword.** `member_id=544` on its own returned 203 bills,
+none of them failed or incorporated. `/LegislationByMember` returned 229 for
+the same member and session. Of the 26 bills the search left out, 21 are
+`Failed` and 2 are `Incorporated`. The other 3 hold neither status: HB397
+(`Acts of Assembly Chapter`), HJ52 and HJ83 (both `Passed`). Call
+`LISService.member_bills` for everything a member patrons.
+
+To filter and keep the failed bills, send the keyword and its location alone,
+then filter the rows yourself. `ChamberCode` and `LegislationStatus` are on
+every row.
+
+### The committee filter does not pick the bills a committee holds
+
+A row names its committee in `CommitteeID` and `CommitteeNumber`. The
+`CommitteeID` criterion does not select the rows that name that committee.
+
+Session 20271, measured 2026-10-13: `category_id=3` (In Committee) with
+`committee_id=8` (H08, House Courts of Justice) returned 39 rows holding 38
+bills. Their rows name six committees:
+
+| `CommitteeNumber` on the row | Bills |
+|---|---|
+| H08, Courts of Justice | 5 |
+| H08001 and H08002, its two subcommittees | 17 |
+| S05, Senate Finance and Appropriations | 9 |
+| S13, Senate Courts of Justice | 6 |
+| H20001, a House Rules subcommittee | 1 |
+
+16 of the 38 sit somewhere else. All 15 that sit in a Senate committee are
+House bills, so a match on an earlier referral is the obvious suspect. It is
+not confirmed.
+
+The filter also misses bills whose rows do name the committee. In 20261
+three `firearm` rows name H15 (HB540, HB696 and HB700), and `committee_id=15`
+with the keyword answered 204. All three are `Failed`, so the drop above
+removes them before the committee can match.
+
+To list what a committee holds, compare `CommitteeID` or `CommitteeNumber` on
+the rows yourself.
 
 ### Two body fields need their entries wrapped
 

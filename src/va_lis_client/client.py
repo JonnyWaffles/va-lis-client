@@ -3287,32 +3287,69 @@ class LISClient:
         against 3,007 rows holding 2,827 unique IDs, and matches no count
         derivable from the payload.  Count the rows yourself.
 
-        Two traps in the criteria themselves:
+        **Warning: a keyword needs a location.**  ``keyword`` without
+        ``keyword_location`` answers HTTP 204, so this method returns ``[]``.
+        In 20261 ``keyword="firearm"`` alone found nothing, and so did
+        ``"wage"``.  With ``keyword_location="Summary"`` it returned 53 rows
+        holding 50 bills, and with ``"Bill Text"`` 140 rows holding 129
+        (measured 2026-10-13).  This method sends no default location.
+
+        **Warning: a criterion beside the keyword drops failed and
+        incorporated bills.**  Those 50 bills are 33 chaptered, 10
+        ``Failed``, 4 ``Continued`` and 3 ``Incorporated``.  Adding
+        ``chamber_code``, ``category_id=1`` or ``summary_length`` left 37,
+        with every failed and incorporated bill gone, and ``member_id`` on
+        its own drops them too (measured 2026-10-13).  Nothing brings them
+        back: not ``exclude_failed=False``, and not ``status_id=9`` (Failed),
+        which answers 204.  To keep them, send the keyword and its location
+        alone and filter the rows yourself.
+
+        Two more traps in the criteria themselves:
 
         - ``subject_index_id`` returns HTTP 204 every time, with either
           session parameter.  The subject vocabulary from
           ``/LegislationSubject`` is therefore not searchable.  The parameter
           is wired so the behavior is discoverable, not because it works.
-        - A common word finds nothing.  ``keyword="the"`` returned 204 while
-          ``keyword="firearm"`` returned 50 bills, so LIS drops stop words.
+        - A common word finds nothing.  ``keyword="the"`` in summaries
+          returned 204 while ``keyword="firearm"`` returned 50 bills, so LIS
+          drops stop words.
 
         Args:
             session_code: e.g. ``20261``.
             session_id: e.g. ``59``.  Send one session parameter or the other.
             keyword: A keyword expression.  Supports ``AND``, ``OR``, and
-                parentheses.
+                parentheses.  Finds nothing unless ``keyword_location`` goes
+                with it.
             keyword_location: Where to search, ``"Summary"`` or
-                ``"Bill Text"``.
+                ``"Bill Text"``.  Required with ``keyword``: LIS answers 204
+                without it.  The two are different searches.  ``"firearm"``
+                in 20261 matched 50 bills in summaries and 129 in bill text,
+                and 2 of the 50 are not among the 129.
             keyword_all_sessions: Search every session, not just this one.
             chamber_code: ``"H"`` or ``"S"``.  Sent as the body key
                 ``Chambercode`` — lowercase ``c``, unlike every other key.
+                Drops failed and incorporated bills: the 50 ``"firearm"``
+                bills came back as 22 for ``"H"`` and 15 for ``"S"``, 37 in
+                all.
             status_id: ``LegislationStatusID`` from
-                :meth:`get_legislation_statuses`.
+                :meth:`get_legislation_statuses`.  Cannot select the failed
+                bills: ``9`` (Failed) with ``"firearm"`` answered 204,
+                although 10 failed bills match that keyword.
             category_id: ``LegislationCategoryID`` from
-                :meth:`get_legislation_categories`.
-            committee_id: Restrict to bills before one committee.
-            member_id: Restrict to one patron.  A second route to the data
-                :meth:`get_member_legislation` returns.
+                :meth:`get_legislation_categories`.  ``1`` (Introduced) is
+                not a stage: with ``"firearm"`` it returned all 37 bills the
+                drop leaves, 33 of them chaptered.  ``12`` (Failed) answered
+                204.
+            committee_id: **Not the bills a committee holds.**  In 20271,
+                ``category_id=3`` (In Committee) with ``committee_id=8``
+                (H08) returned 38 bills, and the rows of 16 name S05, S13 or
+                H20001 (measured 2026-10-13).  A failed bill never matches:
+                ``15`` with ``"firearm"`` answered 204, although three failed
+                bills name H15.  Compare ``CommitteeID`` on the rows instead.
+            member_id: Restrict to one patron, in any role.  Not the whole
+                list: member 544 in 20261 returned 203 bills here and 229
+                from :meth:`get_member_legislation`.  21 of the 26 missing
+                are ``Failed`` and 2 are ``Incorporated``.
             patron_types: ``PatronTypeID`` values, e.g. ``[1]`` for chief
                 patron only.  A flat list of integers, unlike the two below.
             subject_index_id: Always yields 204; see above.
@@ -3327,9 +3364,14 @@ class LISClient:
                 it.
             start_date: Lower bound on the status date.
             end_date: Upper bound on the status date.
-            exclude_failed: Drop bills that failed.
+            exclude_failed: Changes nothing.  ``True`` and ``False`` both
+                returned all 50 ``"firearm"`` bills, the 10 failed ones
+                included, and ``False`` beside ``chamber_code="H"`` did not
+                bring a failed bill back.
             current_status: Match only the bill's current status.
-            summary_length: Truncate the summary HTML to this many characters.
+            summary_length: Shortens nothing.  With ``120`` every summary
+                came back whole, the shortest 418 characters.  It still
+                drops the failed and incorporated bills.
             extra: Body keys merged last, for a field this signature omits.
 
         A compound keyword search rides ``extra``.  ``Keywords`` takes a list

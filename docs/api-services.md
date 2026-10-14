@@ -299,7 +299,9 @@ beside it. Read [Minutes books](chamber-records.md#minutes-books).
 
 This is the only keyword capable bill endpoint, and the only one that filters
 on status, category, committee, chapter number, and patron in one call. It
-has no paging and it repeats bills. Read
+has no paging and it repeats bills. A keyword finds nothing without
+`keyword_location`, a criterion beside the keyword drops the failed bills,
+and the committee filter does not pick the bills a committee holds. Read
 [Searching bills](bills.md#searching-bills) before you use it.
 
 Not wired: `clearpubliccache` and `clearintroductiondatelistcacheasync`, which
