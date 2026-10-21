@@ -7,8 +7,8 @@ Data:  Session reference list reaches back to 1994.  Bill data observed
        working for the 2024–2027 sessions (as of Aug 2026); earlier
        guidance said 2025–2026 only.  Older sessions via legacy CSV.
 
-The client wraps a requests session with a system-cert SSL adapter (required
-on Windows for government CA roots) and returns parsed Pydantic models.
+The client wraps a requests session that verifies TLS against the operating
+system's trust store (see ``http.py``) and returns parsed Pydantic models.
 
 Identifier quick-reference
 --------------------------
@@ -192,8 +192,21 @@ class LISClient:
         )
     """
 
-    def __init__(self, api_key: str | None = None, max_retries: int = _MAX_RETRIES):
-        self.session = requests_session
+    def __init__(
+        self,
+        api_key: str | None = None,
+        max_retries: int = _MAX_RETRIES,
+        *,
+        session: _requests.Session | None = None,
+    ):
+        """
+        Args:
+            session: The requests session to send through.  The default is a
+                shared session that verifies TLS against the operating
+                system's trust store (see :mod:`va_lis_client.http`).  Pass
+                your own to choose trust, proxies or retries yourself.
+        """
+        self.session = session if session is not None else requests_session
         self.api_key = api_key if api_key is not None else os.environ.get("LIS_API_KEY")
         self._max_retries = max_retries
         if not self.api_key:

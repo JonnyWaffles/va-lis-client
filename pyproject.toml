@@ -20,6 +20,7 @@ classifiers = [
 dependencies = [
     "pydantic>=2.0",
     "requests",
+    "truststore",
     "urllib3",
 ]
 

@@ -528,13 +528,34 @@ else:
 Or set `REDIS_URL` and `LIS_RATE_LIMIT` environment variables and call with
 no arguments — the module picks them up automatically.
 
-## Windows / government CA roots
+## TLS trust: the operating system's store
 
-On Windows, Python's OpenSSL doesn't automatically load system certificates,
-which can cause SSL errors when connecting to hosts with enterprise or
-government CA roots.  `va-lis-client` includes a `SystemCertSSLAdapter` that
-loads the system certificate store automatically, so no manual cert bundling
-is needed.
+The client verifies TLS with [truststore](https://truststore.readthedocs.io/),
+so trust comes from the operating system.  On Windows and macOS each chain
+goes to the platform verifier, so the platform's distrust list applies, as do
+enterprise and government roots that IT pushes to the machine.  On Linux it
+verifies with OpenSSL against the system CA bundle.
+
+Do not swap in `ssl.create_default_context()`.  On Windows that copies the
+root store into OpenSSL, which never reads Microsoft's distrust list: after
+the eMudhra intermediate CA compromise (October 2026) such a context still
+accepted both revoked chains.
+
+requests also adds certifi's roots on each new connection.  On Windows and
+macOS those count only after the platform rejects a chain, and the distrust
+list still applies.  On Linux the trust is the union of the system bundle and
+certifi, so keep both current: `ca-certificates` and `certifi>=2026.10.19`.
+
+To choose trust yourself, pass a session:
+
+```python
+import requests
+from va_lis_client import LISClient
+
+session = requests.Session()
+session.verify = "/path/to/ca-bundle.pem"
+client = LISClient(session=session)
+```
 
 ## Package structure
 
