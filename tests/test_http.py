@@ -11,12 +11,13 @@ Run with:
 """
 
 import unittest
+from unittest import mock
 
 import requests
 import truststore
 
 from va_lis_client import LISClient
-from va_lis_client.client import BASE_URL
+from va_lis_client.client import BASE_URL, DEFAULT_TIMEOUT
 from va_lis_client.http import requests_session, ssl_context
 
 
@@ -54,6 +55,64 @@ class TestClientSession(unittest.TestCase):
         client = LISClient(api_key="not-a-real-key", session=session)
 
         self.assertIs(client.session, session)
+
+
+class TestClientHostAndTimeout(unittest.TestCase):
+    """What reaches ``session.request``.  A mock session stands in for LIS."""
+
+    def client(self, **kwargs):
+        session = mock.Mock(spec=requests.Session)
+        response = session.request.return_value
+        response.status_code = 200
+        response.json.return_value = {"Sessions": []}
+        session.get.return_value = response
+
+        return LISClient(api_key="not-a-real-key", session=session, **kwargs), session
+
+    def test_the_defaults_are_production_and_a_bounded_wait(self):
+        client, session = self.client()
+
+        client.get_sessions()
+
+        url = session.request.call_args.args[1]
+        self.assertTrue(url.startswith(f"{BASE_URL}/"))
+        self.assertEqual(session.request.call_args.kwargs["timeout"], DEFAULT_TIMEOUT)
+
+    def test_a_caller_host_and_timeout_reach_the_request(self):
+        client, session = self.client(base_url="https://qa.lis.virginia.gov/", timeout=(3, 10))
+
+        client.get_sessions()
+
+        url = session.request.call_args.args[1]
+        self.assertTrue(url.startswith("https://qa.lis.virginia.gov/Session/"))
+        self.assertEqual(session.request.call_args.kwargs["timeout"], (3, 10))
+
+    def test_none_waits_without_limit(self):
+        client, session = self.client(timeout=None)
+
+        client.get_sessions()
+
+        self.assertIsNone(session.request.call_args.kwargs["timeout"])
+
+    def test_the_key_check_uses_the_same_host_and_timeout(self):
+        client, session = self.client(base_url="https://qa.lis.virginia.gov", timeout=5)
+        session.get.return_value.status_code = 204
+
+        self.assertIsNone(client.check_api_key())
+
+        url = session.get.call_args.args[0]
+        self.assertTrue(url.startswith("https://qa.lis.virginia.gov/PartnerAuthentication/"))
+        self.assertEqual(session.get.call_args.kwargs["timeout"], 5)
+
+    def test_a_timeout_is_retried(self):
+        client, session = self.client(max_retries=1)
+        response = session.request.return_value
+        session.request.side_effect = [requests.Timeout("slow"), response]
+
+        with mock.patch("va_lis_client.client.time.sleep"):
+            client.get_sessions()
+
+        self.assertEqual(session.request.call_count, 2)
 
 
 if __name__ == "__main__":

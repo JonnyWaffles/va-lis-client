@@ -244,6 +244,26 @@ client = LISClient(api_key="your-guid-here")
 `client.check_api_key()` to actually validate a key via the
 PartnerAuthentication service.
 
+## Host and timeout
+
+The client calls production, `https://lis.virginia.gov`, and waits at most
+60 seconds on each request. Both are constructor arguments:
+
+```python
+# The QA site. It keeps its own partner table, so a production key is not
+# registered there.
+qa = LISClient(api_key="your-qa-guid", base_url="https://qa.lis.virginia.gov")
+
+# 3 seconds to connect, 10 to read.
+quick = LISClient(timeout=(3, 10))
+```
+
+`timeout` takes what requests takes: a float bounds the connect and each
+read, a `(connect, read)` tuple bounds them apart, and `None` waits without
+limit. A timeout is a transient failure, so the client retries it with the
+same backoff as a 5xx. Pass `max_retries=0` when one bounded wait is the
+whole budget.
+
 ## Data availability
 
 - The session reference list reaches back to **1994**.

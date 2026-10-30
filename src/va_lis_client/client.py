@@ -148,6 +148,11 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://lis.virginia.gov"
 
+# requests waits without limit when a call names no timeout, so a LIS that
+# stops answering would hang the caller.  A float bounds the connect and each
+# read; a (connect, read) tuple bounds them apart.
+DEFAULT_TIMEOUT = 60  # seconds
+
 # Retry configuration
 _MAX_RETRIES = 8
 _INITIAL_DELAY = 2  # seconds
@@ -198,6 +203,8 @@ class LISClient:
         max_retries: int = _MAX_RETRIES,
         *,
         session: _requests.Session | None = None,
+        base_url: str = BASE_URL,
+        timeout: float | tuple[float, float] | None = DEFAULT_TIMEOUT,
     ):
         """
         Args:
@@ -205,8 +212,17 @@ class LISClient:
                 shared session that verifies TLS against the operating
                 system's trust store (see :mod:`va_lis_client.http`).  Pass
                 your own to choose trust, proxies or retries yourself.
+            base_url: The LIS host.  The default is production; pass
+                ``"https://qa.lis.virginia.gov"`` for the QA site, which keeps
+                its own partner keys.
+            timeout: Seconds to wait on every request, as requests reads it: a
+                float bounds the connect and each read, a ``(connect, read)``
+                tuple bounds them apart, and ``None`` waits without limit.  A
+                timeout counts as a transient failure and is retried.
         """
         self.session = session if session is not None else requests_session
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
         self.api_key = api_key if api_key is not None else os.environ.get("LIS_API_KEY")
         self._max_retries = max_retries
         if not self.api_key:
@@ -246,11 +262,12 @@ class LISClient:
             raw: Return the body as text.  A few paths answer with HTML,
                 plain text or iCalendar instead of JSON.
         """
-        url = f"{BASE_URL}{path}"
+        url = f"{self.base_url}{path}"
         headers = self._headers()
         if page_header:
             headers.update(page_header)
         kwargs.setdefault("headers", headers)
+        kwargs.setdefault("timeout", self.timeout)
         delay = _INITIAL_DELAY
 
         for attempt in range(self._max_retries + 1):
@@ -353,8 +370,8 @@ class LISClient:
         **Important:** Heartbeat endpoints accept *any* key — even garbage.
         This is the only endpoint that actually validates the key.
         """
-        url = f"{BASE_URL}/PartnerAuthentication/api/checkpartnerkeyasync/{self.api_key}"
-        resp = self.session.get(url)
+        url = f"{self.base_url}/PartnerAuthentication/api/checkpartnerkeyasync/{self.api_key}"
+        resp = self.session.get(url, timeout=self.timeout)
         resp.raise_for_status()
         if resp.status_code == 204:
             return None
